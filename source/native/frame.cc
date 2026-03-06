@@ -122,7 +122,8 @@ std::vector<float> build_native_frame(const uint8_t* payload, size_t len,
 
     // 4. Payload + CRC32
     std::vector<uint8_t> payload_with_crc(len + 4);
-    std::memcpy(payload_with_crc.data(), payload, len);
+    for (size_t i = 0; i < len; i++)
+        payload_with_crc[i] = payload[i];
     uint32_t crc = crc32(payload, len);
     payload_with_crc[len + 0] = (crc >>  0) & 0xFF;
     payload_with_crc[len + 1] = (crc >>  8) & 0xFF;

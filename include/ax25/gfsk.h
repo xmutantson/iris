@@ -25,7 +25,6 @@ private:
     float filter_coeffs_[FILTER_TAPS];
     float filter_buf_[FILTER_TAPS];
     int filter_idx_;
-    float phase_;
 };
 
 // GFSK 9600 baud G3RUH-compatible demodulator

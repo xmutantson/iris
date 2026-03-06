@@ -17,8 +17,7 @@ static float gaussian(float t, float bt) {
 GfskModulator::GfskModulator(int sample_rate)
     : sample_rate_(sample_rate),
       samples_per_bit_(sample_rate / GFSK_BAUD),
-      filter_idx_(0),
-      phase_(0.0f) {
+      filter_idx_(0) {
     // Generate Gaussian filter coefficients
     float sum = 0;
     int center = FILTER_TAPS / 2;
@@ -35,7 +34,6 @@ GfskModulator::GfskModulator(int sample_rate)
 }
 
 void GfskModulator::reset() {
-    phase_ = 0.0f;
     filter_idx_ = 0;
     std::memset(filter_buf_, 0, sizeof(filter_buf_));
 }
