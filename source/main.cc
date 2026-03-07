@@ -25,22 +25,25 @@ static void signal_handler(int) {
 }
 
 static void print_usage() {
-    printf("Iris FM Data Modem v0.1\n");
+    printf("Iris FM Data Modem v0.2\n");
     printf("Usage: iris [options]\n");
     printf("  --test           Run loopback tests\n");
     printf("  --config <file>  Load config from INI file (default: iris.ini)\n");
     printf("  --nogui          Disable GUI\n");
+    printf("  --noaudio        Disable audio I/O (for testing)\n");
     printf("  --callsign <cs>  Set callsign\n");
     printf("  --mode <A|B|C>   Set channel mode\n");
     printf("  --port <n>       KISS TCP port (default: 8001)\n");
+    printf("  --list-audio     List audio devices and exit\n");
     printf("  --help           Show this help\n");
 }
 
 int main(int argc, char** argv) {
-    // Parse command line
     std::string config_path = "iris.ini";
     bool run_test = false;
     bool use_gui = true;
+    bool use_audio = true;
+    bool list_audio = false;
     std::string cli_callsign;
     std::string cli_mode;
     int cli_port = -1;
@@ -52,6 +55,10 @@ int main(int argc, char** argv) {
             config_path = argv[++i];
         } else if (strcmp(argv[i], "--nogui") == 0) {
             use_gui = false;
+        } else if (strcmp(argv[i], "--noaudio") == 0) {
+            use_audio = false;
+        } else if (strcmp(argv[i], "--list-audio") == 0) {
+            list_audio = true;
         } else if (strcmp(argv[i], "--callsign") == 0 && i + 1 < argc) {
             cli_callsign = argv[++i];
         } else if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
@@ -64,27 +71,35 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Run tests if requested
-    if (run_test) {
+    if (run_test)
         return run_tests();
+
+    if (list_audio) {
+        auto devices = enumerate_audio_devices();
+        printf("Audio devices:\n");
+        for (const auto& d : devices) {
+            printf("  [%d] %s (in=%d, out=%d, %d Hz)\n",
+                   d.id, d.name.c_str(), d.max_input_channels,
+                   d.max_output_channels, d.default_sample_rate);
+        }
+        if (devices.empty()) printf("  (none found)\n");
+        return 0;
     }
 
     // Load config
     IrisConfig config = load_config(config_path);
-
-    // Apply CLI overrides
     if (!cli_callsign.empty()) config.callsign = cli_callsign;
     if (!cli_mode.empty()) config.mode = cli_mode;
     if (cli_port >= 0) config.kiss_port = cli_port;
 
-    printf("Iris FM Data Modem v0.1\n");
+    printf("Iris FM Data Modem v0.2\n");
     printf("  Callsign: %s\n", config.callsign.c_str());
     printf("  Mode: %s (%d baud)\n", config.mode.c_str(),
            mode_baud_rate(config.mode[0]));
     printf("  AX.25: %d baud\n", config.ax25_baud);
     printf("  KISS port: %d\n", config.kiss_port);
+    printf("  TX level: %.2f\n", config.tx_level);
 
-    // Signal handling
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
@@ -93,6 +108,15 @@ int main(int argc, char** argv) {
     if (!modem.init(config)) {
         fprintf(stderr, "Failed to initialize modem\n");
         return 1;
+    }
+
+    // Initialize PTT
+    auto ptt = create_ptt(config.ptt_method, config.rigctl_host, config.rigctl_port);
+    if (ptt) {
+        modem.set_ptt_controller(std::move(ptt));
+        printf("  PTT: %s\n", config.ptt_method.c_str());
+    } else {
+        printf("  PTT: none\n");
     }
 
     // Initialize KISS server
@@ -110,10 +134,64 @@ int main(int argc, char** argv) {
     }
     printf("  KISS server listening on port %d\n", config.kiss_port);
 
-    // Initialize PTT controller
-    auto ptt = create_ptt(config.ptt_method, config.rigctl_host, config.rigctl_port);
-    if (ptt) {
-        printf("  PTT: %s\n", config.ptt_method.c_str());
+    // Initialize audio
+    std::unique_ptr<AudioCapture> capture;
+    std::unique_ptr<AudioPlayback> playback;
+
+    if (use_audio) {
+        capture = create_capture();
+        playback = create_playback();
+
+        if (capture && playback) {
+            // Set up capture callback -> modem RX
+            capture->set_callback([&modem](float* samples, int frame_count, int channels) {
+                if (channels == 1) {
+                    modem.process_rx(samples, frame_count);
+                } else {
+                    // Downmix to mono
+                    std::vector<float> mono(frame_count);
+                    for (int i = 0; i < frame_count; i++) {
+                        float sum = 0;
+                        for (int ch = 0; ch < channels; ch++)
+                            sum += samples[i * channels + ch];
+                        mono[i] = sum / channels;
+                    }
+                    modem.process_rx(mono.data(), frame_count);
+                }
+            });
+
+            // Set up playback callback -> modem TX
+            playback->set_callback([&modem](float* samples, int frame_count, int channels) {
+                if (channels == 1) {
+                    modem.process_tx(samples, frame_count);
+                } else {
+                    // Generate mono, then duplicate to all channels
+                    std::vector<float> mono(frame_count);
+                    modem.process_tx(mono.data(), frame_count);
+                    for (int i = 0; i < frame_count; i++) {
+                        for (int ch = 0; ch < channels; ch++)
+                            samples[i * channels + ch] = mono[i];
+                    }
+                }
+            });
+
+            bool cap_ok = capture->open(config.capture_device, config.sample_rate, 1, 1024);
+            bool play_ok = playback->open(config.playback_device, config.sample_rate, 1, 1024);
+
+            if (cap_ok && play_ok) {
+                capture->start();
+                playback->start();
+                printf("  Audio: running (capture + playback)\n");
+            } else {
+                printf("  Audio: failed to open devices\n");
+                capture.reset();
+                playback.reset();
+            }
+        } else {
+            printf("  Audio: not available on this platform\n");
+        }
+    } else {
+        printf("  Audio: disabled\n");
     }
 
     // Initialize GUI
@@ -148,12 +226,12 @@ int main(int argc, char** argv) {
                 g_running = false;
         }
 
-        // Periodic status in nogui mode
         auto now = std::chrono::steady_clock::now();
         if (!use_gui && std::chrono::duration_cast<std::chrono::seconds>(now - last_status).count() >= 5) {
             auto diag = modem.get_diagnostics();
-            printf("[Status] KISS clients: %d, RX: %d, TX: %d, CRC errors: %d\n",
-                   kiss.client_count(), diag.frames_rx, diag.frames_tx, diag.crc_errors);
+            printf("[Status] KISS: %d, RX: %d, TX: %d, CRC: %d, SNR: %.1f dB, Level: %s\n",
+                   kiss.client_count(), diag.frames_rx, diag.frames_tx, diag.crc_errors,
+                   diag.snr_db, SPEED_LEVELS[diag.speed_level].name);
             last_status = now;
         }
 
@@ -161,6 +239,8 @@ int main(int argc, char** argv) {
     }
 
     printf("\nShutting down...\n");
+    if (capture) capture->stop();
+    if (playback) playback->stop();
     gui.shutdown();
     kiss.stop();
     modem.shutdown();

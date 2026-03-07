@@ -4,7 +4,16 @@
 #include <cmath>
 #include <algorithm>
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 namespace iris {
+
+// Calibration parameters
+static constexpr float CAL_TONE_FREQ = 1000.0f;    // Hz
+static constexpr int   CAL_TONE_DURATION = 48000;   // 1 second of tone
+static constexpr float CAL_TARGET_RMS = 0.3f;       // Target RX RMS for optimal deviation
 
 Modem::Modem() = default;
 Modem::~Modem() { shutdown(); }
@@ -13,12 +22,18 @@ bool Modem::init(const IrisConfig& config) {
     config_ = config;
 
     // Configure native PHY based on mode
-    if (config_.mode == "A" || config_.mode == "a")
+    if (config_.mode == "A" || config_.mode == "a") {
         phy_config_ = mode_a_config();
-    else if (config_.mode == "B" || config_.mode == "b")
+        use_upconvert_ = true;  // Mode A needs audio upconversion
+        upconverter_ = Upconverter(MODE_A_CENTER_FREQ, config_.sample_rate);
+        downconverter_ = Downconverter(MODE_A_CENTER_FREQ, config_.sample_rate);
+    } else if (config_.mode == "B" || config_.mode == "b") {
         phy_config_ = mode_b_config();
-    else
+        use_upconvert_ = false;
+    } else {
         phy_config_ = mode_c_config();
+        use_upconvert_ = false;
+    }
 
     phy_config_.modulation = Modulation::BPSK; // start conservative
 
@@ -36,7 +51,6 @@ bool Modem::init(const IrisConfig& config) {
 
     // Gearshift setup
     int max_mod_idx = (int)config_.max_modulation;
-    // Map max modulation to max speed level
     int max_level = NUM_SPEED_LEVELS - 1;
     for (int i = 0; i < NUM_SPEED_LEVELS; i++) {
         if ((int)SPEED_LEVELS[i].modulation > max_mod_idx) {
@@ -51,25 +65,50 @@ bool Modem::init(const IrisConfig& config) {
 }
 
 void Modem::shutdown() {
+    ptt_off();
     state_ = ModemState::IDLE;
     native_mod_.reset();
     native_demod_.reset();
+}
+
+void Modem::ptt_on() {
+    if (!ptt_active_ && ptt_) {
+        ptt_->set_ptt(true);
+        ptt_active_ = true;
+    }
+}
+
+void Modem::ptt_off() {
+    if (ptt_active_ && ptt_) {
+        ptt_->set_ptt(false);
+        ptt_active_ = false;
+    }
 }
 
 void Modem::process_rx(const float* rx_audio, int frame_count) {
     if (state_ == ModemState::TX_AX25 || state_ == ModemState::TX_NATIVE)
         return; // Don't receive while transmitting
 
+    // AGC
+    // Work on a copy so we don't modify caller's buffer
+    std::vector<float> audio(rx_audio, rx_audio + frame_count);
+    agc_.process_block(audio.data(), frame_count);
+
     // Measure RMS for diagnostics
     float sum_sq = 0;
     for (int i = 0; i < frame_count; i++)
-        sum_sq += rx_audio[i] * rx_audio[i];
+        sum_sq += audio[i] * audio[i];
     rx_rms_ = std::sqrt(sum_sq / std::max(frame_count, 1));
 
+    if (state_ == ModemState::CALIBRATING) {
+        process_calibration_rx(audio.data(), frame_count);
+        return;
+    }
+
     if (native_mode_) {
-        process_rx_native(rx_audio, frame_count);
+        process_rx_native(audio.data(), frame_count);
     } else {
-        process_rx_ax25(rx_audio, frame_count);
+        process_rx_ax25(audio.data(), frame_count);
     }
 }
 
@@ -97,7 +136,6 @@ void Modem::process_rx_ax25(const float* audio, int count) {
                     auto agreed = negotiate(local_cap_, remote_cap);
                     if (agreed.capabilities != 0) {
                         native_mode_ = true;
-                        // Update PHY config based on negotiation
                         int mod_level = std::min((int)agreed.max_modulation,
                                                 (int)config_.max_modulation);
                         phy_config_.modulation = (Modulation)mod_level;
@@ -120,12 +158,25 @@ void Modem::process_rx_ax25(const float* audio, int count) {
 void Modem::process_rx_native(const float* audio, int count) {
     state_ = ModemState::RX_NATIVE;
 
-    // For native mode, audio is IQ pairs (or needs to be downconverted for Mode A)
-    // For now, treat as IQ interleaved
-    int start = detect_frame_start(audio, count * 2, phy_config_.samples_per_symbol);
+    const float* iq_data;
+    std::vector<float> iq_buf;
+    size_t iq_count;
+
+    if (use_upconvert_) {
+        // Mode A: downconvert audio to IQ
+        iq_buf = downconverter_.audio_to_iq(audio, count);
+        iq_data = iq_buf.data();
+        iq_count = iq_buf.size();
+    } else {
+        // Mode B/C: audio is already baseband IQ (interleaved)
+        iq_data = audio;
+        iq_count = count * 2;
+    }
+
+    int start = detect_frame_start(iq_data, iq_count, phy_config_.samples_per_symbol);
     if (start >= 0) {
         std::vector<uint8_t> payload;
-        if (decode_native_frame(audio, count * 2, start, phy_config_, payload)) {
+        if (decode_native_frame(iq_data, iq_count, start, phy_config_, payload)) {
             frames_rx_++;
 
             // Update constellation for GUI
@@ -155,15 +206,21 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
         std::memcpy(tx_audio, tx_buffer_.data() + tx_pos_, to_copy * sizeof(float));
         tx_pos_ += to_copy;
 
-        // Zero-fill remainder if frame exhausted
         if (to_copy < (size_t)frame_count)
             std::memset(tx_audio + to_copy, 0, (frame_count - to_copy) * sizeof(float));
 
         if (tx_pos_ >= tx_buffer_.size()) {
             tx_buffer_.clear();
             tx_pos_ = 0;
+            ptt_off();
             state_ = ModemState::IDLE;
         }
+        return;
+    }
+
+    // Calibration tone generation
+    if (state_ == ModemState::CALIBRATING && cal_state_ == CalState::TX_TONE) {
+        generate_cal_tone(tx_audio, frame_count);
         return;
     }
 
@@ -176,14 +233,23 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
 
             if (native_mode_) {
                 state_ = ModemState::TX_NATIVE;
-                // Build native frame
                 int level = gearshift_.current_level();
                 PhyConfig tx_config = phy_config_;
                 tx_config.modulation = SPEED_LEVELS[level].modulation;
-                tx_buffer_ = build_native_frame(frame_data.data(), frame_data.size(), tx_config);
+                auto iq = build_native_frame(frame_data.data(), frame_data.size(), tx_config);
+
+                if (use_upconvert_) {
+                    // Mode A: upconvert IQ to audio
+                    tx_buffer_ = upconverter_.iq_to_audio(iq.data(), iq.size());
+                } else {
+                    // Mode B/C: IQ is baseband, output directly
+                    // For real hardware, Mode B outputs just I channel (real baseband)
+                    tx_buffer_.resize(iq.size() / 2);
+                    for (size_t i = 0; i < iq.size() / 2; i++)
+                        tx_buffer_[i] = iq[2 * i]; // I channel only for FM baseband
+                }
             } else {
                 state_ = ModemState::TX_AX25;
-                // Build AX.25 frame
                 auto bits = hdlc_encode(frame_data.data(), frame_data.size(), 8, 4);
                 if (config_.ax25_baud == 9600) {
                     tx_buffer_ = gfsk_mod_.modulate(bits);
@@ -198,6 +264,9 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
 
             tx_pos_ = 0;
             frames_tx_++;
+
+            // Assert PTT
+            ptt_on();
 
             // Output first chunk
             size_t to_copy = std::min((size_t)frame_count, tx_buffer_.size());
@@ -230,7 +299,9 @@ ModemDiag Modem::get_diagnostics() const {
     diag.frames_tx = frames_tx_;
     diag.crc_errors = crc_errors_;
     diag.rx_rms = rx_rms_;
-    diag.ptt_active = (state_ == ModemState::TX_AX25 || state_ == ModemState::TX_NATIVE);
+    diag.ptt_active = ptt_active_;
+    diag.cal_state = cal_state_;
+    diag.cal_measured_rms = cal_measured_rms_;
 
     {
         std::lock_guard<std::mutex> lock(diag_mutex_);
@@ -240,14 +311,107 @@ ModemDiag Modem::get_diagnostics() const {
     return diag;
 }
 
+// --- Auto Level Calibration ---
+// Two-station procedure:
+// 1. Station A transmits 1000 Hz test tone at current TX level (1 second)
+// 2. Station B measures received RMS level
+// 3. Station B reports measured level back (as AX.25 UI frame)
+// 4. Station A adjusts TX level: new_level = old_level * (target_rms / measured_rms)
+// 5. Roles reverse for Station B calibration
+
 void Modem::start_calibration() {
     state_ = ModemState::CALIBRATING;
-    // Auto level calibration:
-    // 1. Generate test tone at current TX level
-    // 2. Partner station measures received level and reports back
-    // 3. Adjust TX level to target optimal FM deviation
-    // For now, just store that we're in calibration mode.
-    // The actual two-station procedure requires ARQ exchange.
+    cal_state_ = CalState::TX_TONE;
+    cal_tone_samples_ = 0;
+    cal_tone_phase_ = 0;
+    cal_rms_accum_ = 0;
+    cal_rms_count_ = 0;
+    cal_measured_rms_ = 0;
+    ptt_on();
+}
+
+void Modem::generate_cal_tone(float* audio, int count) {
+    float phase_inc = 2.0f * (float)M_PI * CAL_TONE_FREQ / (float)config_.sample_rate;
+
+    for (int i = 0; i < count; i++) {
+        audio[i] = config_.tx_level * std::sin(cal_tone_phase_);
+        cal_tone_phase_ += phase_inc;
+        if (cal_tone_phase_ > 2.0f * (float)M_PI)
+            cal_tone_phase_ -= 2.0f * (float)M_PI;
+        cal_tone_samples_++;
+    }
+
+    if (cal_tone_samples_ >= CAL_TONE_DURATION) {
+        // Done transmitting tone
+        ptt_off();
+        cal_state_ = CalState::WAIT_REPORT;
+    }
+}
+
+void Modem::process_calibration_rx(const float* audio, int count) {
+    if (cal_state_ == CalState::RX_TONE) {
+        // Measure RMS of incoming tone
+        for (int i = 0; i < count; i++) {
+            cal_rms_accum_ += audio[i] * audio[i];
+            cal_rms_count_++;
+        }
+
+        // After 1 second of measurement
+        if (cal_rms_count_ >= CAL_TONE_DURATION) {
+            cal_measured_rms_ = std::sqrt(cal_rms_accum_ / cal_rms_count_);
+
+            // Build calibration report frame
+            // Simple format: "CAL:RMS=0.xxx"
+            char report[32];
+            snprintf(report, sizeof(report), "CAL:RMS=%.4f", cal_measured_rms_);
+            queue_tx_frame((const uint8_t*)report, strlen(report));
+
+            cal_state_ = CalState::TX_REPORT;
+        }
+    } else if (cal_state_ == CalState::WAIT_REPORT) {
+        // Look for calibration report in incoming frames
+        // Process as AX.25 to receive the report
+        std::vector<uint8_t> rx_nrzi;
+        if (config_.ax25_baud == 9600)
+            rx_nrzi = gfsk_demod_.demodulate(audio, count);
+        else
+            rx_nrzi = afsk_demod_.demodulate(audio, count);
+
+        auto rx_bits = nrzi_decode(rx_nrzi);
+        for (uint8_t b : rx_bits) {
+            if (hdlc_decoder_.push_bit(b)) {
+                const auto& frame = hdlc_decoder_.frame();
+                // Check if it's a calibration report
+                // Look for "CAL:RMS=" in the payload (after 16 bytes of AX.25 header)
+                if (frame.size() > 16) {
+                    std::string payload(frame.begin() + 16, frame.end());
+                    size_t pos = payload.find("CAL:RMS=");
+                    if (pos != std::string::npos) {
+                        float remote_rms = std::stof(payload.substr(pos + 8));
+                        if (remote_rms > 0.001f) {
+                            // Adjust TX level
+                            float correction = CAL_TARGET_RMS / remote_rms;
+                            config_.tx_level *= correction;
+                            config_.tx_level = std::clamp(config_.tx_level, 0.01f, 1.0f);
+                            config_.calibrated_tx_level = config_.tx_level;
+                            cal_measured_rms_ = remote_rms;
+                        }
+                        cal_state_ = CalState::DONE;
+                        state_ = ModemState::IDLE;
+                    }
+                }
+                hdlc_decoder_.reset();
+            }
+        }
+    } else if (cal_state_ == CalState::TX_REPORT) {
+        // Wait for the report frame to be transmitted
+        if (state_ != ModemState::TX_AX25 && tx_buffer_.empty()) {
+            // Switch to receiving partner's tone
+            cal_state_ = CalState::RX_TONE;
+            cal_rms_accum_ = 0;
+            cal_rms_count_ = 0;
+        }
+    }
 }
 
 } // namespace iris

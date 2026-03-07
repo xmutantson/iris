@@ -1,9 +1,10 @@
 #include "gui/gui.h"
-#include <cstdio>
 
-// Stub GUI implementation
-// When Dear ImGui is vendored (third_party/imgui/), replace this file with
-// gui_imgui.cc that uses the real ImGui API. The interface is the same.
+// This file is only compiled when IRIS_HAS_IMGUI is NOT defined.
+// When building with Dear ImGui, gui_imgui.cc is compiled instead.
+#ifndef IRIS_HAS_IMGUI
+
+#include <cstdio>
 
 namespace iris {
 
@@ -25,7 +26,6 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
 }
 
 bool IrisGui::render_frame() {
-    // In text mode, just print periodic status
     return open_;
 }
 
@@ -41,3 +41,5 @@ void IrisGui::log(const std::string& msg) {
 }
 
 } // namespace iris
+
+#endif // !IRIS_HAS_IMGUI

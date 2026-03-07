@@ -13,6 +13,8 @@
 #include "engine/speed_level.h"
 #include "engine/snr.h"
 #include "engine/gearshift.h"
+#include "engine/modem.h"
+#include "native/upconvert.h"
 #include "config/config.h"
 #include <cstdio>
 #include <cstring>
@@ -615,6 +617,145 @@ int run_tests() {
         check("LDPC 3/4 encoded = 512 bits", (int)enc34.size() == 512);
         auto dec34 = LdpcCodec::decode(enc34, LdpcRate::RATE_3_4);
         check("LDPC 3/4 decode succeeds", !dec34.empty());
+    }
+
+    // LDPC error correction
+    {
+        printf("\n=== LDPC Error Correction ===\n");
+        std::vector<uint8_t> data;
+        for (int i = 0; i < 256; i++) data.push_back((i * 7 + 3) & 1);
+        auto encoded = LdpcCodec::encode(data, LdpcRate::RATE_1_2);
+
+        // Introduce 1 bit error
+        std::vector<uint8_t> corrupted = encoded;
+        corrupted[50] ^= 1;
+        auto corrected = LdpcCodec::decode(corrupted, LdpcRate::RATE_1_2);
+        check("LDPC 1/2 corrects 1-bit error",
+              corrected.size() == data.size() && corrected == data);
+
+        // Introduce 5 bit errors
+        corrupted = encoded;
+        corrupted[10] ^= 1; corrupted[100] ^= 1; corrupted[200] ^= 1;
+        corrupted[300] ^= 1; corrupted[400] ^= 1;
+        corrected = LdpcCodec::decode(corrupted, LdpcRate::RATE_1_2);
+        check("LDPC 1/2 corrects 5-bit errors",
+              corrected.size() == data.size() && corrected == data);
+    }
+
+    // Mode A upconversion
+    {
+        printf("\n=== Mode A Upconversion ===\n");
+        // Generate a simple IQ signal: constant on I, zero on Q
+        std::vector<float> iq(2000);
+        for (int i = 0; i < 1000; i++) {
+            iq[2*i] = 1.0f;    // I
+            iq[2*i+1] = 0.0f;  // Q
+        }
+
+        Upconverter up(1800.0f, 48000);
+        auto audio = up.iq_to_audio(iq.data(), iq.size());
+        check("Upconvert produces audio", (int)audio.size() == 1000);
+
+        // Audio should be a 1800 Hz cosine
+        // Check that it has non-trivial content
+        float rms = 0;
+        for (auto s : audio) rms += s * s;
+        rms = std::sqrt(rms / audio.size());
+        check("Upconverted audio has signal", rms > 0.5f);
+
+        // Downconvert back
+        Downconverter down(1800.0f, 48000);
+        auto iq_back = down.audio_to_iq(audio.data(), audio.size());
+        check("Downconvert produces IQ pairs", (int)iq_back.size() == 2000);
+
+        // The I channel should recover ~1.0 (after transient)
+        // Check middle portion to avoid startup transient
+        float i_avg = 0;
+        int mid_start = 400, mid_end = 800;
+        for (int i = mid_start; i < mid_end; i++)
+            i_avg += iq_back[2*i];
+        i_avg /= (mid_end - mid_start);
+        check("Downconverted I recovers DC",
+              std::abs(i_avg - 0.5f) < 0.2f); // ~0.5 due to cos^2 average
+    }
+
+    // Mode A native frame through upconversion
+    {
+        printf("\n=== Mode A Native Frame Through Audio ===\n");
+        uint8_t payload[] = "Mode A upconvert test!";
+        size_t payload_len = strlen((char*)payload);
+
+        PhyConfig cfg = mode_a_config();
+        cfg.modulation = Modulation::BPSK;
+
+        // Build IQ frame
+        auto iq = build_native_frame(payload, payload_len, cfg);
+
+        // Upconvert to audio
+        Upconverter up(1800.0f, 48000);
+        auto audio = up.iq_to_audio(iq.data(), iq.size());
+        check("Mode A frame -> audio", !audio.empty());
+        printf("  IQ: %zu samples -> Audio: %zu samples\n", iq.size()/2, audio.size());
+
+        // Downconvert back to IQ
+        Downconverter down(1800.0f, 48000);
+        auto iq_back = down.audio_to_iq(audio.data(), audio.size());
+
+        // Detect frame
+        int start = detect_frame_start(iq_back.data(), iq_back.size(),
+                                        cfg.samples_per_symbol);
+        check("Frame detected after upconvert/downconvert", start >= 0);
+
+        if (start >= 0) {
+            std::vector<uint8_t> rx_payload;
+            bool ok = decode_native_frame(iq_back.data(), iq_back.size(),
+                                           start, cfg, rx_payload);
+            check("Frame decoded after upconvert/downconvert", ok);
+            if (ok) {
+                bool match = (rx_payload.size() == payload_len) &&
+                             (memcmp(rx_payload.data(), payload, payload_len) == 0);
+                check("Payload matches after audio round-trip", match);
+            }
+        }
+    }
+
+    // Modem engine
+    {
+        printf("\n=== Modem Engine ===\n");
+        IrisConfig cfg;
+        cfg.mode = "A";
+        cfg.callsign = "TEST01";
+        cfg.ax25_baud = 1200;
+
+        Modem modem;
+        bool ok = modem.init(cfg);
+        check("Modem init", ok);
+        check("Modem starts IDLE", modem.state() == ModemState::IDLE);
+
+        // Queue a frame and generate TX audio
+        uint8_t frame[] = {
+            'C'<<1, 'Q'<<1, ' '<<1, ' '<<1, ' '<<1, ' '<<1, 0x60,
+            'T'<<1, 'E'<<1, 'S'<<1, 'T'<<1, ' '<<1, ' '<<1, 0x61,
+            0x03, 0xF0, 'H', 'i'
+        };
+        modem.queue_tx_frame(frame, sizeof(frame));
+
+        std::vector<float> tx_audio(4800, 0.0f);
+        modem.process_tx(tx_audio.data(), 4800);
+        check("Modem TX produces audio", modem.state() == ModemState::TX_AX25);
+
+        // Check that audio has non-zero content
+        float peak = 0;
+        for (float s : tx_audio) {
+            float a = std::abs(s);
+            if (a > peak) peak = a;
+        }
+        check("TX audio has signal", peak > 0.01f);
+
+        auto diag = modem.get_diagnostics();
+        check("TX frame counted", diag.frames_tx == 1);
+
+        modem.shutdown();
     }
 
     // Config
