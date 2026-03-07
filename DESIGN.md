@@ -9,13 +9,13 @@ Named as companion to Mercury (HF OFDM modem): Mercury carries messages via
 skywave, Iris carries them line-of-sight.
 
 License: AGPL-3.0 (matches Mercury, shared code compatible)
-Language: C++ (shared codebase with Mercury)
+Language: C++17
 
 ## Design Philosophy
 
 - FM channels are flat and stable — no need for OFDM
 - Single-carrier with pulse shaping is simpler, more efficient, lower latency
-- Reuse Mercury's proven ARQ engine, LDPC codes, compression, and encryption
+- Cherry-pick algorithms from Mercury (LDPC, compression, encryption) — don't fork
 - Three transport modes for maximum radio compatibility
 - Adaptive modulation from BPSK to 256-QAM based on link quality
 - AX.25 compatibility layer for interop with existing packet network
@@ -26,8 +26,9 @@ Language: C++ (shared codebase with Mercury)
 
 ### Mode A — Audio-Coupled (Mic/Speaker)
 - Works with any FM radio through audio jacks (including USB audio)
-- Usable bandwidth: ~2800 Hz (300–3100 Hz)
-- Symbol rate: 2400 baud (RRC alpha=0.2 → 2880 Hz occupied)
+- Usable bandwidth: ~2800 Hz (300-3100 Hz)
+- Symbol rate: 2400 baud (RRC alpha=0.2 -> 2880 Hz occupied)
+- Sample rate: 48000 Hz
 - Target: portable/handheld radios, maximum compatibility
 - Latency: ~100ms TX/RX turnaround (VOX or CAT PTT)
 - Note: USB audio interfaces (e.g., IC-705) give flatter response than analog
@@ -36,59 +37,66 @@ Language: C++ (shared codebase with Mercury)
 - Flat baseband access, bypasses audio filtering
 - Usable bandwidth: ~4800 Hz
 - Symbol rate: 4800 baud
+- Sample rate: 48000 Hz
 - Target: base stations, TNC-ready radios (Kenwood TM-D710, IC-9700, etc.)
 
 ### Mode C — Channel-Direct/SDR (Full Channel)
 - Full FM channel bandwidth via SDR or direct modulation
 - 12.5 kHz channel: symbol rate 9600 baud
 - 25 kHz channel: symbol rate 19200 baud
+- Sample rate: 96000 Hz (required for 19200 baud)
 - Target: SDR setups (PlutoSDR, LimeSDR, HackRF), digital-native radios
 - Single-carrier with fractionally-spaced equalizer (not OFDM — VHF multipath
   is only 2-10% of symbol duration, a 5-tap FSE handles it)
 
 ## Modulation & Coding
 
-### Modulation Ladder
+### Modulation Ladder (square QAM only)
 
 | Level | Modulation | Bits/sym | Min SNR (approx) |
 |-------|------------|----------|-------------------|
 | 0     | BPSK       | 1        | 3 dB              |
 | 1     | QPSK       | 2        | 6 dB              |
-| 2     | 8PSK       | 3        | 10 dB             |
-| 3     | 16QAM      | 4        | 14 dB             |
-| 4     | 32QAM      | 5        | 18 dB             |
-| 5     | 64QAM      | 6        | 22 dB             |
-| 6     | 128QAM     | 7        | 26 dB             |
-| 7     | 256QAM     | 8        | 30 dB             |
+| 2     | 16QAM      | 4        | 14 dB             |
+| 3     | 64QAM      | 6        | 22 dB             |
+| 4     | 256QAM     | 8        | 30 dB             |
+
+Note: 8PSK, 32QAM, 128QAM deliberately omitted. Odd-bit constellations add
+implementation complexity (non-square Gray coding) for marginal gain. SNR gaps
+between levels are better covered by varying FEC code rate.
 
 ### LDPC Code Rates
-Reuse Mercury's LDPC codes: 1/16, 1/8, 1/4, 1/2, 3/4, 7/8, 14/16.
-Adaptive code rate combined with modulation level = fine-grained throughput control.
+Extracted from Mercury/codec2: 1/2, 3/4, 7/8.
+Combined with modulation level for fine-grained throughput control.
 
-### Throughput Estimates (Mode A, 2400 baud)
+### Speed Levels — Mode A (2400 baud, 48 kHz)
 
-| Config       | Modulation | Code Rate | Throughput |
-|--------------|------------|-----------|------------|
-| Minimum      | BPSK       | 1/2       | 1,200 bps  |
-| Low          | QPSK       | 3/4       | 3,600 bps  |
-| Medium       | 16QAM      | 3/4       | 7,200 bps  |
-| High         | 64QAM      | 7/8       | 12,600 bps |
-| Maximum      | 256QAM     | 7/8       | 16,800 bps |
+| Level | Mod    | FEC Rate | Net bps | Min SNR |
+|-------|--------|----------|---------|---------|
+| A0    | BPSK   | 1/2      | 1,200   | ~3 dB   |
+| A1    | QPSK   | 1/2      | 2,400   | ~6 dB   |
+| A2    | QPSK   | 3/4      | 3,600   | ~9 dB   |
+| A3    | 16QAM  | 1/2      | 4,800   | ~14 dB  |
+| A4    | 16QAM  | 3/4      | 7,200   | ~17 dB  |
+| A5    | 64QAM  | 3/4      | 10,800  | ~22 dB  |
+| A6    | 64QAM  | 7/8      | 12,600  | ~25 dB  |
+| A7    | 256QAM | 7/8      | 16,800  | ~30 dB  |
 
-Mode B doubles these. Mode C (25 kHz) = 8x Mode A rates.
-Peak theoretical: 256QAM 7/8 on 25 kHz = **134 kbps**.
+Mode B = 2x Mode A rates (4800 baud). Mode C 12.5kHz = 4x (9600 baud).
+Mode C 25kHz = 8x (19200 baud, requires 96 kHz sample rate).
+
+Peak: 256QAM 7/8 on 25 kHz Mode C = **134 kbps**.
 
 ### Comparison
 | | Direwolf 1200 | Direwolf 9600 | VARA FM | Iris AX.25 | Iris Native A |
 |---|---|---|---|---|---|
 | Peak throughput | ~1 kbps | ~7 kbps | ~25 kbps | ~7 kbps | ~17 kbps |
 | FEC | None | None | Yes | None | LDPC |
-| Adaptive | No | No | Yes | No | BPSK→256QAM |
+| Adaptive | No | No | Yes | No | BPSK->256QAM |
 | Encryption | No | No | No | No | ChaCha20 |
 | Compression | No | No | No | No | PPMd+zstd |
 | AX.25 compat | Yes | Yes | No | Yes | Auto-upgrade |
 | Open source | Yes | Yes | No | Yes | Yes |
-| Audio-coupled | Yes | Yes | Yes | Yes | Yes |
 
 ## Physical Layer
 
@@ -97,10 +105,16 @@ Peak theoretical: 256QAM 7/8 on 25 kHz = **134 kbps**.
 - Matched filter at receiver
 - Zero ISI at optimal sample point
 
+### Mode A Audio Upconversion
+- Native PHY produces complex baseband IQ
+- Mode A upconverts to real audio: I*cos(wt) - Q*sin(wt) at 1800 Hz center
+- Receiver downconverts back to complex baseband before matched filter
+- Modes B/C pass baseband directly (no carrier needed)
+
 ### Synchronization
-- Preamble: known BPSK training sequence (63-bit m-sequence or Barker)
-- Timing recovery: Gardner TED or Mueller-Muller
-- Carrier recovery: Costas loop (for low-order) / decision-directed PLL (high-order)
+- Preamble: known BPSK training sequence (63-bit m-sequence)
+- Timing recovery: Gardner TED with interpolation
+- Carrier recovery: decision-directed PLL for high-order QAM
 - AGC: RMS-based with fast attack / slow decay
 
 ### Frame Structure
@@ -113,44 +127,55 @@ Peak theoretical: 256QAM 7/8 on 25 kHz = **134 kbps**.
 - **Sync word**: frame delimiter, Barker-like sequence
 - **Header**: modulation level, code rate, payload length, frame type — always BPSK
   so receiver can decode regardless of payload modulation
-- **Payload**: variable modulation/coding per header
+- **Payload**: variable modulation/coding per header, LDPC-encoded
 - **CRC32**: error detection on decoded payload
 
 ### Channel Estimation
 - Preamble-based SNR measurement (no per-subcarrier estimate needed — flat channel)
 - Decision-directed tracking for phase/amplitude drift during payload
-- Optional mid-frame pilots for Mode C at high symbol rates
 
 ### Equalization
 - Simple 1-tap complex gain correction (flat channel, Modes A/B)
 - 5-tap fractionally-spaced linear equalizer for Mode C (urban VHF multipath)
 
-## Data Link Layer (Reuse from Mercury)
+### FM Deviation Control
+- TX audio level directly controls FM deviation — critical for FM modems
+- Over-deviation causes adjacent channel splatter and distortion
+- Under-deviation wastes SNR
+- Auto level calibration: two-station procedure (like VARA FM)
+  1. Station A transmits known test tone at configured level
+  2. Station B measures received deviation and reports back
+  3. Station A adjusts TX level to target optimal deviation
+  4. Roles reverse for Station B calibration
+- Stored per-radio-profile in config file
+- Manual override always available
+
+## Data Link Layer
 
 ### ARQ Protocol
-- Commander/Responder architecture
+- Commander/Responder architecture (concepts from Mercury)
 - Selective repeat ARQ with NACK
 - Adaptive batch sizing
 
 ### Gearshift
-- SNR-based SUPERSHIFT for fast initial climb
-- Ladder gearshift for fine adaptation
-- Verification probe at top config
-- BREAK recovery with cascading fallback
+- SNR-based rate adaptation
+- Start at lowest reliable level, climb based on measured SNR
+- Probe higher levels periodically
+- Fall back immediately on CRC failure
+- Hysteresis prevents oscillation at level boundaries
 
-### Features (inherited from Mercury)
+### Features
 - PPMd8 + zstd streaming compression with capability negotiation
-- X25519 + ChaCha20-Poly1305 encryption
+- X25519 + ChaCha20-Poly1305 encryption (Monocypher vendored)
 - B2F unroll/reroll for Winlink
 - SSID addressing
-- Passive monitor mode
 
 ### Connection Sequence
 1. HAIL (BPSK, always decodable)
 2. Capability negotiation (compression, encryption, B2F)
 3. Key exchange (if encrypted)
-4. SUPERSHIFT to optimal modulation
-5. Data transfer with ladder gearshift
+4. Gearshift to optimal modulation
+5. Data transfer with adaptive rate
 
 ## AX.25 Compatibility Layer
 
@@ -176,16 +201,14 @@ mode      support it)
 - Clean-room AFSK 1200 baud (Bell 202) modulator/demodulator
 - Clean-room GFSK 9600 baud (G3RUH) modulator/demodulator
 - Standard AX.25 HDLC framing, NRZI encoding
-- KISS TNC interface on TCP port 8001 and/or serial PTY
+- KISS TNC interface on TCP port 8001
 - Compatible with Winlink, APRS, BPQ32, Pat, and any KISS-aware application
-- Functionally equivalent to Direwolf — same protocols, same framing
 
 ### Auto-Upgrade Negotiation
 When two Iris stations connect, they can upgrade to native mode mid-session
-using a combination of XID frames (connected mode) and reserved PID bytes
-(connectionless/APRS).
+using XID frames (connected mode) and reserved PID bytes (connectionless).
 
-#### Connected Mode (Winlink, BPQ32, etc.)
+#### Connected Mode
 1. Station A sends normal AX.25 SABM — works with any TNC
 2. Connection established in standard AX.25
 3. Station A sends XID frame with Iris capability parameters
@@ -193,137 +216,107 @@ using a combination of XID frames (connected mode) and reserved PID bytes
 5. If peer responds with FRMR or silence: stay in AX.25 mode
 6. If native link drops, fall back to AX.25 automatically
 
-XID (Exchange Identification) is an AX.25 2.2 standard frame type designed
-specifically for capability negotiation. Legacy TNCs that don't understand XID
-respond with FRMR, which cleanly signals "not Iris-capable."
-
 #### XID Capability Frame Format
 ```
 XID Information Field (8 bytes, fixed format):
   Bytes 0-3: Magic "IRIS" (0x49 0x52 0x49 0x53)
   Byte 4:    Version (0x01 = v1)
-  Bytes 5-6: Capabilities bitmask (little-endian)
+  Bytes 5-6: Capabilities bitmask (big-endian)
     bit 0: Native Mode A supported
     bit 1: Native Mode B supported
     bit 2: Native Mode C supported
     bit 3: Encryption capable (ChaCha20)
     bit 4: Compression capable (PPMd+zstd)
     bit 5: B2F unroll capable
-  Byte 7:    Max modulation level (0-7, maps to modulation ladder)
+  Byte 7:    Max modulation level (0-4, maps to modulation ladder)
 ```
-
-Version byte allows future extension. If version > what receiver understands,
-negotiate down to common version.
 
 #### Connectionless Mode (APRS, UI frames)
 - Use reserved PID byte (0xBE) for Iris-native UI frames
 - Legacy TNCs silently drop frames with unknown PID — no interference
-- Iris stations recognize PID 0xBE and decode with native framing
 - Standard AX.25 UI frames (PID 0xF0) continue to work for legacy interop
 
-#### Result
-- Iris <-> Direwolf: works, AX.25 1200/9600, XID gets FRMR, stays legacy
-- Iris <-> Iris: starts AX.25, XID succeeds, auto-upgrades to native
-- Upgrade is transparent to the application layer (KISS interface unchanged)
-- No channel pollution, no SSID hacks, standards-compliant
+## Implementation Architecture
 
-### What Auto-Upgrade Enables
-| | AX.25 1200 | AX.25 9600 | Iris Native Mode A |
-|---|---|---|---|
-| Throughput | ~1 kbps | ~7 kbps | ~17 kbps |
-| FEC | None | None | LDPC |
-| Adaptive | No | No | BPSK→256QAM |
-| Encryption | No | No | ChaCha20 |
-| Compression | No | No | PPMd+zstd |
-| Weak signal | Dies | Dies | Gearshift down |
+### Code Organization (standalone C++17 project)
+```
+iris/
+  include/
+    common/types.h         - Constants, types
+    ax25/                   - CRC16, HDLC, AFSK, GFSK
+    kiss/                   - KISS codec
+    native/                 - RRC, constellation, PHY, frame, XID
+    fec/                    - LDPC encoder/decoder
+    audio/                  - Audio I/O abstraction
+    radio/                  - rigctl/PTT control
+    engine/                 - Modem engine, gearshift, ARQ
+    gui/                    - Dear ImGui interface
+    config/                 - INI config parser
+  source/
+    (mirrors include/ structure)
+  third_party/
+    imgui/                  - Dear ImGui
+    monocypher/             - Encryption library
+  build.sh
+```
 
-## Implementation Plan
-
-### What to reuse from Mercury (C++)
-- LDPC encoder/decoder (all code rates)
-- ARQ state machine (commander/responder)
-- Compression engine (PPMd8 + zstd streaming)
-- Encryption (Monocypher, key exchange)
-- B2F unroll/reroll
-- TCP control/data socket interface
-- GUI framework (Qt)
-- CLI argument parsing
-- Audio I/O (WASAPI/ALSA abstraction)
+### What to extract from Mercury (algorithm-level, not fork)
+- LDPC parity check matrices and decoder algorithm
+- Compression approach (PPMd8 + zstd streaming pattern)
+- Encryption approach (Monocypher X25519 + ChaCha20)
+- Gearshift concept (SNR-based adaptation)
+- Audio I/O pattern (WASAPI/ALSA abstraction)
 
 ### What to build new
-- AFSK 1200 baud modem (Bell 202, clean-room from spec)
-- GFSK 9600 baud modem (G3RUH, clean-room from original paper)
-- AX.25 HDLC framing, NRZI encoding, KISS TNC interface
-- XID-based auto-upgrade negotiation (AX.25 -> Iris native)
-- Single-carrier modulator (RRC pulse shaping) for native mode
-- Single-carrier demodulator (matched filter + timing recovery)
-- Carrier/phase recovery (Costas/PLL)
-- Frame sync (correlator on preamble/sync word)
-- AGC
-- SNR estimator (preamble residual)
-- FM radio TX/RX turnaround timing
-- PTT control (CAT/CI-V, VOX, GPIO, CM108 HID)
+- Everything above as clean C++17 with clear interfaces
+- Dear ImGui GUI (constellation, waterfall, SNR meter, config)
+- rigctl integration for PTT
+- KISS TCP server
+- Auto level calibration
+- FM-specific TX/RX turnaround timing
+- Speed level management
 
-### Estimated Complexity
-- AX.25 layer (AFSK/GFSK modem + HDLC + KISS): ~3000-4000 lines
-- Iris native PHY (single-carrier): ~2000-3000 lines
-- Auto-upgrade negotiation: ~500 lines
-- Shared code from Mercury (ARQ, compression, encryption): ~15000 lines (already written)
-- Total new code: ~6000-8000 lines
+## GUI (Dear ImGui)
 
-### Build Approach
-Fork Mercury, replace PHY layer, keep everything above. Shared ARQ/compression/
-encryption code stays in-tree. If both projects diverge significantly, extract
-shared code into a library later.
+### Panels
+- **Main**: Connect/disconnect, callsign, mode selection, speed level
+- **Constellation**: Real-time scatter plot of received symbols
+- **Waterfall/Spectrum**: Audio spectrum display
+- **SNR Meter**: Bar graph with history, current speed level indicator
+- **Config**: Audio device selection, radio model, PTT method, TX level
+- **Calibration**: Auto level set wizard (two-station procedure)
+- **Log**: Scrolling text log of events, decoded frames
 
-## Audio Interface
-
-### PTT Control
-- CAT/CI-V serial commands (preferred, lowest latency)
-- VOX (fallback, add TX preamble tone for VOX activation)
-- GPIO (Raspberry Pi, embedded)
-- CM108 HID (SignaLink, Digirig)
-
-### TX/RX Turnaround
-- FM radios have significant TX/RX switching time (~50-200ms)
-- ARQ timing must account for this (Mercury assumes ~10ms for SSB)
-- Configurable turnaround delay per radio model
-- Burst mode: longer transmissions with more data per turn to amortize overhead
-
-### Audio Levels
-- TX: configurable deviation control (important for FM — overdeviation = splatter)
-- RX: AGC handles variable levels from discriminator
-
-## Frequency Plan
-
-Primary target: VHF/UHF amateur bands where FM data is permitted.
-- 2m: 144.900-145.100 MHz (US), or local packet frequencies
-- 70cm: 430-440 MHz region
-- Works on any FM channel — amateur, GMRS, commercial (with appropriate license)
+### Radio Control
+- rigctl (hamlib) via TCP or direct serial for PTT and frequency
+- VOX fallback (add TX preamble tone)
+- CM108 HID for SignaLink/Digirig
 
 ## Platform Support
-- Windows (WASAPI/DirectSound)
-- Linux (ALSA/PulseAudio)
-- macOS (CoreAudio)
-- Raspberry Pi (ALSA + GPIO PTT)
+- Windows (WASAPI audio, Dear ImGui DirectX/OpenGL backend)
+- Linux (ALSA audio, Dear ImGui OpenGL/SDL backend)
+- macOS (CoreAudio, Dear ImGui Metal/OpenGL backend)
 
 ## Decisions Log
 
 | Question | Decision | Rationale |
 |----------|----------|-----------|
 | Mode C modulation | Single-carrier + FSE | VHF multipath 2-10% of symbol; 5-tap equalizer sufficient |
+| Mode C sample rate | 96 kHz required | 19200 baud needs SPS >= 5; 48kHz only gives 2.5 |
 | Duplex | Deferred to v2 | Doubles audio complexity, ARQ assumes half-duplex |
 | Voice/M17 | No | Iris is data-only; M17 handles voice well |
-| Winlink/Pat/BPQ32 | Via KISS TNC | All speak KISS; no special integration needed |
-| Direwolf DSP reuse | Clean-room | Direwolf GPLv2 incompatible with AGPL-3.0 |
-| Config format | Own INI/TOML | Don't clone Direwolf config; KISS interface is what matters |
-| License | AGPL-3.0 | Matches Mercury, shared code compatible |
-| Language | C++ | Shared codebase with Mercury |
+| Odd QAM (8PSK etc) | Dropped | Non-square Gray coding complexity; use FEC rate variation instead |
+| Mercury code reuse | Extract algorithms, don't fork | Architectures too different; clean C++17 interfaces |
+| Direwolf DSP reuse | Clean-room | GPLv2 incompatible with AGPL-3.0 |
+| Config format | Own INI | Simple, human-readable |
+| License | AGPL-3.0 | Matches Mercury |
+| GUI | Dear ImGui | Lightweight, single binary, good for SDR-style displays |
 | XID format | Fixed 8-byte | Magic + version + caps bitmask + max modulation |
 | Upgrade beacon | Reserved PID 0xBE | Legacy TNCs silently drop unknown PID |
+| Auto level cal | Two-station procedure | Like VARA FM; essential for FM deviation control |
 
 ## Future (v2+)
-- Full duplex through repeater pairs (simultaneous TX/RX, no turnaround penalty)
+- Full duplex through repeater pairs
 - OFDM option for Mode C if FSE proves insufficient in urban environments
 - Codec2 voice+data multiplexing if demand exists
 - Mesh/digipeater mode with Iris-native routing

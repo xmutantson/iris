@@ -21,7 +21,7 @@ fi
 if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "mingw"* || "$OSTYPE" == "cygwin" ]]; then
     BINARY="iris.exe"
     CXXFLAGS="$CXXFLAGS -D_WIN32_WINNT=0x0601"
-    LDFLAGS="-lws2_32"
+    LDFLAGS="-lws2_32 -lole32 -lwinmm"
 else
     LDFLAGS="-lpthread"
 fi
