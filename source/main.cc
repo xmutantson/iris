@@ -65,6 +65,7 @@ static void print_usage() {
     printf("  --center-freq <Hz> Center frequency (default: auto = midpoint of band)\n");
     printf("\nAudio:\n");
     printf("  --noaudio          Disable audio I/O (for testing)\n");
+    printf("  --loopback         Internal audio loopback (TX->RX, no hardware)\n");
     printf("  --list-audio       List audio devices and exit\n");
     printf("  --capture <id>     Capture device ID (-1 = default)\n");
     printf("  --playback <id>    Playback device ID (-1 = default)\n");
@@ -99,6 +100,7 @@ int main(int argc, char** argv) {
     bool run_test = false;
     bool use_gui = true;
     bool use_audio = true;
+    bool use_loopback = false;
     bool list_audio = false;
     std::string cli_callsign;
     std::string cli_mode;
@@ -142,6 +144,8 @@ int main(int argc, char** argv) {
             use_gui = false;
         } else if (strcmp(argv[i], "--noaudio") == 0) {
             use_audio = false;
+        } else if (strcmp(argv[i], "--loopback") == 0) {
+            use_loopback = true;
         } else if (strcmp(argv[i], "--list-audio") == 0) {
             list_audio = true;
         } else if (strcmp(argv[i], "--callsign") == 0 && i + 1 < argc) {
@@ -321,6 +325,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    if (use_loopback)
+        modem.set_loopback_mode(true);
+
     // Start listening for incoming ARQ connections
     modem.arq_listen();
 
@@ -389,58 +396,62 @@ int main(int argc, char** argv) {
     std::unique_ptr<AudioCapture> capture;
     std::unique_ptr<AudioPlayback> playback;
 
-    if (use_audio) {
+    if (use_loopback) {
+        loopback_reset();
+        capture = create_loopback_capture();
+        playback = create_loopback_playback();
+    } else if (use_audio) {
         capture = create_capture();
         playback = create_playback();
+    }
 
-        if (capture && playback) {
-            // Set up capture callback -> modem RX
-            capture->set_callback([&modem](float* samples, int frame_count, int channels) {
-                if (channels == 1) {
-                    modem.process_rx(samples, frame_count);
-                } else {
-                    // Downmix to mono
-                    std::vector<float> mono(frame_count);
-                    for (int i = 0; i < frame_count; i++) {
-                        float sum = 0;
-                        for (int ch = 0; ch < channels; ch++)
-                            sum += samples[i * channels + ch];
-                        mono[i] = sum / channels;
-                    }
-                    modem.process_rx(mono.data(), frame_count);
-                }
-            });
-
-            // Set up playback callback -> modem TX
-            playback->set_callback([&modem](float* samples, int frame_count, int channels) {
-                if (channels == 1) {
-                    modem.process_tx(samples, frame_count);
-                } else {
-                    // Generate mono, then duplicate to all channels
-                    std::vector<float> mono(frame_count);
-                    modem.process_tx(mono.data(), frame_count);
-                    for (int i = 0; i < frame_count; i++) {
-                        for (int ch = 0; ch < channels; ch++)
-                            samples[i * channels + ch] = mono[i];
-                    }
-                }
-            });
-
-            bool cap_ok = capture->open(config.capture_device, config.sample_rate, 1, 1024);
-            bool play_ok = playback->open(config.playback_device, config.sample_rate, 1, 1024);
-
-            if (cap_ok && play_ok) {
-                capture->start();
-                playback->start();
-                printf("  Audio: running (capture + playback)\n");
+    if (capture && playback) {
+        // Set up capture callback -> modem RX
+        capture->set_callback([&modem](float* samples, int frame_count, int channels) {
+            if (channels == 1) {
+                modem.process_rx(samples, frame_count);
             } else {
-                printf("  Audio: failed to open devices\n");
-                capture.reset();
-                playback.reset();
+                // Downmix to mono
+                std::vector<float> mono(frame_count);
+                for (int i = 0; i < frame_count; i++) {
+                    float sum = 0;
+                    for (int ch = 0; ch < channels; ch++)
+                        sum += samples[i * channels + ch];
+                    mono[i] = sum / channels;
+                }
+                modem.process_rx(mono.data(), frame_count);
             }
+        });
+
+        // Set up playback callback -> modem TX
+        playback->set_callback([&modem](float* samples, int frame_count, int channels) {
+            if (channels == 1) {
+                modem.process_tx(samples, frame_count);
+            } else {
+                // Generate mono, then duplicate to all channels
+                std::vector<float> mono(frame_count);
+                modem.process_tx(mono.data(), frame_count);
+                for (int i = 0; i < frame_count; i++) {
+                    for (int ch = 0; ch < channels; ch++)
+                        samples[i * channels + ch] = mono[i];
+                }
+            }
+        });
+
+        bool cap_ok = capture->open(config.capture_device, config.sample_rate, 1, 480);
+        bool play_ok = playback->open(config.playback_device, config.sample_rate, 1, 480);
+
+        if (cap_ok && play_ok) {
+            capture->start();
+            playback->start();
+            printf("  Audio: %s\n", use_loopback ? "loopback (TX->RX)" : "running (capture + playback)");
         } else {
-            printf("  Audio: not available on this platform\n");
+            printf("  Audio: failed to open devices\n");
+            capture.reset();
+            playback.reset();
         }
+    } else if (use_audio || use_loopback) {
+        printf("  Audio: not available on this platform\n");
     } else {
         printf("  Audio: disabled\n");
     }

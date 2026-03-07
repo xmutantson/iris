@@ -107,6 +107,7 @@ public:
     // Accessors
     ModemState state() const { return state_; }
     const IrisConfig& config() const { return config_; }
+    void set_loopback_mode(bool v) { loopback_mode_ = v; }
 
     void set_rx_callback(std::function<void(const uint8_t*, size_t)> cb) {
         rx_callback_ = cb;
@@ -135,6 +136,7 @@ private:
 
     IrisConfig config_;
     std::atomic<ModemState> state_{ModemState::IDLE};
+    bool loopback_mode_ = false;  // Skip TX mute when using internal loopback
 
     // AX.25 modems
     AfskModulator afsk_mod_;
@@ -211,7 +213,9 @@ private:
 
     // RX overlap buffer for native mode
     std::vector<float> rx_overlap_buf_;
-    static constexpr size_t RX_OVERLAP_MAX = 48000 * 2;
+    static constexpr size_t RX_OVERLAP_MAX = 48000 * 12;  // 6 seconds of IQ (floats=IQ×2)
+    int pending_frame_start_ = -1;   // Cached frame start when waiting for more data
+    size_t pending_need_floats_ = 0; // Min buffer size (floats) needed before retry
 
     // Waterfall spectrum
     mutable std::mutex diag_mutex_;

@@ -1,4 +1,5 @@
 #include "agw/agw_server.h"
+#include "common/logging.h"
 #include <cstring>
 #include <cstdio>
 #include <algorithm>
@@ -155,6 +156,8 @@ void AgwServer::client_thread(int sock) {
             }
         }
 
+        printf("[AGW] Frame kind='%c' (0x%02x) from=%.10s to=%.10s data_len=%u\n",
+               hdr.data_kind, hdr.data_kind, hdr.call_from, hdr.call_to, hdr.data_len);
         handle_frame(sock, hdr, data);
     }
 
@@ -226,6 +229,7 @@ void AgwServer::handle_frame(int sock, const AgwHeader& hdr, const std::vector<u
             std::string from = get_call(hdr.call_from);
             std::string to = get_call(hdr.call_to);
             printf("[AGW] Connect request: %s -> %s\n", from.c_str(), to.c_str());
+            IRIS_LOG("AGW connect: %s -> %s (callback=%d)", from.c_str(), to.c_str(), connect_callback_ ? 1 : 0);
             connected_client_ = sock;
             if (connect_callback_) connect_callback_(to);
             break;

@@ -50,6 +50,10 @@ bool decode_native_frame(const float* iq_samples, size_t count,
                           int frame_start, const PhyConfig& default_config,
                           std::vector<uint8_t>& payload);
 
+// Returns true if last decode_native_frame failed due to buffer overflow
+// (not enough IQ data), as opposed to a real CRC/decode error.
+bool decode_was_overflow();
+
 } // namespace iris
 
 #endif

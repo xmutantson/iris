@@ -1,4 +1,5 @@
 #include "native/frame.h"
+#include "common/logging.h"
 #include <cmath>
 #include <cstring>
 
@@ -197,6 +198,9 @@ std::vector<float> build_native_frame(const uint8_t* payload, size_t len,
 static float g_last_best_corr = 0;
 float detect_best_corr() { return g_last_best_corr; }
 
+static bool g_decode_overflow = false;
+bool decode_was_overflow() { return g_decode_overflow; }
+
 int detect_frame_start(const float* iq_samples, size_t count, int sps) {
     auto preamble = generate_preamble();
     auto sync = generate_sync_word();
@@ -208,12 +212,19 @@ int detect_frame_start(const float* iq_samples, size_t count, int sps) {
     size_t ref_len = ref.size();
     size_t n_samples = count / 2;
 
-    if (n_samples < ref_len * (size_t)sps) { g_last_best_corr = -1; return -1; }
+    // Don't limit search range here — the buffer may need to accumulate
+    // more data before decode succeeds. Let decode_native_frame handle
+    // overflow gracefully (it checks bounds per-symbol).
+    // Only require enough buffer for the preamble+sync correlation itself.
+    size_t min_corr_iq = ref_len * sps;
+    if (n_samples < min_corr_iq + (size_t)sps) { g_last_best_corr = -1; return -1; }
 
     float best_corr = 0;
     int best_offset = -1;
 
-    size_t search_end = n_samples - ref_len * sps;
+    // Search the full buffer; if we detect a frame near the end,
+    // the caller will retry after accumulating more data.
+    size_t search_end = n_samples - min_corr_iq;
 
     for (size_t offset = 0; offset < search_end; offset += sps / 2) {
         float corr_re = 0, corr_im = 0;
@@ -231,7 +242,9 @@ int detect_frame_start(const float* iq_samples, size_t count, int sps) {
         }
 
         float mag = std::sqrt(corr_re * corr_re + corr_im * corr_im);
-        float norm = (energy > 0) ? mag / std::sqrt(energy) : 0;
+        // Properly normalize to [0,1]: divide by sqrt(signal_energy * ref_energy)
+        // Reference symbols are unit magnitude, so ref_energy = ref_len
+        float norm = (energy > 0) ? mag / std::sqrt(energy * (float)ref_len) : 0;
 
         if (norm > best_corr) {
             best_corr = norm;
@@ -247,6 +260,7 @@ int detect_frame_start(const float* iq_samples, size_t count, int sps) {
 bool decode_native_frame(const float* iq_samples, size_t count,
                           int frame_start, const PhyConfig& default_config,
                           std::vector<uint8_t>& payload) {
+    g_decode_overflow = false;
     int sps = default_config.samples_per_symbol;
     size_t n_samples = count / 2;
 
@@ -270,7 +284,10 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     std::vector<uint8_t> header_bits;
     for (int i = 0; i < IRIS_HEADER_LEN; i++) {
         size_t idx = header_start + i * sps;
-        if (idx >= filt_len) return false;
+        if (idx >= filt_len) {
+            g_decode_overflow = true;
+            return false;
+        }
         float re = i_filt[idx];
         header_bits.push_back(re < 0 ? 1 : 0);
     }
@@ -278,11 +295,17 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     Modulation mod;
     uint16_t payload_len;
     LdpcRate fec;
-    if (!decode_header(header_bits, mod, payload_len, fec))
+    if (!decode_header(header_bits, mod, payload_len, fec)) {
+        IRIS_LOG("[DECODE] header decode failed (frame_start=%d, header_start=%d)", frame_start, header_start);
         return false;
+    }
 
-    if (payload_len > AX25_MAX_FRAME * 4)
+    // Header decoded: mod, payload_len, fec known. Continue to payload decode.
+
+    if (payload_len > AX25_MAX_FRAME * 4) {
+        IRIS_LOG("[DECODE] payload_len %d too large", payload_len);
         return false;
+    }
 
     int payload_start = header_start + IRIS_HEADER_LEN * sps;
     int bps = bits_per_symbol(mod);
@@ -307,7 +330,10 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     std::vector<std::complex<float>> symbols;
     for (int k2 = 0; k2 < payload_symbols; k2++) {
         size_t idx = payload_start + k2 * sps;
-        if (idx >= filt_len) return false;
+        if (idx >= filt_len) {
+            g_decode_overflow = true;
+            return false;
+        }
         symbols.push_back({i_filt[idx], q_filt[idx]});
     }
 
@@ -318,13 +344,17 @@ bool decode_native_frame(const float* iq_samples, size_t count,
         if ((int)bits.size() > encoded_bits)
             bits.resize(encoded_bits);
         bits = LdpcCodec::decode(bits, fec);
-        if (bits.empty())
+        if (bits.empty()) {
+            IRIS_LOG("[DECODE] LDPC decode failed");
             return false;
+        }
     }
 
     int total_bytes = payload_len + 4;
-    if ((int)bits.size() < total_bytes * 8)
+    if ((int)bits.size() < total_bytes * 8) {
+        IRIS_LOG("[DECODE] bits too short: %zu < %d", bits.size(), total_bytes * 8);
         return false;
+    }
 
     std::vector<uint8_t> decoded_bytes(total_bytes, 0);
     for (int i = 0; i < total_bytes; i++) {
@@ -339,6 +369,9 @@ bool decode_native_frame(const float* iq_samples, size_t count,
                       ((uint32_t)decoded_bytes[payload_len + 3] << 24);
 
     uint32_t calc_crc = crc32(decoded_bytes.data(), payload_len);
+    if (rx_crc != calc_crc) {
+        IRIS_LOG("[DECODE] CRC mismatch: rx=0x%08x calc=0x%08x (len=%d)", rx_crc, calc_crc, payload_len);
+    }
     if (rx_crc != calc_crc)
         return false;
 

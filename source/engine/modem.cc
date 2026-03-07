@@ -203,17 +203,21 @@ void Modem::ptt_off() {
 }
 
 void Modem::process_rx(const float* rx_audio, int frame_count) {
-    if (state_ == ModemState::TX_AX25 || state_ == ModemState::TX_NATIVE)
-        return;
-
-    // Half-duplex holdoff after TX
-    if (rx_muted_) {
-        if (rx_mute_holdoff_ > 0) {
-            rx_mute_holdoff_ -= frame_count;
+    // In loopback mode, skip TX mute — the delay buffer handles timing
+    if (!loopback_mode_) {
+        if (state_ == ModemState::TX_AX25 || state_ == ModemState::TX_NATIVE)
             return;
+
+        // Half-duplex holdoff after TX
+        if (rx_muted_) {
+            if (rx_mute_holdoff_ > 0) {
+                rx_mute_holdoff_ -= frame_count;
+                return;
+            }
+            rx_muted_ = false;
+            rx_overlap_buf_.clear();
+            pending_frame_start_ = -1;
         }
-        rx_muted_ = false;
-        rx_overlap_buf_.clear();
     }
 
     std::vector<float> audio(rx_audio, rx_audio + frame_count);
@@ -311,9 +315,34 @@ void Modem::process_rx_native(const float* audio, int count) {
                                rx_overlap_buf_.begin() + excess);
     }
 
-    int start = detect_frame_start(rx_overlap_buf_.data(), rx_overlap_buf_.size(),
-                                    phy_config_.samples_per_symbol);
+    // If we have a pending frame waiting for more data, skip detection
+    if (pending_frame_start_ >= 0) {
+        if (rx_overlap_buf_.size() < pending_need_floats_)
+            return;  // Still not enough data, skip expensive work
+    }
+
+    int start;
+    float det_corr;
+    if (pending_frame_start_ >= 0) {
+        // Re-use cached detection result
+        start = pending_frame_start_;
+        det_corr = 0.9f;  // Known good
+        pending_frame_start_ = -1;
+    } else {
+        start = detect_frame_start(rx_overlap_buf_.data(), rx_overlap_buf_.size(),
+                                        phy_config_.samples_per_symbol);
+        det_corr = detect_best_corr();
+    }
+
     if (start >= 0) {
+        // Trim pre-frame silence to maximize buffer space for payload
+        if (start > 100) {
+            size_t trim = (size_t)(start - 10) * 2;  // Keep 10 IQ pairs margin
+            rx_overlap_buf_.erase(rx_overlap_buf_.begin(),
+                                   rx_overlap_buf_.begin() + trim);
+            start = 10;
+        }
+
         std::vector<uint8_t> payload;
         if (decode_native_frame(rx_overlap_buf_.data(), rx_overlap_buf_.size(),
                                  start, phy_config_, payload)) {
@@ -348,24 +377,42 @@ void Modem::process_rx_native(const float* audio, int count) {
 
             // Route through ARQ in any active session state
             auto arq_st = arq_.state();
-            if (arq_st == ArqState::CONNECTED ||
-                arq_st == ArqState::CONNECTING ||
-                arq_st == ArqState::LISTENING ||
-                arq_st == ArqState::HAILING ||
-                arq_st == ArqState::DISCONNECTING) {
+            if (!loopback_mode_ &&
+                (arq_st == ArqState::CONNECTED ||
+                 arq_st == ArqState::CONNECTING ||
+                 arq_st == ArqState::LISTENING ||
+                 arq_st == ArqState::HAILING ||
+                 arq_st == ArqState::DISCONNECTING)) {
                 arq_.on_frame_received(payload.data(), payload.size());
             } else {
                 if (rx_callback_)
                     rx_callback_(payload.data(), payload.size());
             }
 
-            size_t consumed = start + phy_config_.samples_per_symbol * 128;
+            // start is in IQ pairs; buffer stores interleaved floats (×2)
+            size_t consumed = (size_t)(start + phy_config_.samples_per_symbol * 128) * 2;
             if (consumed > rx_overlap_buf_.size())
                 consumed = rx_overlap_buf_.size();
             rx_overlap_buf_.erase(rx_overlap_buf_.begin(),
                                    rx_overlap_buf_.begin() + consumed);
+        } else if (decode_was_overflow()) {
+            // Cache frame start, wait until buffer doubles from current size
+            // (overestimate is fine — better than retrying every 0.5s)
+            pending_frame_start_ = start;
+            pending_need_floats_ = rx_overlap_buf_.size() * 2;
+            if (pending_need_floats_ > RX_OVERLAP_MAX)
+                pending_need_floats_ = RX_OVERLAP_MAX;
+            IRIS_LOG("RX decode: need more data at offset %d (buf=%zu IQ, need ~%zu)",
+                     start, rx_overlap_buf_.size() / 2, pending_need_floats_ / 2);
         } else {
             crc_errors_++;
+            IRIS_LOG("RX decode FAIL at offset %d corr=%.3f (crc_errors=%d)",
+                     start, det_corr, (int)crc_errors_);
+            // start is in IQ pairs; buffer stores interleaved floats (×2)
+            size_t skip = (size_t)(start + phy_config_.samples_per_symbol * 16) * 2;
+            if (skip > rx_overlap_buf_.size()) skip = rx_overlap_buf_.size();
+            rx_overlap_buf_.erase(rx_overlap_buf_.begin(),
+                                   rx_overlap_buf_.begin() + skip);
         }
     }
 

@@ -62,6 +62,11 @@ std::vector<AudioDevice> enumerate_audio_devices();
 std::unique_ptr<AudioCapture> create_capture();
 std::unique_ptr<AudioPlayback> create_playback();
 
+// Internal loopback (TX output -> RX input, no audio hardware)
+void loopback_reset();
+std::unique_ptr<AudioCapture> create_loopback_capture();
+std::unique_ptr<AudioPlayback> create_loopback_playback();
+
 // RMS level measurement (for calibration)
 float measure_rms(const float* samples, int count);
 
