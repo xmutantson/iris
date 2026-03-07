@@ -45,8 +45,11 @@ Downconverter::Downconverter(float center_freq, int sample_rate)
     : center_freq_(center_freq), sample_rate_(sample_rate),
       phase_(0.0f), lpf_pos_(0) {
     phase_inc_ = 2.0f * (float)M_PI * center_freq_ / (float)sample_rate_;
-    // LPF cutoff at 80% of center freq to pass baseband, reject 2*fc image
-    design_lpf(center_freq * 0.8f);
+    // LPF cutoff: pass baseband signal, reject 2*fc image
+    // For 2400 baud RRC alpha=0.2: half-BW = 2400*1.2/2 = 1440 Hz
+    // Use min(center*0.8, 1800) to handle various center frequencies safely
+    float cutoff = std::min(center_freq * 0.8f, 1800.0f);
+    design_lpf(cutoff);
     std::memset(lpf_buf_i_, 0, sizeof(lpf_buf_i_));
     std::memset(lpf_buf_q_, 0, sizeof(lpf_buf_q_));
 }

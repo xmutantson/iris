@@ -27,6 +27,12 @@ struct IrisConfig {
     float tx_level = 0.5f;     // 0.0-1.0, controls FM deviation
     float rx_gain = 1.0f;
 
+    // Band plan (Hz) — configurable for different radio passband characteristics
+    // Default: 300-3500 Hz (typical FM audio passband, above CTCSS max 254 Hz)
+    float band_low_hz = 300.0f;    // Low edge (must be > 254 Hz to avoid CTCSS)
+    float band_high_hz = 3500.0f;  // High edge
+    float center_freq_hz = 0.0f;   // 0 = auto (midpoint of band_low/band_high)
+
     // Radio / PTT
     std::string ptt_method = "none";   // none, rigctl, vox, cm108, serial
     std::string rigctl_host = "localhost";

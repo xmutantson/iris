@@ -1,5 +1,6 @@
 #include "engine/modem.h"
 #include "native/frame.h"
+#include "common/logging.h"
 #include <cstring>
 #include <cmath>
 #include <algorithm>
@@ -24,8 +25,19 @@ bool Modem::init(const IrisConfig& config) {
     if (config_.mode == "A" || config_.mode == "a") {
         phy_config_ = mode_a_config();
         use_upconvert_ = true;
-        upconverter_ = Upconverter(MODE_A_CENTER_FREQ, config_.sample_rate);
-        downconverter_ = Downconverter(MODE_A_CENTER_FREQ, config_.sample_rate);
+
+        // Compute center frequency from band config
+        float center = config_.center_freq_hz;
+        if (center <= 0.0f)
+            center = (config_.band_low_hz + config_.band_high_hz) / 2.0f;
+
+        IRIS_LOG("Band: %.0f-%.0f Hz, center %.0f Hz (baud %d, BW %.0f Hz)",
+                 config_.band_low_hz, config_.band_high_hz, center,
+                 phy_config_.baud_rate,
+                 phy_config_.baud_rate * (1.0f + phy_config_.rrc_alpha));
+
+        upconverter_ = Upconverter(center, config_.sample_rate);
+        downconverter_ = Downconverter(center, config_.sample_rate);
     } else if (config_.mode == "B" || config_.mode == "b") {
         phy_config_ = mode_b_config();
         use_upconvert_ = false;
@@ -114,6 +126,8 @@ bool Modem::init(const IrisConfig& config) {
         rx_callback_(cur, cur_len);
     };
     arq_cb.on_state_changed = [this](ArqState state) {
+        const char* sn[] = {"IDLE","LISTEN","HAIL","CONNECTING","CONNECTED","TURBO","DISCONNECTING"};
+        IRIS_LOG("ARQ state -> %s", sn[(int)state]);
         if (state == ArqState::CONNECTED) {
             // Init compressors for new session
             tx_compressor_.init();
@@ -295,6 +309,7 @@ void Modem::process_rx_native(const float* audio, int count) {
         if (decode_native_frame(rx_overlap_buf_.data(), rx_overlap_buf_.size(),
                                  start, phy_config_, payload)) {
             frames_rx_++;
+            IRIS_LOG("RX native frame %zu bytes at offset %d", payload.size(), start);
 
             {
                 auto preamble_ref = generate_preamble();
@@ -379,6 +394,8 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
             auto frame_data = std::move(tx_queue_.front());
             tx_queue_.pop();
 
+            IRIS_LOG("TX frame %zu bytes (native=%d)", frame_data.size(), native_mode_ ? 1 : 0);
+
             if (native_mode_) {
                 state_ = ModemState::TX_NATIVE;
                 int level = gearshift_.current_level();
@@ -403,6 +420,8 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                 else
                     tx_buffer_ = afsk_mod_.modulate(bits);
             }
+
+            IRIS_LOG("TX buffer %zu samples", tx_buffer_.size());
 
             for (auto& s : tx_buffer_)
                 s *= config_.tx_level;
@@ -490,16 +509,23 @@ void Modem::queue_tx_frame(const uint8_t* frame, size_t len) {
 }
 
 void Modem::arq_connect(const std::string& remote_callsign) {
+    IRIS_LOG("ARQ connect to %s", remote_callsign.c_str());
     native_mode_ = true;
     arq_.connect(remote_callsign);
 }
 
 void Modem::arq_disconnect() {
+    IRIS_LOG("ARQ disconnect");
     arq_.disconnect();
 }
 
 void Modem::arq_listen() {
-    native_mode_ = true;
+    // Enable native mode based on configured PHY mode (A/B/C use native PHY).
+    // AX.25-only mode stays in AX.25 for Winlink backward compatibility.
+    // XID negotiation can also upgrade AX.25 → native mid-session.
+    if (!config_.ax25_only)
+        native_mode_ = true;
+    IRIS_LOG("ARQ listen (native_mode=%d)", native_mode_ ? 1 : 0);
     arq_.listen();
 }
 

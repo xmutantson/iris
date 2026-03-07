@@ -662,6 +662,21 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
 
             ImGui::SliderFloat("TX Level", &config.tx_level, 0.0f, 1.0f, "%.2f");
             ImGui::SliderFloat("RX Gain", &config.rx_gain, 0.1f, 10.0f, "%.1f");
+
+            ImGui::Separator();
+            ImGui::Text("Band Plan (Hz)");
+            ImGui::SliderFloat("Low Edge", &config.band_low_hz, 200.0f, 1000.0f, "%.0f Hz");
+            ImGui::SliderFloat("High Edge", &config.band_high_hz, 2000.0f, 5000.0f, "%.0f Hz");
+            ImGui::SliderFloat("Center Freq", &config.center_freq_hz, 0.0f, 4000.0f, "%.0f Hz");
+            if (config.center_freq_hz < 1.0f)
+                ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
+                    "Center: auto (%.0f Hz)", (config.band_low_hz + config.band_high_hz) / 2.0f);
+            float bw = (config.band_high_hz - config.band_low_hz);
+            ImGui::TextColored(ImVec4(0.5f, 0.7f, 1.0f, 1.0f),
+                "Band: %.0f Hz wide (%.0f - %.0f)", bw, config.band_low_hz, config.band_high_hz);
+            if (config.band_low_hz < 255.0f)
+                ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
+                    "Warning: Low edge below CTCSS max (254 Hz)!");
         }
 
         if (ImGui::CollapsingHeader("Audio Devices")) {

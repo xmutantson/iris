@@ -7,9 +7,12 @@
 
 namespace iris {
 
-// Mode A upconversion: complex baseband IQ -> real audio centered at 1800 Hz
+// Mode A upconversion: complex baseband IQ -> real audio centered at fc Hz
 // out[n] = I[n]*cos(2*pi*fc*n/fs) - Q[n]*sin(2*pi*fc*n/fs)
-constexpr float MODE_A_CENTER_FREQ = 1800.0f;
+// Default center = midpoint of 300-3500 Hz band = 1900 Hz
+constexpr float MODE_A_DEFAULT_BAND_LOW  = 300.0f;
+constexpr float MODE_A_DEFAULT_BAND_HIGH = 3500.0f;
+constexpr float MODE_A_CENTER_FREQ = (MODE_A_DEFAULT_BAND_LOW + MODE_A_DEFAULT_BAND_HIGH) / 2.0f;
 
 class Upconverter {
 public:

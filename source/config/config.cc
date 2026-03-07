@@ -140,6 +140,10 @@ IrisConfig load_config(const std::string& path) {
     cfg.encryption_mode = ini.get_int("Security", "EncryptionMode", cfg.encryption_mode);
     cfg.psk_hex = ini.get("Security", "PSK", cfg.psk_hex);
 
+    cfg.band_low_hz = ini.get_float("Modem", "BandLowHz", cfg.band_low_hz);
+    cfg.band_high_hz = ini.get_float("Modem", "BandHighHz", cfg.band_high_hz);
+    cfg.center_freq_hz = ini.get_float("Modem", "CenterFreqHz", cfg.center_freq_hz);
+
     cfg.b2f_unroll = ini.get_bool("Modem", "B2FUnroll", cfg.b2f_unroll);
 
     cfg.calibrated_tx_level = ini.get_float("Calibration", "TxLevel", cfg.calibrated_tx_level);
@@ -180,6 +184,10 @@ bool save_config(const std::string& path, const IrisConfig& cfg) {
 
     ini.set_int("Security", "EncryptionMode", cfg.encryption_mode);
     ini.set("Security", "PSK", cfg.psk_hex);
+
+    ini.set_float("Modem", "BandLowHz", cfg.band_low_hz);
+    ini.set_float("Modem", "BandHighHz", cfg.band_high_hz);
+    ini.set_float("Modem", "CenterFreqHz", cfg.center_freq_hz);
 
     ini.set_bool("Modem", "B2FUnroll", cfg.b2f_unroll);
 

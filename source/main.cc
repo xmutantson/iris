@@ -60,6 +60,9 @@ static void print_usage() {
     printf("  --max-mod <mod>    Max modulation (BPSK,QPSK,QAM16,QAM64,QAM256)\n");
     printf("  --tx-level <f>     TX level 0.0-1.0 (default: 0.5)\n");
     printf("  --rx-gain <f>      RX gain multiplier (default: 1.0)\n");
+    printf("  --band-low <Hz>    Band low edge (default: 300, must be >254 for CTCSS)\n");
+    printf("  --band-high <Hz>   Band high edge (default: 3500)\n");
+    printf("  --center-freq <Hz> Center frequency (default: auto = midpoint of band)\n");
     printf("\nAudio:\n");
     printf("  --noaudio          Disable audio I/O (for testing)\n");
     printf("  --list-audio       List audio devices and exit\n");
@@ -122,6 +125,9 @@ int main(int argc, char** argv) {
     bool cli_no_waterfall = false;
     std::string cli_encrypt;
     std::string cli_psk;
+    float cli_band_low = -1.0f;
+    float cli_band_high = -1.0f;
+    float cli_center_freq = -1.0f;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--test") == 0) {
@@ -150,6 +156,12 @@ int main(int argc, char** argv) {
             cli_tx_level = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--rx-gain") == 0 && i + 1 < argc) {
             cli_rx_gain = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--band-low") == 0 && i + 1 < argc) {
+            cli_band_low = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--band-high") == 0 && i + 1 < argc) {
+            cli_band_high = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--center-freq") == 0 && i + 1 < argc) {
+            cli_center_freq = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--capture") == 0 && i + 1 < argc) {
             cli_capture = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--playback") == 0 && i + 1 < argc) {
@@ -230,6 +242,9 @@ int main(int argc, char** argv) {
     if (cli_agw_port >= 0) config.agw_port = cli_agw_port;
     if (cli_no_constellation) config.show_constellation = false;
     if (cli_no_waterfall) config.show_waterfall = false;
+    if (cli_band_low >= 0.0f) config.band_low_hz = cli_band_low;
+    if (cli_band_high >= 0.0f) config.band_high_hz = cli_band_high;
+    if (cli_center_freq >= 0.0f) config.center_freq_hz = cli_center_freq;
     if (!cli_encrypt.empty()) {
         if (cli_encrypt == "strict") config.encryption_mode = 1;
         else if (cli_encrypt == "fast") config.encryption_mode = 2;
