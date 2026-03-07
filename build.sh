@@ -9,7 +9,7 @@ CXX="${CXX:-g++}"
 OUTDIR="build"
 BINARY="iris"
 
-CXXFLAGS="-std=c++17 -Wall -Wextra -Wpedantic -I include -I third_party/monocypher"
+CXXFLAGS="-std=c++17 -Wall -Wextra -Wpedantic -I include -I third_party/monocypher -I third_party/zstd"
 IMGUI_FLAGS=""
 
 # Check for GUI mode
@@ -67,10 +67,13 @@ fi
 
 mkdir -p "$OUTDIR"
 
-# Compile Monocypher (C library)
+# Compile C libraries
 CC="${CC:-gcc}"
 MONOCYPHER_OBJ="$OUTDIR/monocypher.o"
 $CC -c -O2 -I third_party/monocypher third_party/monocypher/monocypher.c -o "$MONOCYPHER_OBJ"
+
+ZSTD_OBJ="$OUTDIR/zstd.o"
+$CC -c -O2 -I third_party/zstd third_party/zstd/zstd.c -o "$ZSTD_OBJ"
 
 SOURCES=$(find source -name '*.cc' -o -name '*.cpp' | sort)
 
@@ -94,7 +97,7 @@ fi
 echo "  CXX: $CXX"
 echo "  Sources: $(echo $SOURCES | wc -w) files"
 
-$CXX $CXXFLAGS $SOURCES "$MONOCYPHER_OBJ" -o "$OUTDIR/$BINARY" $LDFLAGS $IMGUI_FLAGS
+$CXX $CXXFLAGS $SOURCES "$MONOCYPHER_OBJ" "$ZSTD_OBJ" -o "$OUTDIR/$BINARY" $LDFLAGS $IMGUI_FLAGS
 
 echo "=== Build complete: $OUTDIR/$BINARY ==="
 ls -la "$OUTDIR/$BINARY"
