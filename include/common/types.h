@@ -50,13 +50,15 @@ constexpr int IRIS_HEADER_LEN   = 32;   // header symbols (BPSK)
 constexpr uint8_t XID_MAGIC[4] = {'I', 'R', 'I', 'S'};
 constexpr uint8_t XID_VERSION  = 0x01;
 
-// Capability bits
+// Capability bits (negotiated in CONNECT/CONNECT_ACK)
 constexpr uint16_t CAP_MODE_A      = 0x0001;
 constexpr uint16_t CAP_MODE_B      = 0x0002;
 constexpr uint16_t CAP_MODE_C      = 0x0004;
 constexpr uint16_t CAP_ENCRYPTION  = 0x0008;
 constexpr uint16_t CAP_COMPRESSION = 0x0010;
 constexpr uint16_t CAP_B2F_UNROLL  = 0x0020;
+constexpr uint16_t CAP_STREAMING   = 0x0040;  // Streaming compression context
+constexpr uint16_t CAP_PQ_CRYPTO   = 0x0080;  // Post-quantum ML-KEM-768
 
 } // namespace iris
 

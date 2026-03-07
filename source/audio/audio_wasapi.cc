@@ -30,7 +30,7 @@ public:
 
     bool open(int device_id, int sample_rate, int channels,
               int frames_per_buffer) override {
-        (void)device_id;  // TODO: device selection
+        device_id_ = device_id;
         sample_rate_ = sample_rate;
         channels_ = channels;
         buffer_frames_ = frames_per_buffer;
@@ -75,32 +75,51 @@ private:
         HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
                                       CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
                                       (void**)&enumerator);
-        if (FAILED(hr)) { running_ = false; return; }
+        if (FAILED(hr)) { printf("[Audio] Capture: CoCreateInstance failed 0x%08lx\n", hr); running_ = false; return; }
 
-        hr = enumerator->GetDefaultAudioEndpoint(eCapture, eConsole, &device);
-        if (FAILED(hr)) { enumerator->Release(); running_ = false; return; }
+        if (device_id_ >= 0) {
+            IMMDeviceCollection* col = nullptr;
+            hr = enumerator->EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, &col);
+            if (SUCCEEDED(hr)) {
+                hr = col->Item((UINT)device_id_, &device);
+                col->Release();
+            }
+        } else {
+            hr = enumerator->GetDefaultAudioEndpoint(eCapture, eConsole, &device);
+        }
+        if (FAILED(hr)) { printf("[Audio] Capture: device %d not found 0x%08lx\n", device_id_, hr); enumerator->Release(); running_ = false; return; }
 
         hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
                               (void**)&client);
-        if (FAILED(hr)) { device->Release(); enumerator->Release(); running_ = false; return; }
+        if (FAILED(hr)) { printf("[Audio] Capture: Activate failed 0x%08lx\n", hr); device->Release(); enumerator->Release(); running_ = false; return; }
 
-        WAVEFORMATEX fmt = {};
-        fmt.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
-        fmt.nChannels = (WORD)channels_;
-        fmt.nSamplesPerSec = (DWORD)sample_rate_;
-        fmt.wBitsPerSample = 32;
-        fmt.nBlockAlign = fmt.nChannels * fmt.wBitsPerSample / 8;
-        fmt.nAvgBytesPerSec = fmt.nSamplesPerSec * fmt.nBlockAlign;
-
-        REFERENCE_TIME duration = (REFERENCE_TIME)(10000000.0 * buffer_frames_ / sample_rate_);
-        hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, duration, 0, &fmt, nullptr);
-        if (FAILED(hr)) {
+        // Use device's mix format (WASAPI shared mode requires it)
+        WAVEFORMATEX* mix_fmt = nullptr;
+        hr = client->GetMixFormat(&mix_fmt);
+        if (FAILED(hr) || !mix_fmt) {
+            printf("[Audio] Capture: GetMixFormat failed 0x%08lx\n", hr);
             client->Release(); device->Release(); enumerator->Release();
             running_ = false; return;
         }
 
+        int actual_channels = mix_fmt->nChannels;
+        int actual_rate = mix_fmt->nSamplesPerSec;
+        printf("[Audio] Capture dev %d: %d ch, %d Hz, %d bit\n",
+               device_id_, actual_channels, actual_rate, mix_fmt->wBitsPerSample);
+
+        REFERENCE_TIME duration = (REFERENCE_TIME)(10000000.0 * buffer_frames_ / actual_rate);
+        hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, duration, 0, mix_fmt, nullptr);
+        if (FAILED(hr)) {
+            printf("[Audio] Capture: Initialize failed 0x%08lx\n", hr);
+            CoTaskMemFree(mix_fmt);
+            client->Release(); device->Release(); enumerator->Release();
+            running_ = false; return;
+        }
+        CoTaskMemFree(mix_fmt);
+
         hr = client->GetService(__uuidof(IAudioCaptureClient), (void**)&capture);
         if (FAILED(hr)) {
+            printf("[Audio] Capture: GetService failed 0x%08lx\n", hr);
             client->Release(); device->Release(); enumerator->Release();
             running_ = false; return;
         }
@@ -124,12 +143,11 @@ private:
 
                     // Apply volume
                     if (volume_ != 1.0f) {
-                        // Work on a copy
-                        std::vector<float> buf(fdata, fdata + frames_available * channels_);
+                        std::vector<float> buf(fdata, fdata + frames_available * actual_channels);
                         for (auto& s : buf) s *= volume_;
-                        if (callback_) callback_(buf.data(), frames_available, channels_);
+                        if (callback_) callback_(buf.data(), frames_available, actual_channels);
                     } else {
-                        if (callback_) callback_(fdata, frames_available, channels_);
+                        if (callback_) callback_(fdata, frames_available, actual_channels);
                     }
 
                     capture->ReleaseBuffer(frames_available);
@@ -146,6 +164,7 @@ private:
         enumerator->Release();
     }
 
+    int device_id_ = -1;
     int sample_rate_ = 48000;
     int channels_ = 1;
     int buffer_frames_ = 1024;
@@ -163,7 +182,7 @@ public:
 
     bool open(int device_id, int sample_rate, int channels,
               int frames_per_buffer) override {
-        (void)device_id;
+        device_id_ = device_id >= 1000 ? device_id - 1000 : device_id;
         sample_rate_ = sample_rate;
         channels_ = channels;
         buffer_frames_ = frames_per_buffer;
@@ -208,35 +227,54 @@ private:
         HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
                                       CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
                                       (void**)&enumerator);
-        if (FAILED(hr)) { running_ = false; return; }
+        if (FAILED(hr)) { printf("[Audio] Playback: CoCreateInstance failed 0x%08lx\n", hr); running_ = false; return; }
 
-        hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
-        if (FAILED(hr)) { enumerator->Release(); running_ = false; return; }
+        if (device_id_ >= 0) {
+            IMMDeviceCollection* col = nullptr;
+            hr = enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &col);
+            if (SUCCEEDED(hr)) {
+                hr = col->Item((UINT)device_id_, &device);
+                col->Release();
+            }
+        } else {
+            hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+        }
+        if (FAILED(hr)) { printf("[Audio] Playback: device %d not found 0x%08lx\n", device_id_, hr); enumerator->Release(); running_ = false; return; }
 
         hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
                               (void**)&client);
-        if (FAILED(hr)) { device->Release(); enumerator->Release(); running_ = false; return; }
+        if (FAILED(hr)) { printf("[Audio] Playback: Activate failed 0x%08lx\n", hr); device->Release(); enumerator->Release(); running_ = false; return; }
 
-        WAVEFORMATEX fmt = {};
-        fmt.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
-        fmt.nChannels = (WORD)channels_;
-        fmt.nSamplesPerSec = (DWORD)sample_rate_;
-        fmt.wBitsPerSample = 32;
-        fmt.nBlockAlign = fmt.nChannels * fmt.wBitsPerSample / 8;
-        fmt.nAvgBytesPerSec = fmt.nSamplesPerSec * fmt.nBlockAlign;
-
-        UINT32 buffer_size = 0;
-        REFERENCE_TIME duration = (REFERENCE_TIME)(10000000.0 * buffer_frames_ / sample_rate_);
-        hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, duration, 0, &fmt, nullptr);
-        if (FAILED(hr)) {
+        // Use device's mix format (WASAPI shared mode requires it)
+        WAVEFORMATEX* mix_fmt = nullptr;
+        hr = client->GetMixFormat(&mix_fmt);
+        if (FAILED(hr) || !mix_fmt) {
+            printf("[Audio] Playback: GetMixFormat failed 0x%08lx\n", hr);
             client->Release(); device->Release(); enumerator->Release();
             running_ = false; return;
         }
+
+        int actual_channels = mix_fmt->nChannels;
+        int actual_rate = mix_fmt->nSamplesPerSec;
+        printf("[Audio] Playback dev %d: %d ch, %d Hz, %d bit\n",
+               device_id_, actual_channels, actual_rate, mix_fmt->wBitsPerSample);
+
+        UINT32 buffer_size = 0;
+        REFERENCE_TIME duration = (REFERENCE_TIME)(10000000.0 * buffer_frames_ / actual_rate);
+        hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, duration, 0, mix_fmt, nullptr);
+        if (FAILED(hr)) {
+            printf("[Audio] Playback: Initialize failed 0x%08lx\n", hr);
+            CoTaskMemFree(mix_fmt);
+            client->Release(); device->Release(); enumerator->Release();
+            running_ = false; return;
+        }
+        CoTaskMemFree(mix_fmt);
 
         client->GetBufferSize(&buffer_size);
 
         hr = client->GetService(__uuidof(IAudioRenderClient), (void**)&render);
         if (FAILED(hr)) {
+            printf("[Audio] Playback: GetService failed 0x%08lx\n", hr);
             client->Release(); device->Release(); enumerator->Release();
             running_ = false; return;
         }
@@ -257,14 +295,14 @@ private:
                     float* fdata = (float*)data;
 
                     if (callback_) {
-                        callback_(fdata, available, channels_);
+                        callback_(fdata, available, actual_channels);
                         // Apply volume
                         if (volume_ != 1.0f) {
-                            for (UINT32 i = 0; i < available * (UINT32)channels_; i++)
+                            for (UINT32 i = 0; i < available * (UINT32)actual_channels; i++)
                                 fdata[i] *= volume_;
                         }
                     } else {
-                        std::memset(data, 0, available * channels_ * sizeof(float));
+                        std::memset(data, 0, available * actual_channels * sizeof(float));
                     }
 
                     render->ReleaseBuffer(available, 0);
@@ -279,6 +317,7 @@ private:
         enumerator->Release();
     }
 
+    int device_id_ = -1;
     int sample_rate_ = 48000;
     int channels_ = 1;
     int buffer_frames_ = 1024;

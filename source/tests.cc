@@ -603,30 +603,52 @@ int run_tests() {
         check("Low SNR -> level 0", gs.current_level() == 0);
     }
 
-    // LDPC
+    // LDPC (1600-bit codewords, N=1600)
     {
         printf("\n=== LDPC FEC ===\n");
+        // RATE_1_2: k=800 data bits
         std::vector<uint8_t> data;
-        for (int i = 0; i < 256; i++) data.push_back(i & 1);
+        for (int i = 0; i < 800; i++) data.push_back(i & 1);
         auto encoded = LdpcCodec::encode(data, LdpcRate::RATE_1_2);
-        check("LDPC 1/2 encoded size = 512", (int)encoded.size() == 512);
+        check("LDPC 1/2 encoded size = 1600", (int)encoded.size() == 1600);
         auto decoded = LdpcCodec::decode(encoded, LdpcRate::RATE_1_2);
-        check("LDPC 1/2 decode size = 256", (int)decoded.size() == 256);
+        check("LDPC 1/2 decode size = 800", (int)decoded.size() == 800);
         check("LDPC 1/2 round-trip", decoded == data);
 
+        // RATE_5_8: k=1000
+        std::vector<uint8_t> data58;
+        for (int i = 0; i < 1000; i++) data58.push_back((i * 3) & 1);
+        auto enc58 = LdpcCodec::encode(data58, LdpcRate::RATE_5_8);
+        check("LDPC 5/8 encoded = 1600 bits", (int)enc58.size() == 1600);
+        auto dec58 = LdpcCodec::decode(enc58, LdpcRate::RATE_5_8);
+        check("LDPC 5/8 round-trip", dec58 == data58);
+
+        // RATE_3_4: k=1200, 800 data bits padded to 1200
         auto enc34 = LdpcCodec::encode(data, LdpcRate::RATE_3_4);
-        // 256 data bits / 384 block = needs ceil(256/384)=1 block -> 512 codeword bits
-        // But 256 is padded to 384, then encoded to 512
-        check("LDPC 3/4 encoded = 512 bits", (int)enc34.size() == 512);
+        check("LDPC 3/4 encoded = 1600 bits", (int)enc34.size() == 1600);
         auto dec34 = LdpcCodec::decode(enc34, LdpcRate::RATE_3_4);
         check("LDPC 3/4 decode succeeds", !dec34.empty());
+
+        // Weak-signal rate: RATE_1_16 (k=100)
+        std::vector<uint8_t> data_weak;
+        for (int i = 0; i < 100; i++) data_weak.push_back(i & 1);
+        auto enc116 = LdpcCodec::encode(data_weak, LdpcRate::RATE_1_16);
+        check("LDPC 1/16 encoded = 1600 bits", (int)enc116.size() == 1600);
+        auto dec116 = LdpcCodec::decode(enc116, LdpcRate::RATE_1_16);
+        check("LDPC 1/16 round-trip", dec116 == data_weak);
+
+        // Dual decoder: test SPA and GBF
+        auto dec_spa = LdpcCodec::decode(encoded, LdpcRate::RATE_1_2, LdpcDecoder::SPA);
+        check("LDPC 1/2 SPA round-trip", dec_spa == data);
+        auto dec_gbf = LdpcCodec::decode(encoded, LdpcRate::RATE_1_2, LdpcDecoder::GBF);
+        check("LDPC 1/2 GBF round-trip", dec_gbf == data);
     }
 
     // LDPC error correction
     {
         printf("\n=== LDPC Error Correction ===\n");
         std::vector<uint8_t> data;
-        for (int i = 0; i < 256; i++) data.push_back((i * 7 + 3) & 1);
+        for (int i = 0; i < 800; i++) data.push_back((i * 7 + 3) & 1);
         auto encoded = LdpcCodec::encode(data, LdpcRate::RATE_1_2);
 
         // Introduce 1 bit error
@@ -643,6 +665,18 @@ int run_tests() {
         corrected = LdpcCodec::decode(corrupted, LdpcRate::RATE_1_2);
         check("LDPC 1/2 corrects 5-bit errors",
               corrected.size() == data.size() && corrected == data);
+
+        // Weak-signal error correction (RATE_1_16: k=100, p=1500)
+        std::vector<uint8_t> data_weak;
+        for (int i = 0; i < 100; i++) data_weak.push_back((i * 5 + 1) & 1);
+        auto enc_weak = LdpcCodec::encode(data_weak, LdpcRate::RATE_1_16);
+        corrupted = enc_weak;
+        // Flip 5 bits spread across the codeword
+        corrupted[10] ^= 1; corrupted[200] ^= 1; corrupted[500] ^= 1;
+        corrupted[900] ^= 1; corrupted[1300] ^= 1;
+        corrected = LdpcCodec::decode(corrupted, LdpcRate::RATE_1_16);
+        check("LDPC 1/16 corrects 5-bit errors",
+              corrected.size() == data_weak.size() && corrected == data_weak);
 
         // LDPC NONE passthrough
         auto passthrough = LdpcCodec::encode(data, LdpcRate::NONE);
@@ -840,7 +874,7 @@ int run_tests() {
         frame.payload = {'T', 'E', 'S', 'T'};
         auto data = frame.serialize();
         check("ARQ frame serialized", data.size() == 7);
-        check("ARQ frame type byte", data[0] == 0x01);
+        check("ARQ frame type byte", data[0] == (uint8_t)ArqType::CONNECT);
 
         ArqFrame decoded;
         bool ok = ArqFrame::deserialize(data.data(), data.size(), decoded);
@@ -852,7 +886,7 @@ int run_tests() {
               decoded.payload == std::vector<uint8_t>{'T', 'E', 'S', 'T'});
     }
 
-    // ARQ session loopback (commander + responder, direct frame exchange)
+    // ARQ session loopback (commander + responder, with HAIL beacon phase)
     {
         printf("\n=== ARQ Session Loopback ===\n");
 
@@ -887,23 +921,32 @@ int run_tests() {
         };
         responder.set_callbacks(rsp_cb);
 
-        // Commander connects
+        // Responder must listen before commander connects
+        responder.listen();
+        check("Responder state = LISTENING", responder.state() == ArqState::LISTENING);
+        check("Responder role = LISTENING", responder.role() == ArqRole::LISTENING);
+
+        // Commander connects — starts HAILING
         commander.connect("RSP01");
-        check("Commander state = CONNECTING", commander.state() == ArqState::CONNECTING);
+        check("Commander state = HAILING", commander.state() == ArqState::HAILING);
         check("Commander role = COMMANDER", commander.role() == ArqRole::COMMANDER);
 
-        // Deliver CONNECT to responder
-        check("CONNECT frame sent", cmd_to_rsp.size() == 1);
-        responder.on_frame_received(cmd_to_rsp[0].data(), cmd_to_rsp[0].size());
-        cmd_to_rsp.clear();
-        check("Responder state = CONNECTED", responder.state() == ArqState::CONNECTED);
-        check("Responder role = RESPONDER", responder.role() == ArqRole::RESPONDER);
+        // Pump HAIL -> HAIL_ACK -> CONNECT -> CONNECT_ACK
+        for (int pump = 0; pump < 20; pump++) {
+            auto c2r = std::move(cmd_to_rsp); cmd_to_rsp.clear();
+            for (auto& f : c2r) responder.on_frame_received(f.data(), f.size());
+            auto r2c = std::move(rsp_to_cmd); rsp_to_cmd.clear();
+            for (auto& f : r2c) commander.on_frame_received(f.data(), f.size());
+            if (commander.state() == ArqState::CONNECTED ||
+                commander.state() == ArqState::TURBOSHIFT)
+                break;
+        }
 
-        // Deliver CONNECT_ACK to commander
-        check("CONNECT_ACK sent", rsp_to_cmd.size() == 1);
-        commander.on_frame_received(rsp_to_cmd[0].data(), rsp_to_cmd[0].size());
-        rsp_to_cmd.clear();
-        check("Commander state = CONNECTED", commander.state() == ArqState::CONNECTED);
+        check("Commander connected after HAIL",
+              commander.state() == ArqState::CONNECTED ||
+              commander.state() == ArqState::TURBOSHIFT);
+        check("Responder connected", responder.state() == ArqState::CONNECTED);
+        check("Responder role = RESPONDER", responder.role() == ArqRole::RESPONDER);
 
         // Queue data and send
         const char* test_msg = "Hello from ARQ! This is a test transfer.";
@@ -912,13 +955,11 @@ int run_tests() {
         // Pump frames back and forth until transfer completes (max 50 iterations)
         int iters = 0;
         while (!transfer_done && iters < 50) {
-            // Deliver commander->responder frames
             auto c2r = std::move(cmd_to_rsp);
             cmd_to_rsp.clear();
             for (auto& f : c2r)
                 responder.on_frame_received(f.data(), f.size());
 
-            // Deliver responder->commander frames
             auto r2c = std::move(rsp_to_cmd);
             rsp_to_cmd.clear();
             for (auto& f : r2c)
@@ -935,18 +976,24 @@ int run_tests() {
         printf("  ARQ completed in %d iterations, %d retransmits\n",
                iters, commander.retransmit_count());
 
-        // Disconnect
+        // Disconnect (pump all pending frames first)
+        for (int pump = 0; pump < 5; pump++) {
+            auto c2r = std::move(cmd_to_rsp); cmd_to_rsp.clear();
+            for (auto& f : c2r) responder.on_frame_received(f.data(), f.size());
+            auto r2c = std::move(rsp_to_cmd); rsp_to_cmd.clear();
+            for (auto& f : r2c) commander.on_frame_received(f.data(), f.size());
+        }
         commander.disconnect();
         check("Commander disconnecting", commander.state() == ArqState::DISCONNECTING);
-        if (!cmd_to_rsp.empty()) {
-            responder.on_frame_received(cmd_to_rsp[0].data(), cmd_to_rsp[0].size());
-            cmd_to_rsp.clear();
+        // Pump disconnect frames through both sides
+        for (int pump = 0; pump < 5; pump++) {
+            auto c2r = std::move(cmd_to_rsp); cmd_to_rsp.clear();
+            for (auto& f : c2r) responder.on_frame_received(f.data(), f.size());
+            auto r2c = std::move(rsp_to_cmd); rsp_to_cmd.clear();
+            for (auto& f : r2c) commander.on_frame_received(f.data(), f.size());
+            if (commander.state() == ArqState::IDLE) break;
         }
         check("Responder returned to IDLE", responder.state() == ArqState::IDLE);
-        if (!rsp_to_cmd.empty()) {
-            commander.on_frame_received(rsp_to_cmd[0].data(), rsp_to_cmd[0].size());
-            rsp_to_cmd.clear();
-        }
         check("Commander returned to IDLE", commander.state() == ArqState::IDLE);
     }
 
@@ -988,16 +1035,24 @@ int run_tests() {
         std::vector<uint8_t> big_data(2048);
         for (int i = 0; i < 2048; i++) big_data[i] = (uint8_t)(i & 0xFF);
 
-        // Connect
+        // Responder listens, commander connects (with HAIL + turboshift)
+        responder.listen();
         commander.connect("RSP02");
-        for (auto& f : cmd_to_rsp)
-            responder.on_frame_received(f.data(), f.size());
-        cmd_to_rsp.clear();
-        for (auto& f : rsp_to_cmd)
-            commander.on_frame_received(f.data(), f.size());
-        rsp_to_cmd.clear();
+        for (int pump = 0; pump < 30; pump++) {
+            auto c2r = std::move(cmd_to_rsp);
+            cmd_to_rsp.clear();
+            for (auto& f : c2r)
+                responder.on_frame_received(f.data(), f.size());
+            auto r2c = std::move(rsp_to_cmd);
+            rsp_to_cmd.clear();
+            for (auto& f : r2c)
+                commander.on_frame_received(f.data(), f.size());
+            if (commander.state() == ArqState::CONNECTED)
+                break;
+        }
 
-        check("Multi-frame: connected", commander.state() == ArqState::CONNECTED);
+        check("Multi-frame: connected", commander.state() == ArqState::CONNECTED ||
+              commander.state() == ArqState::TURBOSHIFT);
 
         // Queue all data
         commander.send_data(big_data.data(), big_data.size());

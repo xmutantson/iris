@@ -135,8 +135,16 @@ IrisConfig load_config(const std::string& path) {
     cfg.serial_baud = ini.get_int("Radio", "SerialBaud", cfg.serial_baud);
 
     cfg.kiss_port = ini.get_int("Network", "KISSPort", cfg.kiss_port);
+    cfg.agw_port = ini.get_int("Network", "AGWPort", cfg.agw_port);
+
+    cfg.encryption_mode = ini.get_int("Security", "EncryptionMode", cfg.encryption_mode);
+    cfg.psk_hex = ini.get("Security", "PSK", cfg.psk_hex);
+
+    cfg.b2f_unroll = ini.get_bool("Modem", "B2FUnroll", cfg.b2f_unroll);
 
     cfg.calibrated_tx_level = ini.get_float("Calibration", "TxLevel", cfg.calibrated_tx_level);
+
+    cfg.log_enabled = ini.get_bool("Logging", "LogEnabled", cfg.log_enabled);
 
     cfg.show_constellation = ini.get_bool("GUI", "ShowConstellation", cfg.show_constellation);
     cfg.show_waterfall = ini.get_bool("GUI", "ShowWaterfall", cfg.show_waterfall);
@@ -168,8 +176,16 @@ bool save_config(const std::string& path, const IrisConfig& cfg) {
     ini.set_int("Radio", "SerialBaud", cfg.serial_baud);
 
     ini.set_int("Network", "KISSPort", cfg.kiss_port);
+    ini.set_int("Network", "AGWPort", cfg.agw_port);
+
+    ini.set_int("Security", "EncryptionMode", cfg.encryption_mode);
+    ini.set("Security", "PSK", cfg.psk_hex);
+
+    ini.set_bool("Modem", "B2FUnroll", cfg.b2f_unroll);
 
     ini.set_float("Calibration", "TxLevel", cfg.calibrated_tx_level);
+
+    ini.set_bool("Logging", "LogEnabled", cfg.log_enabled);
 
     ini.set_bool("GUI", "ShowConstellation", cfg.show_constellation);
     ini.set_bool("GUI", "ShowWaterfall", cfg.show_waterfall);

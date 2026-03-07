@@ -40,11 +40,15 @@ bool Modem::init(const IrisConfig& config) {
     native_demod_ = std::make_unique<NativeDemodulator>(phy_config_, config_.sample_rate);
 
     local_cap_.version = XID_VERSION;
-    local_cap_.capabilities = CAP_MODE_A;
+    local_cap_.capabilities = CAP_MODE_A | CAP_COMPRESSION | CAP_STREAMING;
     if (config_.mode == "B" || config_.mode == "b")
         local_cap_.capabilities |= CAP_MODE_B;
     if (config_.mode == "C" || config_.mode == "c")
         local_cap_.capabilities |= CAP_MODE_C;
+    if (config_.encryption_mode > 0)
+        local_cap_.capabilities |= CAP_ENCRYPTION;
+    if (config_.b2f_unroll)
+        local_cap_.capabilities |= CAP_B2F_UNROLL;
     local_cap_.max_modulation = config_.max_modulation;
 
     int max_mod_idx = (int)config_.max_modulation;
@@ -59,6 +63,7 @@ bool Modem::init(const IrisConfig& config) {
 
     // Wire ARQ session
     arq_.set_callsign(config_.callsign);
+    arq_.set_local_capabilities(local_cap_.capabilities);
     ArqCallbacks arq_cb;
     arq_cb.send_frame = [this](const uint8_t* data, size_t len) {
         // ARQ frames go directly to TX queue (not back through ARQ)
@@ -66,8 +71,92 @@ bool Modem::init(const IrisConfig& config) {
         tx_queue_.push(std::vector<uint8_t>(data, data + len));
     };
     arq_cb.on_data_received = [this](const uint8_t* data, size_t len) {
-        if (rx_callback_)
-            rx_callback_(data, len);
+        if (!rx_callback_) return;
+        const uint8_t* cur = data;
+        size_t cur_len = len;
+
+        // Layer 1: Decrypt if encryption active
+        std::vector<uint8_t> decrypted;
+        if (cipher_.is_active() && cur_len > 0) {
+            decrypted.resize(cur_len);
+            int dec = cipher_.decrypt(cur, (int)cur_len, decrypted.data(), (int)decrypted.size(),
+                                       rx_batch_counter_++, crypto_direction_ ^ 1, AUTH_TAG_SIZE);
+            if (dec > 0) {
+                cur = decrypted.data();
+                cur_len = dec;
+            }
+        }
+
+        // Layer 2: Decompress if compression negotiated
+        std::vector<uint8_t> decompressed;
+        if (arq_.negotiated(CAP_COMPRESSION) && cur_len > 0) {
+            decompressed.resize(cur_len * 4 + 4096);
+            int dec_len = rx_compressor_.decompress_block(cur, (int)cur_len,
+                                                          decompressed.data(), (int)decompressed.size());
+            if (dec_len > 0) {
+                cur = decompressed.data();
+                cur_len = dec_len;
+            }
+        }
+
+        // Layer 3: B2F reroll if negotiated
+        std::vector<uint8_t> rerolled;
+        if (arq_.negotiated(CAP_B2F_UNROLL) && b2f_handler_.is_initialized() && cur_len > 0) {
+            rerolled.resize(cur_len * 2 + 4096);
+            int rx_len = b2f_handler_.filter_rx((const char*)cur, (int)cur_len,
+                                                 (char*)rerolled.data(), (int)rerolled.size());
+            if (rx_len > 0) {
+                cur = rerolled.data();
+                cur_len = rx_len;
+            }
+        }
+
+        rx_callback_(cur, cur_len);
+    };
+    arq_cb.on_state_changed = [this](ArqState state) {
+        if (state == ArqState::CONNECTED) {
+            // Init compressors for new session
+            tx_compressor_.init();
+            rx_compressor_.init();
+            if (arq_.negotiated(CAP_STREAMING)) {
+                tx_compressor_.streaming_enable();
+                rx_compressor_.streaming_enable();
+            }
+
+            // Init encryption if negotiated
+            if (arq_.negotiated(CAP_ENCRYPTION) && config_.encryption_mode > 0) {
+                // Parse PSK from hex
+                std::vector<uint8_t> psk;
+                for (size_t i = 0; i + 1 < config_.psk_hex.size(); i += 2) {
+                    char byte_str[3] = {config_.psk_hex[i], config_.psk_hex[i+1], 0};
+                    psk.push_back((uint8_t)strtol(byte_str, nullptr, 16));
+                }
+                // X25519 key exchange happens via CONNECT/CONNECT_ACK payloads
+                // (handled by ARQ session). Here we just derive the session key.
+                bool is_commander = (arq_.role() == ArqRole::COMMANDER);
+                crypto_direction_ = is_commander ? DIR_CMD_TO_RSP : DIR_RSP_TO_CMD;
+                cipher_.derive_session_key(config_.callsign.c_str(),
+                                            arq_.remote_callsign().c_str(),
+                                            psk.empty() ? nullptr : psk.data(),
+                                            (int)psk.size(), false);
+                cipher_.activate();
+                tx_batch_counter_ = 0;
+                rx_batch_counter_ = 0;
+            }
+
+            // Init B2F handler if negotiated
+            if (arq_.negotiated(CAP_B2F_UNROLL)) {
+                b2f_handler_.init();
+                b2f_handler_.unroll_enabled = true;
+            }
+        } else if (state == ArqState::IDLE) {
+            tx_compressor_.deinit();
+            rx_compressor_.deinit();
+            cipher_.wipe();
+            b2f_handler_.deinit();
+        }
+        if (state_callback_)
+            state_callback_(state, arq_.remote_callsign());
     };
     arq_.set_callbacks(arq_cb);
 
@@ -233,9 +322,13 @@ void Modem::process_rx_native(const float* audio, int count) {
                     last_constellation_ = native_demod_->symbols();
             }
 
-            // Route through ARQ if session active
-            if (arq_.state() == ArqState::CONNECTED ||
-                arq_.state() == ArqState::CONNECTING) {
+            // Route through ARQ in any active session state
+            auto arq_st = arq_.state();
+            if (arq_st == ArqState::CONNECTED ||
+                arq_st == ArqState::CONNECTING ||
+                arq_st == ArqState::LISTENING ||
+                arq_st == ArqState::HAILING ||
+                arq_st == ArqState::DISCONNECTING) {
                 arq_.on_frame_received(payload.data(), payload.size());
             } else {
                 if (rx_callback_)
@@ -340,10 +433,59 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
 
 void Modem::queue_tx_frame(const uint8_t* frame, size_t len) {
     if (native_mode_ && arq_.state() == ArqState::CONNECTED) {
-        arq_.send_data(frame, len);
+        const uint8_t* cur = frame;
+        size_t cur_len = len;
+
+        // Layer 1: B2F unroll if negotiated (strip LZHUF on TX)
+        std::vector<uint8_t> unrolled;
+        if (arq_.negotiated(CAP_B2F_UNROLL) && b2f_handler_.is_initialized() && cur_len > 0) {
+            unrolled.resize(cur_len * 2 + 4096);
+            int tx_len = b2f_handler_.filter_tx((const char*)cur, (int)cur_len,
+                                                 (char*)unrolled.data(), (int)unrolled.size());
+            if (tx_len > 0) {
+                cur = unrolled.data();
+                cur_len = tx_len;
+            }
+        }
+
+        // Layer 2: Compress if negotiated
+        std::vector<uint8_t> compressed;
+        if (arq_.negotiated(CAP_COMPRESSION) && cur_len > 0) {
+            compressed.resize(cur_len + COMPRESS_HEADER_SIZE + 256);
+            int comp_len = tx_compressor_.compress_block(cur, (int)cur_len,
+                                                         compressed.data(), (int)compressed.size());
+            if (comp_len > 0) {
+                tx_compressor_.streaming_commit(cur, (int)cur_len);
+                cur = compressed.data();
+                cur_len = comp_len;
+            }
+        }
+
+        // Layer 3: Encrypt if active
+        std::vector<uint8_t> encrypted;
+        if (cipher_.is_active() && cur_len > 0) {
+            encrypted.resize(cur_len + AUTH_TAG_SIZE);
+            int enc_len = cipher_.encrypt(cur, (int)cur_len, encrypted.data(), (int)encrypted.size(),
+                                           tx_batch_counter_++, crypto_direction_, AUTH_TAG_SIZE);
+            if (enc_len > 0) {
+                cur = encrypted.data();
+                cur_len = enc_len;
+            }
+        }
+
+        arq_.send_data(cur, cur_len);
         return;
     }
     std::lock_guard<std::mutex> lock(tx_mutex_);
+
+    // If AX.25 mode and native upgrade allowed, send XID before first user frame
+    if (!native_mode_ && !config_.ax25_only && !xid_sent_) {
+        auto xid_frame = build_xid_frame(config_.callsign.c_str(), "CQ    ",
+                                           local_cap_);
+        tx_queue_.push(std::move(xid_frame));
+        xid_sent_ = true;
+    }
+
     tx_queue_.push(std::vector<uint8_t>(frame, frame + len));
 }
 
@@ -354,6 +496,11 @@ void Modem::arq_connect(const std::string& remote_callsign) {
 
 void Modem::arq_disconnect() {
     arq_.disconnect();
+}
+
+void Modem::arq_listen() {
+    native_mode_ = true;
+    arq_.listen();
 }
 
 void Modem::tick() {

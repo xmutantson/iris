@@ -6,55 +6,51 @@
 
 namespace iris {
 
-// All rates use 512-bit codewords, systematic: [data | parity]
-static constexpr int LDPC_N = 512;
-static constexpr int LDPC_BLOCK_1_2 = 256;   // k=256, p=256
-static constexpr int LDPC_BLOCK_3_4 = 384;   // k=384, p=128
-static constexpr int LDPC_BLOCK_7_8 = 448;   // k=448, p=64
+// All rates use 1600-bit codewords, systematic: [data | parity]
+static constexpr int LDPC_N = 1600;
+
+// Data bits (K) for each rate — P = N - K
+static int rate_to_k(LdpcRate rate) {
+    switch (rate) {
+        case LdpcRate::RATE_1_16: return 100;
+        case LdpcRate::RATE_2_16: return 200;
+        case LdpcRate::RATE_3_16: return 300;
+        case LdpcRate::RATE_4_16: return 400;
+        case LdpcRate::RATE_5_16: return 500;
+        case LdpcRate::RATE_6_16: return 600;
+        case LdpcRate::RATE_1_2:  return 800;
+        case LdpcRate::RATE_5_8:  return 1000;
+        case LdpcRate::RATE_3_4:  return 1200;
+        case LdpcRate::RATE_7_8:  return 1400;
+        default: return 0;
+    }
+}
 
 // H matrix: p rows (check nodes) x n columns (variable nodes)
-// Stored as adjacency list per check node.
-// Parity bits (columns k..n-1) are assigned so that each parity bit
-// appears in exactly one check equation as the "pivot" for encoding.
-// Check j's pivot is parity bit j (column k+j).
 struct LdpcMatrix {
     int n, k, p;
-    std::vector<std::vector<int>> check_nodes; // check_nodes[j] = columns in check j
+    std::vector<std::vector<int>> check_nodes;
 
     LdpcMatrix() : n(0), k(0), p(0) {}
-
-    LdpcMatrix(int n_, int k_) : n(n_), k(k_), p(n_ - k_) {
-        build_h();
-    }
+    LdpcMatrix(int n_, int k_) : n(n_), k(k_), p(n_ - k_) { build_h(); }
 
     void build_h() {
         check_nodes.resize(p);
+        // Column weight: higher for low-rate codes (more redundancy)
+        int wc = (p >= 600) ? 3 : (p >= 200) ? 3 : 2;
 
-        // Each check node j connects to:
-        //   - Its pivot parity bit at column k+j (for encoding)
-        //   - A subset of data bits (columns 0..k-1)
-        //
-        // We use a regular structure: each data bit participates in wc checks.
-        // Column weight for data bits: wc=3 (high rate: wc=2)
-        int wc = (p >= 128) ? 3 : 2;
-
-        // First, assign data columns to checks
         for (int j = 0; j < p; j++) {
             check_nodes[j].clear();
-            // Always include the pivot parity bit
-            check_nodes[j].push_back(k + j);
+            check_nodes[j].push_back(k + j); // pivot parity bit
         }
 
-        // Distribute data bits across checks using wc layers
         for (int layer = 0; layer < wc; layer++) {
             for (int col = 0; col < k; col++) {
-                // Map data column to a check node
                 int check = (col + layer * (k / std::max(1, wc))) % p;
                 check_nodes[check].push_back(col);
             }
         }
 
-        // Sort and deduplicate each check's variable list
         for (int j = 0; j < p; j++) {
             std::sort(check_nodes[j].begin(), check_nodes[j].end());
             check_nodes[j].erase(
@@ -64,45 +60,76 @@ struct LdpcMatrix {
     }
 };
 
+// Lazy-initialized matrix cache
 static LdpcMatrix& get_matrix(LdpcRate rate) {
-    static LdpcMatrix m12(LDPC_N, LDPC_BLOCK_1_2);
-    static LdpcMatrix m34(LDPC_N, LDPC_BLOCK_3_4);
-    static LdpcMatrix m78(LDPC_N, LDPC_BLOCK_7_8);
+    static LdpcMatrix matrices[10];
+    static bool inited[10] = {};
+
+    int idx;
     switch (rate) {
-        case LdpcRate::RATE_3_4: return m34;
-        case LdpcRate::RATE_7_8: return m78;
-        default: return m12;
+        case LdpcRate::RATE_1_16: idx = 0; break;
+        case LdpcRate::RATE_2_16: idx = 1; break;
+        case LdpcRate::RATE_3_16: idx = 2; break;
+        case LdpcRate::RATE_4_16: idx = 3; break;
+        case LdpcRate::RATE_5_16: idx = 4; break;
+        case LdpcRate::RATE_6_16: idx = 5; break;
+        case LdpcRate::RATE_1_2:  idx = 6; break;
+        case LdpcRate::RATE_5_8:  idx = 7; break;
+        case LdpcRate::RATE_3_4:  idx = 8; break;
+        case LdpcRate::RATE_7_8:  idx = 9; break;
+        default: idx = 6; break; // fallback to 1/2
     }
+
+    if (!inited[idx]) {
+        int k = rate_to_k(rate);
+        if (k <= 0) k = 800;
+        matrices[idx] = LdpcMatrix(LDPC_N, k);
+        inited[idx] = true;
+    }
+    return matrices[idx];
 }
+
+// --- Public API ---
 
 int LdpcCodec::block_size(LdpcRate rate) {
-    switch (rate) {
-        case LdpcRate::NONE:     return 0;
-        case LdpcRate::RATE_1_2: return LDPC_BLOCK_1_2;
-        case LdpcRate::RATE_3_4: return LDPC_BLOCK_3_4;
-        case LdpcRate::RATE_7_8: return LDPC_BLOCK_7_8;
-    }
-    return LDPC_BLOCK_1_2;
+    int k = rate_to_k(rate);
+    return k > 0 ? k : 0;
 }
 
-int LdpcCodec::codeword_size(LdpcRate) {
-    return LDPC_N;
-}
+int LdpcCodec::codeword_size(LdpcRate) { return LDPC_N; }
 
 int LdpcCodec::parity_bits(LdpcRate rate) {
     return codeword_size(rate) - block_size(rate);
 }
 
 float LdpcCodec::code_rate(LdpcRate rate) {
-    return (float)block_size(rate) / (float)codeword_size(rate);
+    int k = block_size(rate);
+    return k > 0 ? (float)k / (float)LDPC_N : 0.0f;
 }
 
 LdpcRate fec_to_ldpc_rate(int num, int den) {
+    if (den == 16) {
+        switch (num) {
+            case 1: return LdpcRate::RATE_1_16;
+            case 2: return LdpcRate::RATE_2_16;
+            case 3: return LdpcRate::RATE_3_16;
+            case 4: return LdpcRate::RATE_4_16;
+            case 5: return LdpcRate::RATE_5_16;
+            case 6: return LdpcRate::RATE_6_16;
+            case 8: return LdpcRate::RATE_1_2;
+            case 10: return LdpcRate::RATE_5_8;
+            case 12: return LdpcRate::RATE_3_4;
+            case 14: return LdpcRate::RATE_7_8;
+        }
+    }
     if (num == 1 && den == 2) return LdpcRate::RATE_1_2;
+    if (num == 5 && den == 8) return LdpcRate::RATE_5_8;
     if (num == 3 && den == 4) return LdpcRate::RATE_3_4;
     if (num == 7 && den == 8) return LdpcRate::RATE_7_8;
     return LdpcRate::NONE;
 }
+
+// --- Encoder ---
 
 std::vector<uint8_t> LdpcCodec::encode(const std::vector<uint8_t>& data_bits, LdpcRate rate) {
     if (rate == LdpcRate::NONE) return data_bits;
@@ -119,18 +146,13 @@ std::vector<uint8_t> LdpcCodec::encode(const std::vector<uint8_t>& data_bits, Ld
 
     for (size_t offset = 0; offset < padded.size(); offset += k) {
         std::vector<uint8_t> codeword(n, 0);
-
-        // Copy data bits (systematic)
         for (int i = 0; i < k; i++)
             codeword[i] = padded[offset + i] & 1;
 
-        // Compute each parity bit from its check equation:
-        // Check j: XOR of all connected columns = 0
-        // Pivot is column k+j, so: codeword[k+j] = XOR of all other connected columns
         for (int j = 0; j < H.p; j++) {
             uint8_t syndrome = 0;
             for (int col : H.check_nodes[j]) {
-                if (col != k + j) // skip pivot
+                if (col != k + j)
                     syndrome ^= codeword[col];
             }
             codeword[k + j] = syndrome & 1;
@@ -139,114 +161,318 @@ std::vector<uint8_t> LdpcCodec::encode(const std::vector<uint8_t>& data_bits, Ld
         for (int i = 0; i < n; i++)
             output.push_back(codeword[i]);
     }
-
     return output;
 }
 
-std::vector<uint8_t> LdpcCodec::decode(const std::vector<uint8_t>& codeword, LdpcRate rate) {
+// --- Decoder helpers ---
+
+struct DecoderWorkspace {
+    int n, p;
+    std::vector<std::vector<int>> var_to_checks;
+    std::vector<std::vector<int>> check_var_idx;
+    std::vector<std::vector<float>> c2v;
+    std::vector<float> posterior;
+
+    void init(const LdpcMatrix& H) {
+        n = H.n;
+        p = H.p;
+        var_to_checks.assign(n, {});
+        for (int j = 0; j < p; j++)
+            for (int col : H.check_nodes[j])
+                var_to_checks[col].push_back(j);
+
+        check_var_idx.resize(p);
+        for (int j = 0; j < p; j++) {
+            check_var_idx[j].assign(n, -1);
+            for (int idx = 0; idx < (int)H.check_nodes[j].size(); idx++)
+                check_var_idx[j][H.check_nodes[j][idx]] = idx;
+        }
+
+        c2v.resize(p);
+        for (int j = 0; j < p; j++)
+            c2v[j].assign(H.check_nodes[j].size(), 0.0f);
+
+        posterior.resize(n);
+    }
+
+    void reset_messages(const LdpcMatrix&) {
+        for (int j = 0; j < p; j++)
+            std::fill(c2v[j].begin(), c2v[j].end(), 0.0f);
+    }
+
+    bool check_syndrome(const LdpcMatrix& H) {
+        for (int j = 0; j < p; j++) {
+            int parity = 0;
+            for (int col : H.check_nodes[j])
+                if (posterior[col] < 0) parity ^= 1;
+            if (parity != 0) return false;
+        }
+        return true;
+    }
+};
+
+// --- Min-Sum Decoder ---
+
+static int decode_min_sum(const std::vector<float>& llr, const LdpcMatrix& H,
+                           DecoderWorkspace& ws, int max_iter,
+                           std::atomic<bool>* abort_flag) {
+    constexpr float SCALE = 0.75f;
+    ws.reset_messages(H);
+
+    for (int iter = 0; iter < max_iter; iter++) {
+        if (abort_flag && abort_flag->load(std::memory_order_relaxed))
+            return -(iter + 1);
+
+        // Check node update
+        for (int j = 0; j < H.p; j++) {
+            int deg = (int)H.check_nodes[j].size();
+            std::vector<float> v2c(deg);
+            for (int idx = 0; idx < deg; idx++) {
+                int v = H.check_nodes[j][idx];
+                float msg = llr[v];
+                for (int jj : ws.var_to_checks[v]) {
+                    if (jj == j) continue;
+                    int vi = ws.check_var_idx[jj][v];
+                    if (vi >= 0) msg += ws.c2v[jj][vi];
+                }
+                v2c[idx] = msg;
+            }
+
+            for (int idx = 0; idx < deg; idx++) {
+                float min_abs = 1e9f;
+                int sign = 1;
+                for (int idx2 = 0; idx2 < deg; idx2++) {
+                    if (idx2 == idx) continue;
+                    float a = std::abs(v2c[idx2]);
+                    if (a < min_abs) min_abs = a;
+                    if (v2c[idx2] < 0) sign = -sign;
+                }
+                ws.c2v[j][idx] = sign * min_abs * SCALE;
+            }
+        }
+
+        // Posterior
+        for (int i = 0; i < H.n; i++) {
+            ws.posterior[i] = llr[i];
+            for (int j : ws.var_to_checks[i]) {
+                int vi = ws.check_var_idx[j][i];
+                if (vi >= 0) ws.posterior[i] += ws.c2v[j][vi];
+            }
+        }
+
+        if (ws.check_syndrome(H))
+            return iter + 1;
+    }
+    return max_iter;
+}
+
+// --- Sum-Product Algorithm (SPA) Decoder ---
+
+static int decode_spa(const std::vector<float>& llr, const LdpcMatrix& H,
+                       DecoderWorkspace& ws, int max_iter,
+                       std::atomic<bool>* abort_flag) {
+    ws.reset_messages(H);
+
+    // Q messages: Q[j][idx] = variable-to-check message
+    std::vector<std::vector<float>> Q(H.p);
+    for (int j = 0; j < H.p; j++)
+        Q[j].assign(H.check_nodes[j].size(), 0.0f);
+
+    // Initialize Q with channel LLRs
+    for (int j = 0; j < H.p; j++) {
+        for (int idx = 0; idx < (int)H.check_nodes[j].size(); idx++) {
+            Q[j][idx] = llr[H.check_nodes[j][idx]];
+        }
+    }
+
+    for (int iter = 0; iter < max_iter; iter++) {
+        if (abort_flag && abort_flag->load(std::memory_order_relaxed))
+            return -(iter + 1);
+
+        // Check node update: R[j][idx] = 2 * atanh(product of tanh(Q[j][k]/2) for k!=idx)
+        for (int j = 0; j < H.p; j++) {
+            int deg = (int)H.check_nodes[j].size();
+            for (int idx = 0; idx < deg; idx++) {
+                float product = 1.0f;
+                for (int k = 0; k < deg; k++) {
+                    if (k == idx) continue;
+                    float t = tanhf(0.5f * Q[j][k]);
+                    // Clamp to avoid singularities
+                    if (t > 0.9999999f) t = 0.9999999f;
+                    if (t < -0.9999999f) t = -0.9999999f;
+                    product *= t;
+                }
+                if (product > 0.9999999f) product = 0.9999999f;
+                if (product < -0.9999999f) product = -0.9999999f;
+                ws.c2v[j][idx] = 2.0f * atanhf(product);
+            }
+        }
+
+        // Variable node update: Q[j][idx] = LLR[v] + sum R[k][v] for k!=j
+        // Also compute posterior
+        for (int i = 0; i < H.n; i++) {
+            float sum_r = 0.0f;
+            for (int j : ws.var_to_checks[i]) {
+                int vi = ws.check_var_idx[j][i];
+                if (vi >= 0) sum_r += ws.c2v[j][vi];
+            }
+            ws.posterior[i] = llr[i] + sum_r;
+
+            // Update Q messages
+            for (int j : ws.var_to_checks[i]) {
+                int vi = ws.check_var_idx[j][i];
+                if (vi >= 0)
+                    Q[j][vi] = ws.posterior[i] - ws.c2v[j][vi];
+            }
+        }
+
+        if (ws.check_syndrome(H))
+            return iter + 1;
+    }
+    return max_iter;
+}
+
+// --- Gradient Bit-Flipping (GBF) Decoder ---
+
+static int decode_gbf(const std::vector<float>& llr, const LdpcMatrix& H,
+                       DecoderWorkspace& ws, int max_iter,
+                       std::atomic<bool>* abort_flag) {
+    constexpr float ETA = 1.0f; // correction rate
+
+    // Initialize LLR estimates
+    std::vector<float> llr_est(llr.begin(), llr.end());
+
+    for (int iter = 0; iter < max_iter; iter++) {
+        if (abort_flag && abort_flag->load(std::memory_order_relaxed))
+            return -(iter + 1);
+
+        // Compute syndrome for each check
+        std::vector<int> syndrome(H.p);
+        bool all_satisfied = true;
+        for (int j = 0; j < H.p; j++) {
+            int parity = 0;
+            for (int col : H.check_nodes[j])
+                if (llr_est[col] < 0) parity ^= 1;
+            syndrome[j] = parity;
+            if (parity != 0) all_satisfied = false;
+        }
+
+        if (all_satisfied) {
+            for (int i = 0; i < H.n; i++)
+                ws.posterior[i] = llr_est[i];
+            return iter + 1;
+        }
+
+        // Compute gradient delta for each variable
+        std::vector<float> delta(H.n, 0.0f);
+        for (int j = 0; j < H.p; j++) {
+            float contrib = 2.0f * syndrome[j] - 1.0f; // +1 if unsatisfied, -1 if satisfied
+            for (int col : H.check_nodes[j])
+                delta[col] += contrib;
+        }
+
+        // Flip bits with positive delta
+        for (int i = 0; i < H.n; i++) {
+            if (delta[i] > 0) {
+                float sign_flip = (llr_est[i] < 0) ? 1.0f : -1.0f;
+                llr_est[i] += sign_flip * delta[i] * ETA;
+            }
+        }
+    }
+
+    // Copy final estimates to posterior
+    for (int i = 0; i < H.n; i++)
+        ws.posterior[i] = llr_est[i];
+
+    return max_iter;
+}
+
+// --- Unified decode entry points ---
+
+std::vector<uint8_t> LdpcCodec::decode(const std::vector<uint8_t>& codeword, LdpcRate rate,
+                                         LdpcDecoder algo, int max_iter,
+                                         std::atomic<bool>* abort_flag) {
     if (rate == LdpcRate::NONE) return codeword;
 
     int k = block_size(rate);
     int n = codeword_size(rate);
-
-    if (codeword.size() % n != 0)
-        return {};
+    if (codeword.size() % n != 0) return {};
 
     auto& H = get_matrix(rate);
-    constexpr int MAX_ITER = 50;
-    constexpr float SCALE = 0.75f; // min-sum scaling
+    DecoderWorkspace ws;
+    ws.init(H);
 
     std::vector<uint8_t> output;
     output.reserve(codeword.size() / n * k);
 
-    // Build variable-to-check adjacency once
-    std::vector<std::vector<int>> var_to_checks(n);
-    for (int j = 0; j < H.p; j++) {
-        for (int col : H.check_nodes[j]) {
-            var_to_checks[col].push_back(j);
-        }
-    }
-
-    // For fast lookup: position of variable col in check j's list
-    // check_var_idx[j][col] = index of col in check_nodes[j], or -1
-    std::vector<std::vector<int>> check_var_idx(H.p);
-    for (int j = 0; j < H.p; j++) {
-        check_var_idx[j].assign(n, -1);
-        for (int idx = 0; idx < (int)H.check_nodes[j].size(); idx++)
-            check_var_idx[j][H.check_nodes[j][idx]] = idx;
-    }
-
     for (size_t offset = 0; offset < codeword.size(); offset += n) {
-        // Channel LLRs: 0 -> +3.0, 1 -> -3.0 (soft-ish from hard bits)
         std::vector<float> llr(n);
         for (int i = 0; i < n; i++)
             llr[i] = (codeword[offset + i] & 1) ? -3.0f : 3.0f;
 
-        // c2v messages: c2v[j][idx] for check j, variable index idx
-        std::vector<std::vector<float>> c2v(H.p);
-        for (int j = 0; j < H.p; j++)
-            c2v[j].assign(H.check_nodes[j].size(), 0.0f);
-
-        std::vector<float> posterior(n);
-        bool converged = false;
-
-        for (int iter = 0; iter < MAX_ITER && !converged; iter++) {
-            // Check node update (min-sum)
-            for (int j = 0; j < H.p; j++) {
-                int deg = (int)H.check_nodes[j].size();
-
-                // Compute v2c messages: v2c[idx] = llr[v] + sum c2v from other checks
-                std::vector<float> v2c(deg);
-                for (int idx = 0; idx < deg; idx++) {
-                    int v = H.check_nodes[j][idx];
-                    float msg = llr[v];
-                    for (int jj : var_to_checks[v]) {
-                        if (jj == j) continue;
-                        int vi = check_var_idx[jj][v];
-                        if (vi >= 0) msg += c2v[jj][vi];
-                    }
-                    v2c[idx] = msg;
-                }
-
-                // Min-sum: c2v[j][idx] = sign_product * min_abs (excluding idx)
-                for (int idx = 0; idx < deg; idx++) {
-                    float min_abs = 1e9f;
-                    int sign = 1;
-                    for (int idx2 = 0; idx2 < deg; idx2++) {
-                        if (idx2 == idx) continue;
-                        float a = std::abs(v2c[idx2]);
-                        if (a < min_abs) min_abs = a;
-                        if (v2c[idx2] < 0) sign = -sign;
-                    }
-                    c2v[j][idx] = sign * min_abs * SCALE;
-                }
-            }
-
-            // Compute posterior LLRs
-            for (int i = 0; i < n; i++) {
-                posterior[i] = llr[i];
-                for (int j : var_to_checks[i]) {
-                    int vi = check_var_idx[j][i];
-                    if (vi >= 0) posterior[i] += c2v[j][vi];
-                }
-            }
-
-            // Syndrome check
-            converged = true;
-            for (int j = 0; j < H.p; j++) {
-                int parity = 0;
-                for (int col : H.check_nodes[j]) {
-                    if (posterior[col] < 0) parity ^= 1;
-                }
-                if (parity != 0) { converged = false; break; }
-            }
+        int result;
+        switch (algo) {
+            case LdpcDecoder::SPA:
+                result = decode_spa(llr, H, ws, max_iter, abort_flag);
+                break;
+            case LdpcDecoder::GBF:
+                result = decode_gbf(llr, H, ws, max_iter, abort_flag);
+                break;
+            default:
+                result = decode_min_sum(llr, H, ws, max_iter, abort_flag);
+                break;
         }
 
-        // Extract data bits
+        if (result < 0) return {}; // aborted
+
         for (int i = 0; i < k; i++)
-            output.push_back(posterior[i] < 0 ? 1 : 0);
+            output.push_back(ws.posterior[i] < 0 ? 1 : 0);
+    }
+    return output;
+}
+
+std::vector<uint8_t> LdpcCodec::decode_soft(const std::vector<float>& llrs, LdpcRate rate,
+                                              LdpcDecoder algo, int max_iter,
+                                              std::atomic<bool>* abort_flag) {
+    if (rate == LdpcRate::NONE) {
+        std::vector<uint8_t> out(llrs.size());
+        for (size_t i = 0; i < llrs.size(); i++)
+            out[i] = llrs[i] < 0 ? 1 : 0;
+        return out;
     }
 
+    int k = block_size(rate);
+    int n = codeword_size(rate);
+    if ((int)llrs.size() % n != 0) return {};
+
+    auto& H = get_matrix(rate);
+    DecoderWorkspace ws;
+    ws.init(H);
+
+    std::vector<uint8_t> output;
+    output.reserve(llrs.size() / n * k);
+
+    for (size_t offset = 0; offset < llrs.size(); offset += n) {
+        std::vector<float> llr(llrs.begin() + offset, llrs.begin() + offset + n);
+
+        int result;
+        switch (algo) {
+            case LdpcDecoder::SPA:
+                result = decode_spa(llr, H, ws, max_iter, abort_flag);
+                break;
+            case LdpcDecoder::GBF:
+                result = decode_gbf(llr, H, ws, max_iter, abort_flag);
+                break;
+            default:
+                result = decode_min_sum(llr, H, ws, max_iter, abort_flag);
+                break;
+        }
+
+        if (result < 0) return {}; // aborted
+
+        for (int i = 0; i < k; i++)
+            output.push_back(ws.posterior[i] < 0 ? 1 : 0);
+    }
     return output;
 }
 

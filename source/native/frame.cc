@@ -63,33 +63,47 @@ std::vector<std::complex<float>> generate_sync_word() {
     return sync;
 }
 
-// Map LdpcRate to 2-bit field for header
+// Map LdpcRate to 4-bit field for header
 static uint8_t fec_to_field(LdpcRate fec) {
     switch (fec) {
-        case LdpcRate::NONE:     return 0;
-        case LdpcRate::RATE_1_2: return 1;
-        case LdpcRate::RATE_3_4: return 2;
-        case LdpcRate::RATE_7_8: return 3;
+        case LdpcRate::NONE:      return 0;
+        case LdpcRate::RATE_1_16: return 1;
+        case LdpcRate::RATE_2_16: return 2;
+        case LdpcRate::RATE_3_16: return 3;
+        case LdpcRate::RATE_4_16: return 4;
+        case LdpcRate::RATE_5_16: return 5;
+        case LdpcRate::RATE_6_16: return 6;
+        case LdpcRate::RATE_1_2:  return 7;
+        case LdpcRate::RATE_5_8:  return 8;
+        case LdpcRate::RATE_3_4:  return 9;
+        case LdpcRate::RATE_7_8:  return 10;
     }
     return 0;
 }
 
 static LdpcRate field_to_fec(uint8_t field) {
-    switch (field & 0x03) {
-        case 0: return LdpcRate::NONE;
-        case 1: return LdpcRate::RATE_1_2;
-        case 2: return LdpcRate::RATE_3_4;
-        case 3: return LdpcRate::RATE_7_8;
+    switch (field & 0x0F) {
+        case 0:  return LdpcRate::NONE;
+        case 1:  return LdpcRate::RATE_1_16;
+        case 2:  return LdpcRate::RATE_2_16;
+        case 3:  return LdpcRate::RATE_3_16;
+        case 4:  return LdpcRate::RATE_4_16;
+        case 5:  return LdpcRate::RATE_5_16;
+        case 6:  return LdpcRate::RATE_6_16;
+        case 7:  return LdpcRate::RATE_1_2;
+        case 8:  return LdpcRate::RATE_5_8;
+        case 9:  return LdpcRate::RATE_3_4;
+        case 10: return LdpcRate::RATE_7_8;
     }
     return LdpcRate::NONE;
 }
 
 std::vector<uint8_t> encode_header(Modulation mod, uint16_t payload_len, LdpcRate fec) {
-    // 32 bits: [4 mod][12 payload_len][2 fec][6 reserved][8 crc8]
+    // 32 bits: [4 mod][12 payload_len][4 fec][4 reserved][8 crc8]
     uint8_t header_bytes[4];
     header_bytes[0] = ((uint8_t)mod << 4) | ((payload_len >> 8) & 0x0F);
     header_bytes[1] = payload_len & 0xFF;
-    header_bytes[2] = (fec_to_field(fec) << 6);
+    header_bytes[2] = (fec_to_field(fec) << 4);
     header_bytes[3] = crc8(header_bytes, 3);
 
     std::vector<uint8_t> bits(32);
@@ -120,7 +134,7 @@ bool decode_header(const std::vector<uint8_t>& bits, Modulation& mod, uint16_t& 
 
     mod = (Modulation)mod_val;
     payload_len = ((header_bytes[0] & 0x0F) << 8) | header_bytes[1];
-    fec = field_to_fec(header_bytes[2] >> 6);
+    fec = field_to_fec(header_bytes[2] >> 4);
     return true;
 }
 

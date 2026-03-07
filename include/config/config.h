@@ -28,7 +28,7 @@ struct IrisConfig {
     float rx_gain = 1.0f;
 
     // Radio / PTT
-    std::string ptt_method = "none";   // none, rigctl, vox, cm108
+    std::string ptt_method = "none";   // none, rigctl, vox, cm108, serial
     std::string rigctl_host = "localhost";
     int rigctl_port = 4532;
     std::string serial_port;
@@ -38,9 +38,20 @@ struct IrisConfig {
 
     // Network
     int kiss_port = 8001;
+    int agw_port = 8000;
+
+    // Security
+    int encryption_mode = 0;     // 0=off, 1=strict (hybrid KX before data), 2=fast (classical-first)
+    std::string psk_hex;         // Pre-shared key in hex (up to 128 chars = 64 bytes)
+
+    // B2F
+    bool b2f_unroll = true;      // Enable B2F LZHUF unroll/reroll for Winlink
 
     // Calibration
     float calibrated_tx_level = -1.0f;  // -1 = not calibrated
+
+    // Logging
+    bool log_enabled = false;    // Auto-log to AppData/Iris/logs/
 
     // GUI
     bool show_constellation = true;

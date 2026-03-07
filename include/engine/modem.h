@@ -10,6 +10,9 @@
 #include "native/xid.h"
 #include "native/upconvert.h"
 #include "arq/arq.h"
+#include "compress/compress.h"
+#include "crypto/crypto.h"
+#include "b2f/b2f_handler.h"
 #include "ax25/hdlc.h"
 #include "ax25/afsk.h"
 #include "ax25/gfsk.h"
@@ -92,6 +95,7 @@ public:
     // ARQ session control
     void arq_connect(const std::string& remote_callsign);
     void arq_disconnect();
+    void arq_listen();
     ArqState arq_state() const { return arq_.state(); }
 
     // Periodic tick for ARQ timeouts (call from main loop ~100ms)
@@ -107,6 +111,15 @@ public:
     void set_rx_callback(std::function<void(const uint8_t*, size_t)> cb) {
         rx_callback_ = cb;
     }
+
+    // Callback when ARQ state changes (for AGW notifications)
+    void set_state_callback(std::function<void(ArqState, const std::string&)> cb) {
+        state_callback_ = cb;
+    }
+
+    // ARQ accessors for AGW flow control
+    const std::string& arq_remote_callsign() const { return arq_.remote_callsign(); }
+    int arq_pending_frames() const { return arq_.pending_frames(); }
 
 private:
     void process_rx_ax25(const float* audio, int count);
@@ -149,6 +162,19 @@ private:
     // ARQ session
     ArqSession arq_;
 
+    // Compression (used when ARQ peers negotiate CAP_COMPRESSION)
+    Compressor tx_compressor_;
+    Compressor rx_compressor_;
+
+    // Encryption (used when ARQ peers negotiate CAP_ENCRYPTION)
+    CipherSuite cipher_;
+    uint64_t tx_batch_counter_ = 0;
+    uint64_t rx_batch_counter_ = 0;
+    uint32_t crypto_direction_ = DIR_CMD_TO_RSP;
+
+    // B2F unroll/reroll (used when ARQ peers negotiate CAP_B2F_UNROLL)
+    B2fHandler b2f_handler_;
+
     // PTT
     std::unique_ptr<PttController> ptt_;
     bool ptt_active_ = false;
@@ -165,6 +191,7 @@ private:
 
     // RX state
     bool native_mode_ = false;
+    bool xid_sent_ = false;
     XidCapability local_cap_;
 
     // Calibration
@@ -192,6 +219,9 @@ private:
 
     // Callback to deliver received frames
     std::function<void(const uint8_t*, size_t)> rx_callback_;
+
+    // Callback for ARQ state changes (state, remote_callsign)
+    std::function<void(ArqState, const std::string&)> state_callback_;
 };
 
 } // namespace iris

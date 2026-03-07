@@ -63,6 +63,39 @@ public:
     bool get_ptt() const override { return false; }
 };
 
+// Serial PTT (RTS/DTR toggling)
+class SerialPtt : public PttController {
+public:
+    SerialPtt(const std::string& port, int baud = 9600);
+    ~SerialPtt() override;
+    bool set_ptt(bool tx) override;
+    bool get_ptt() const override { return state_; }
+private:
+#ifdef _WIN32
+    void* handle_ = (void*)-1;  // INVALID_HANDLE_VALUE
+#else
+    int fd_ = -1;
+#endif
+    bool state_ = false;
+};
+
+// CM108 HID PTT (USB GPIO on Digirig / Masters Communications interfaces)
+class Cm108Ptt : public PttController {
+public:
+    Cm108Ptt(const std::string& device = "");
+    ~Cm108Ptt() override;
+    bool set_ptt(bool tx) override;
+    bool get_ptt() const override { return state_; }
+private:
+    bool set_gpio(bool on);
+#ifdef _WIN32
+    void* handle_ = (void*)-1;
+#else
+    int fd_ = -1;
+#endif
+    bool state_ = false;
+};
+
 // No PTT (for testing/loopback)
 class NullPtt : public PttController {
 public:
@@ -75,7 +108,9 @@ private:
 // Factory
 std::unique_ptr<PttController> create_ptt(const std::string& method,
                                            const std::string& host = "localhost",
-                                           int port = 4532);
+                                           int port = 4532,
+                                           const std::string& serial_port = "",
+                                           int serial_baud = 9600);
 
 } // namespace iris
 
