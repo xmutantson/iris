@@ -193,6 +193,10 @@ std::vector<float> build_native_frame(const uint8_t* payload, size_t len,
     return mod.modulate_symbols(all_symbols);
 }
 
+// Track best correlation for diagnostics
+static float g_last_best_corr = 0;
+float detect_best_corr() { return g_last_best_corr; }
+
 int detect_frame_start(const float* iq_samples, size_t count, int sps) {
     auto preamble = generate_preamble();
     auto sync = generate_sync_word();
@@ -204,7 +208,7 @@ int detect_frame_start(const float* iq_samples, size_t count, int sps) {
     size_t ref_len = ref.size();
     size_t n_samples = count / 2;
 
-    if (n_samples < ref_len * (size_t)sps) return -1;
+    if (n_samples < ref_len * (size_t)sps) { g_last_best_corr = -1; return -1; }
 
     float best_corr = 0;
     int best_offset = -1;
@@ -229,12 +233,14 @@ int detect_frame_start(const float* iq_samples, size_t count, int sps) {
         float mag = std::sqrt(corr_re * corr_re + corr_im * corr_im);
         float norm = (energy > 0) ? mag / std::sqrt(energy) : 0;
 
-        if (norm > best_corr && norm > 0.5f) {
+        if (norm > best_corr) {
             best_corr = norm;
-            best_offset = (int)offset;
+            if (norm > 0.5f)
+                best_offset = (int)offset;
         }
     }
 
+    g_last_best_corr = best_corr;
     return best_offset;
 }
 

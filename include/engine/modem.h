@@ -207,6 +207,7 @@ private:
     std::atomic<int> frames_tx_{0};
     std::atomic<int> crc_errors_{0};
     float rx_rms_ = 0;
+    int rx_diag_counter_ = 0;  // Periodic RX diagnostic counter
 
     // RX overlap buffer for native mode
     std::vector<float> rx_overlap_buf_;

@@ -1316,6 +1316,67 @@ int run_tests() {
               memcmp(dec_frame.data(), msg, strlen(msg)) == 0);
     }
 
+    // Native PHY upconvert/downconvert loopback
+    {
+        printf("\n=== Native PHY Upconvert/Downconvert Loopback ===\n");
+
+        float center = 1900.0f;
+        PhyConfig cfg = mode_a_config();
+        cfg.modulation = Modulation::BPSK;
+
+        // Build a test frame
+        uint8_t payload[] = "TestPayload123";
+        auto iq = build_native_frame(payload, sizeof(payload), cfg, LdpcRate::RATE_1_2);
+        printf("  Built frame: %zu IQ samples (%zu audio samples)\n",
+               iq.size() / 2, iq.size() / 2);
+
+        // Upconvert to audio
+        Upconverter up(center, 48000);
+        auto audio = up.iq_to_audio(iq.data(), iq.size());
+        printf("  Upconverted: %zu audio samples, center %.0f Hz\n",
+               audio.size(), center);
+
+        // Check audio signal level
+        float peak = 0;
+        for (float s : audio) { float a = std::abs(s); if (a > peak) peak = a; }
+        printf("  Audio peak: %.4f\n", peak);
+        check("Audio has signal", peak > 0.01f);
+
+        // Downconvert back to baseband IQ
+        Downconverter down(center, 48000);
+        auto rx_iq = down.audio_to_iq(audio.data(), audio.size());
+        printf("  Downconverted: %zu IQ samples\n", rx_iq.size() / 2);
+
+        // Check baseband IQ signal level
+        float iq_peak = 0;
+        for (size_t i = 0; i < rx_iq.size(); i += 2) {
+            float mag = std::sqrt(rx_iq[i]*rx_iq[i] + rx_iq[i+1]*rx_iq[i+1]);
+            if (mag > iq_peak) iq_peak = mag;
+        }
+        printf("  IQ peak: %.4f\n", iq_peak);
+        check("IQ has signal after downconvert", iq_peak > 0.001f);
+
+        // Try frame detection
+        int start = detect_frame_start(rx_iq.data(), rx_iq.size(), cfg.samples_per_symbol);
+        float best = detect_best_corr();
+        printf("  Frame detect: offset=%d, best_corr=%.3f\n", start, best);
+        check("Frame detected after upconvert/downconvert", start >= 0);
+
+        // Try full decode
+        if (start >= 0) {
+            std::vector<uint8_t> decoded;
+            bool ok = decode_native_frame(rx_iq.data(), rx_iq.size(),
+                                           start, cfg, decoded);
+            printf("  Decode: %s, %zu bytes\n", ok ? "OK" : "FAIL", decoded.size());
+            check("Frame decoded successfully", ok);
+            if (ok) {
+                check("Decoded payload matches",
+                      decoded.size() == sizeof(payload) &&
+                      memcmp(decoded.data(), payload, sizeof(payload)) == 0);
+            }
+        }
+    }
+
     printf("\n============================\n");
     printf("Results: %d passed, %d failed\n", tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

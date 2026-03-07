@@ -41,6 +41,9 @@ std::vector<float> build_native_frame(const uint8_t* payload, size_t len,
 // Returns sample offset of frame start, or -1 if not found
 int detect_frame_start(const float* iq_samples, size_t count, int sps);
 
+// Get the best normalized correlation from the last detect_frame_start() call
+float detect_best_corr();
+
 // Decode a native frame from IQ samples starting at frame_start
 // Returns true if frame decoded successfully, fills payload
 bool decode_native_frame(const float* iq_samples, size_t count,

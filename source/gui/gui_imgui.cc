@@ -745,8 +745,20 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
                 }
             }
 
-            ImGui::SliderInt("PTT Pre-delay (ms)", &config.ptt_pre_delay_ms, 0, 500);
-            ImGui::SliderInt("PTT Post-delay (ms)", &config.ptt_post_delay_ms, 0, 500);
+            ImGui::Separator();
+            ImGui::Text("Timing (Direwolf-compatible)");
+            ImGui::SliderInt("TXDelay (ms)", &config.ptt_pre_delay_ms, 0, 1000);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Delay after keying before data (default 300ms)");
+            ImGui::SliderInt("TXTail (ms)", &config.ptt_post_delay_ms, 0, 500);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Extra TX time after data (default 100ms)");
+            ImGui::SliderInt("SlotTime (ms)", &config.slottime_ms, 10, 500);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("CSMA slot time (default 100ms)");
+            ImGui::SliderInt("Persist", &config.persist, 0, 255);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("p-persistence 0-255 (63=25%%, default 63)");
         }
 
         if (ImGui::CollapsingHeader("Network")) {

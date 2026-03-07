@@ -224,6 +224,15 @@ void Modem::process_rx(const float* rx_audio, int frame_count) {
         sum_sq += audio[i] * audio[i];
     rx_rms_ = std::sqrt(sum_sq / std::max(frame_count, 1));
 
+    // Periodic RX diagnostic (~every 5 seconds)
+    rx_diag_counter_ += frame_count;
+    if (rx_diag_counter_ >= config_.sample_rate * 5) {
+        rx_diag_counter_ = 0;
+        float best = detect_best_corr();
+        IRIS_LOG("RX: rms=%.4f overlap=%zu corr=%.3f native=%d",
+                 rx_rms_, rx_overlap_buf_.size(), best, native_mode_ ? 1 : 0);
+    }
+
     compute_spectrum(audio.data(), frame_count);
 
     if (state_ == ModemState::CALIBRATING) {

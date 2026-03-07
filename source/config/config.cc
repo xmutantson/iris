@@ -133,6 +133,10 @@ IrisConfig load_config(const std::string& path) {
     cfg.rigctl_port = ini.get_int("Radio", "RigctlPort", cfg.rigctl_port);
     cfg.serial_port = ini.get("Radio", "SerialPort", cfg.serial_port);
     cfg.serial_baud = ini.get_int("Radio", "SerialBaud", cfg.serial_baud);
+    cfg.ptt_pre_delay_ms = ini.get_int("Radio", "TXDelay", cfg.ptt_pre_delay_ms);
+    cfg.ptt_post_delay_ms = ini.get_int("Radio", "TXTail", cfg.ptt_post_delay_ms);
+    cfg.slottime_ms = ini.get_int("Radio", "SlotTime", cfg.slottime_ms);
+    cfg.persist = ini.get_int("Radio", "Persist", cfg.persist);
 
     cfg.kiss_port = ini.get_int("Network", "KISSPort", cfg.kiss_port);
     cfg.agw_port = ini.get_int("Network", "AGWPort", cfg.agw_port);
@@ -178,6 +182,10 @@ bool save_config(const std::string& path, const IrisConfig& cfg) {
     ini.set_int("Radio", "RigctlPort", cfg.rigctl_port);
     ini.set("Radio", "SerialPort", cfg.serial_port);
     ini.set_int("Radio", "SerialBaud", cfg.serial_baud);
+    ini.set_int("Radio", "TXDelay", cfg.ptt_pre_delay_ms);
+    ini.set_int("Radio", "TXTail", cfg.ptt_post_delay_ms);
+    ini.set_int("Radio", "SlotTime", cfg.slottime_ms);
+    ini.set_int("Radio", "Persist", cfg.persist);
 
     ini.set_int("Network", "KISSPort", cfg.kiss_port);
     ini.set_int("Network", "AGWPort", cfg.agw_port);

@@ -75,8 +75,10 @@ static void print_usage() {
     printf("  --rigctl-port <n>  Rigctl port (default: 4532)\n");
     printf("  --serial <port>    Serial port for PTT\n");
     printf("  --serial-baud <n>  Serial baud rate (default: 9600)\n");
-    printf("  --ptt-pre <ms>     PTT pre-delay ms (default: 100)\n");
-    printf("  --ptt-post <ms>    PTT post-delay ms (default: 50)\n");
+    printf("  --ptt-pre <ms>     TXDelay: PTT pre-delay ms (default: 300)\n");
+    printf("  --ptt-post <ms>    TXTail: PTT post-delay ms (default: 100)\n");
+    printf("  --slottime <ms>    CSMA slot time ms (default: 100)\n");
+    printf("  --persist <0-255>  p-persistence (default: 63 = 25%%)\n");
     printf("\nSecurity:\n");
     printf("  --encrypt <mode>   Encryption: off, strict, fast (default: off)\n");
     printf("  --psk <hex>        Pre-shared key in hex (up to 64 bytes)\n");
@@ -121,6 +123,8 @@ int main(int argc, char** argv) {
     int cli_serial_baud = -1;
     int cli_ptt_pre = -1;
     int cli_ptt_post = -1;
+    int cli_slottime = -1;
+    int cli_persist = -1;
     bool cli_no_constellation = false;
     bool cli_no_waterfall = false;
     std::string cli_encrypt;
@@ -182,6 +186,10 @@ int main(int argc, char** argv) {
             cli_ptt_pre = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--ptt-post") == 0 && i + 1 < argc) {
             cli_ptt_post = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--slottime") == 0 && i + 1 < argc) {
+            cli_slottime = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--persist") == 0 && i + 1 < argc) {
+            cli_persist = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             cli_port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--agw-port") == 0 && i + 1 < argc) {
@@ -238,6 +246,8 @@ int main(int argc, char** argv) {
     if (cli_serial_baud > 0) config.serial_baud = cli_serial_baud;
     if (cli_ptt_pre >= 0) config.ptt_pre_delay_ms = cli_ptt_pre;
     if (cli_ptt_post >= 0) config.ptt_post_delay_ms = cli_ptt_post;
+    if (cli_slottime >= 0) config.slottime_ms = cli_slottime;
+    if (cli_persist >= 0) config.persist = cli_persist;
     if (cli_port >= 0) config.kiss_port = cli_port;
     if (cli_agw_port >= 0) config.agw_port = cli_agw_port;
     if (cli_no_constellation) config.show_constellation = false;
