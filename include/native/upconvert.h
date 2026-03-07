@@ -41,6 +41,15 @@ private:
     int sample_rate_;
     float phase_;
     float phase_inc_;
+
+    // Lowpass FIR filter to remove 2*fc image after mixing
+    static constexpr int LPF_TAPS = 31;
+    float lpf_coeffs_[LPF_TAPS] = {};
+    float lpf_buf_i_[LPF_TAPS] = {};  // I channel delay line
+    float lpf_buf_q_[LPF_TAPS] = {};  // Q channel delay line
+    int lpf_pos_ = 0;
+    void design_lpf(float cutoff_hz);
+    float apply_lpf(float* buf, float sample);
 };
 
 } // namespace iris

@@ -392,12 +392,17 @@ float measure_peak(const float* samples, int count) {
 } // namespace iris
 
 #else
-// Stub for non-Windows — ALSA implementation would go here
+// Non-Windows: ALSA backend in audio_alsa.cc provides factory functions on Linux.
+#ifndef __linux__
+// Fallback stubs for platforms with no audio backend
 namespace iris {
-
 std::vector<AudioDevice> enumerate_audio_devices() { return {}; }
 std::unique_ptr<AudioCapture> create_capture() { return nullptr; }
 std::unique_ptr<AudioPlayback> create_playback() { return nullptr; }
+} // namespace iris
+#endif
+
+namespace iris {
 
 float measure_rms(const float* samples, int count) {
     if (count <= 0) return 0.0f;

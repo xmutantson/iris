@@ -5,6 +5,7 @@
 #include "imgui.h"
 #include "imgui_impl_opengl3.h"
 #include "engine/speed_level.h"
+#include "arq/arq.h"
 
 #include <cstdio>
 #include <cmath>
@@ -298,6 +299,24 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
     ImGui::Text("CRC Err: %d", diag.crc_errors); ImGui::NextColumn();
     ImGui::Text("RX RMS: %.3f", diag.rx_rms); ImGui::Columns(1);
 
+    // ARQ status
+    {
+        const char* arq_str = "IDLE";
+        ImVec4 arq_color(0.5f, 0.5f, 0.5f, 1.0f);
+        if (diag.arq_state == ArqState::CONNECTING) { arq_str = "CONNECTING"; arq_color = ImVec4(1,1,0,1); }
+        else if (diag.arq_state == ArqState::CONNECTED) { arq_str = "CONNECTED"; arq_color = ImVec4(0,1,0,1); }
+        else if (diag.arq_state == ArqState::DISCONNECTING) { arq_str = "DISCONNECTING"; arq_color = ImVec4(1,0.5f,0,1); }
+        ImGui::PushStyleColor(ImGuiCol_Text, arq_color);
+        ImGui::Text("ARQ: %s", arq_str);
+        ImGui::PopStyleColor();
+        if (diag.arq_state != ArqState::IDLE) {
+            ImGui::SameLine();
+            ImGui::Text("  Role: %s  Retx: %d",
+                diag.arq_role == ArqRole::COMMANDER ? "CMD" : "RSP",
+                diag.retransmits);
+        }
+    }
+
     // PTT indicator
     if (diag.ptt_active) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 0, 0, 1));
@@ -361,6 +380,51 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
             dl->AddCircleFilled(ImVec2(px, py), 2.0f, IM_COL32(0, 255, 100, 200));
         }
         ImGui::Dummy(canvas_size);
+    }
+
+    // === Spectrum / Waterfall ===
+    if (!diag.spectrum.empty()) {
+        ImGui::Separator();
+        ImGui::Text("Spectrum (%zu bins)", diag.spectrum.size());
+        ImVec2 spec_pos = ImGui::GetCursorScreenPos();
+        ImVec2 spec_size(ImGui::GetContentRegionAvail().x, 100);
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+
+        dl->AddRectFilled(spec_pos,
+            ImVec2(spec_pos.x + spec_size.x, spec_pos.y + spec_size.y),
+            IM_COL32(10, 10, 20, 255));
+
+        int n_bins = (int)diag.spectrum.size();
+        float bin_w = spec_size.x / n_bins;
+        float db_min = -80.0f, db_max = 0.0f;
+
+        for (int i = 0; i < n_bins; i++) {
+            float db = diag.spectrum[i];
+            float frac = (db - db_min) / (db_max - db_min);
+            frac = frac < 0.0f ? 0.0f : frac > 1.0f ? 1.0f : frac;
+
+            float x0 = spec_pos.x + i * bin_w;
+            float y0 = spec_pos.y + spec_size.y * (1.0f - frac);
+            float x1 = x0 + bin_w;
+            float y1 = spec_pos.y + spec_size.y;
+
+            // Color gradient: blue -> cyan -> green -> yellow
+            uint8_t r, g, b;
+            if (frac < 0.33f) {
+                float t = frac / 0.33f;
+                r = 0; g = (uint8_t)(t * 200); b = (uint8_t)(100 + t * 155);
+            } else if (frac < 0.66f) {
+                float t = (frac - 0.33f) / 0.33f;
+                r = 0; g = (uint8_t)(200 + t * 55); b = (uint8_t)(255 * (1 - t));
+            } else {
+                float t = (frac - 0.66f) / 0.34f;
+                r = (uint8_t)(t * 255); g = 255; b = 0;
+            }
+
+            dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), IM_COL32(r, g, b, 200));
+        }
+
+        ImGui::Dummy(spec_size);
     }
 
     ImGui::End(); // Main panel

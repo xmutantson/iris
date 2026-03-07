@@ -43,6 +43,26 @@ std::vector<uint8_t> nrzi_encode(const std::vector<uint8_t>& bits);
 // NRZI decode: output 0 on transition, 1 on same
 std::vector<uint8_t> nrzi_decode(const std::vector<uint8_t>& bits);
 
+// Stateful NRZI decoder for streaming use
+class NrziDecoder {
+public:
+    NrziDecoder() : prev_(0) {}
+    void reset() { prev_ = 0; }
+
+    std::vector<uint8_t> decode(const std::vector<uint8_t>& bits) {
+        std::vector<uint8_t> out;
+        out.reserve(bits.size());
+        for (uint8_t b : bits) {
+            out.push_back((b == prev_) ? 1 : 0);
+            prev_ = b;
+        }
+        return out;
+    }
+
+private:
+    uint8_t prev_;
+};
+
 } // namespace iris
 
 #endif

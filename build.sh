@@ -9,7 +9,7 @@ CXX="${CXX:-g++}"
 OUTDIR="build"
 BINARY="iris"
 
-CXXFLAGS="-std=c++17 -Wall -Wextra -Wpedantic -I include"
+CXXFLAGS="-std=c++17 -Wall -Wextra -Wpedantic -I include -I third_party/monocypher"
 IMGUI_FLAGS=""
 
 # Check for GUI mode
@@ -32,7 +32,7 @@ fi
 if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "mingw"* || "$OSTYPE" == "cygwin" ]]; then
     BINARY="iris.exe"
     CXXFLAGS="$CXXFLAGS -D_WIN32_WINNT=0x0601"
-    LDFLAGS="-lws2_32 -lole32 -lwinmm"
+    LDFLAGS="-static -lws2_32 -lole32 -lwinmm -lbcrypt"
 
     if [ "$USE_IMGUI" = "1" ]; then
         CXXFLAGS="$CXXFLAGS -DIRIS_HAS_IMGUI -I third_party/imgui -I third_party/imgui/backends"
@@ -44,7 +44,7 @@ if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "mingw"* || "$OSTYPE" == "cygwin" ]]; 
         fi
     fi
 elif [[ "$OSTYPE" == "linux"* ]]; then
-    LDFLAGS="-lpthread"
+    LDFLAGS="-lpthread -lasound"
 
     if [ "$USE_IMGUI" = "1" ]; then
         CXXFLAGS="$CXXFLAGS -DIRIS_HAS_IMGUI -DIRIS_USE_SDL2 -I third_party/imgui -I third_party/imgui/backends"
@@ -66,6 +66,11 @@ else
 fi
 
 mkdir -p "$OUTDIR"
+
+# Compile Monocypher (C library)
+CC="${CC:-gcc}"
+MONOCYPHER_OBJ="$OUTDIR/monocypher.o"
+$CC -c -O2 -I third_party/monocypher third_party/monocypher/monocypher.c -o "$MONOCYPHER_OBJ"
 
 SOURCES=$(find source -name '*.cc' -o -name '*.cpp' | sort)
 
@@ -89,7 +94,7 @@ fi
 echo "  CXX: $CXX"
 echo "  Sources: $(echo $SOURCES | wc -w) files"
 
-$CXX $CXXFLAGS $SOURCES -o "$OUTDIR/$BINARY" $LDFLAGS $IMGUI_FLAGS
+$CXX $CXXFLAGS $SOURCES "$MONOCYPHER_OBJ" -o "$OUTDIR/$BINARY" $LDFLAGS $IMGUI_FLAGS
 
 echo "=== Build complete: $OUTDIR/$BINARY ==="
 ls -la "$OUTDIR/$BINARY"

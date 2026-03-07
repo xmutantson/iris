@@ -17,6 +17,8 @@
 #include "native/upconvert.h"
 #include "arq/arq.h"
 #include "config/config.h"
+#include "compress/compress.h"
+#include "crypto/crypto.h"
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -1022,6 +1024,241 @@ int run_tests() {
         check("Multi-frame data matches", received_data == big_data);
         printf("  2KB transferred in %d iterations, %d retransmits\n",
                iters, commander.retransmit_count());
+    }
+
+    // Phase 7: End-to-end two-station test
+    printf("\n--- Phase 7: End-to-End ---\n");
+
+    // AX.25 frame through modem audio path
+    {
+        printf("\n=== End-to-End AX.25 Through Audio ===\n");
+
+        // Station A (TX) and Station B (RX) with Mode B (no upconversion, simpler)
+        IrisConfig cfg_a, cfg_b;
+        cfg_a.mode = "B"; cfg_a.callsign = "STA_A";
+        cfg_a.ax25_baud = 1200;
+        cfg_a.ptt_pre_delay_ms = 0;
+        cfg_a.ptt_post_delay_ms = 0;
+
+        cfg_b.mode = "B"; cfg_b.callsign = "STA_B";
+        cfg_b.ax25_baud = 1200;
+        cfg_b.ptt_pre_delay_ms = 0;
+        cfg_b.ptt_post_delay_ms = 0;
+
+        Modem station_a, station_b;
+        check("Station A init", station_a.init(cfg_a));
+        check("Station B init", station_b.init(cfg_b));
+
+        // Capture received frames from station B
+        std::vector<std::vector<uint8_t>> rx_frames;
+        station_b.set_rx_callback([&](const uint8_t* data, size_t len) {
+            rx_frames.push_back(std::vector<uint8_t>(data, data + len));
+        });
+
+        // Build an AX.25 frame
+        uint8_t ax25_frame[] = {
+            'C'<<1, 'Q'<<1, ' '<<1, ' '<<1, ' '<<1, ' '<<1, 0x60,
+            'T'<<1, 'E'<<1, 'S'<<1, 'T'<<1, ' '<<1, ' '<<1, 0x61,
+            0x03, 0xF0,
+            'H', 'e', 'l', 'l', 'o', ' ', 'W', 'o', 'r', 'l', 'd', '!'
+        };
+        station_a.queue_tx_frame(ax25_frame, sizeof(ax25_frame));
+
+        // Generate TX audio from station A, feed to station B RX
+        // Use large buffer to capture entire frame
+        constexpr int CHUNK = 1024;
+        constexpr int TOTAL = 48000 * 3;  // 3 seconds
+        std::vector<float> audio(CHUNK);
+
+        // First, generate ALL TX audio
+        std::vector<float> all_tx;
+        int samples_tx = 0;
+        float max_sample = 0;
+        while (samples_tx < TOTAL) {
+            std::fill(audio.begin(), audio.end(), 0.0f);
+            station_a.process_tx(audio.data(), CHUNK);
+
+            for (int j = 0; j < CHUNK; j++) {
+                float a = std::abs(audio[j]);
+                if (a > max_sample) max_sample = a;
+            }
+            all_tx.insert(all_tx.end(), audio.begin(), audio.end());
+            samples_tx += CHUNK;
+
+            // Stop after TX finishes (state returns to IDLE)
+            if (station_a.state() == ModemState::IDLE && max_sample > 0.01f)
+                break;
+        }
+
+        // Now feed all TX audio to station B in chunks
+        for (size_t off = 0; off < all_tx.size(); off += CHUNK) {
+            int n = std::min(CHUNK, (int)(all_tx.size() - off));
+            station_b.process_rx(all_tx.data() + off, n);
+            if (!rx_frames.empty()) break;
+        }
+
+        check("Station B received frame", !rx_frames.empty());
+        if (!rx_frames.empty()) {
+            // HDLC decoded frame should contain our payload
+            auto& f = rx_frames[0];
+            bool has_hello = false;
+            if (f.size() >= 18) {
+                has_hello = (f[16] == 'H' && f[17] == 'e');
+            }
+            check("Received payload matches", has_hello);
+            printf("  Frame received: %zu bytes after %d samples\n",
+                   f.size(), samples_tx);
+        }
+
+        station_a.shutdown();
+        station_b.shutdown();
+    }
+
+    // Native frame through modem audio path (Mode A with upconversion)
+    {
+        printf("\n=== End-to-End Native Through Audio (Mode A) ===\n");
+
+        IrisConfig cfg_a, cfg_b;
+        cfg_a.mode = "A"; cfg_a.callsign = "STA_A";
+        cfg_a.ptt_pre_delay_ms = 0;
+        cfg_a.ptt_post_delay_ms = 0;
+        cfg_a.max_modulation = Modulation::BPSK;
+
+        cfg_b.mode = "A"; cfg_b.callsign = "STA_B";
+        cfg_b.ptt_pre_delay_ms = 0;
+        cfg_b.ptt_post_delay_ms = 0;
+        cfg_b.max_modulation = Modulation::BPSK;
+
+        Modem station_a, station_b;
+        check("Native A init", station_a.init(cfg_a));
+        check("Native B init", station_b.init(cfg_b));
+
+        // Capture received frames from station B
+        std::vector<std::vector<uint8_t>> rx_frames;
+        station_b.set_rx_callback([&](const uint8_t* data, size_t len) {
+            rx_frames.push_back(std::vector<uint8_t>(data, data + len));
+        });
+
+        // Build a native-mode payload and queue it as if native mode were active
+        // We need to simulate XID exchange to enter native mode first
+        // For simplicity, build an AX.25 frame and verify it goes through
+        uint8_t test_frame[] = {
+            'C'<<1, 'Q'<<1, ' '<<1, ' '<<1, ' '<<1, ' '<<1, 0x60,
+            'N'<<1, 'A'<<1, 'T'<<1, 'V'<<1, ' '<<1, ' '<<1, 0x61,
+            0x03, 0xF0,
+            'N', 'a', 't', 'i', 'v', 'e', ' ', 'T', 'e', 's', 't'
+        };
+        station_a.queue_tx_frame(test_frame, sizeof(test_frame));
+
+        constexpr int CHUNK = 1024;
+        constexpr int TOTAL = 48000 * 3;
+        std::vector<float> audio(CHUNK);
+
+        int samples_tx = 0;
+        while (samples_tx < TOTAL) {
+            std::fill(audio.begin(), audio.end(), 0.0f);
+            station_a.process_tx(audio.data(), CHUNK);
+            station_b.process_rx(audio.data(), CHUNK);
+            samples_tx += CHUNK;
+            if (!rx_frames.empty()) break;
+        }
+
+        check("Mode A frame received", !rx_frames.empty());
+        if (!rx_frames.empty()) {
+            auto& f = rx_frames[0];
+            bool has_native = false;
+            if (f.size() >= 18) {
+                has_native = (f[16] == 'N' && f[17] == 'a');
+            }
+            check("Mode A payload matches", has_native);
+            printf("  Mode A frame received: %zu bytes after %d samples\n",
+                   f.size(), samples_tx);
+        }
+
+        station_a.shutdown();
+        station_b.shutdown();
+    }
+
+    // Phase 7: Compression
+    {
+        printf("\n=== Compression ===\n");
+
+        // Repetitive text compresses well
+        const char* text = "Hello Hello Hello Hello World World World World!!!!";
+        auto compressed = compress_frame((const uint8_t*)text, strlen(text));
+        check("Compressed is smaller", compressed.size() < strlen(text));
+        printf("  Text: %zu -> %zu bytes (%.0f%%)\n",
+               strlen(text), compressed.size(),
+               100.0 * compressed.size() / strlen(text));
+
+        auto decompressed = decompress_frame(compressed.data(), compressed.size());
+        check("Decompress round-trip",
+              decompressed.size() == strlen(text) &&
+              memcmp(decompressed.data(), text, strlen(text)) == 0);
+
+        // Random data should not expand much (stored uncompressed)
+        std::vector<uint8_t> random_data(256);
+        for (int i = 0; i < 256; i++) random_data[i] = (uint8_t)(i * 37 + 13);
+        auto comp_rand = compress_frame(random_data.data(), random_data.size());
+        auto decomp_rand = decompress_frame(comp_rand.data(), comp_rand.size());
+        check("Random data round-trip", decomp_rand == random_data);
+        printf("  Random: %zu -> %zu bytes\n", random_data.size(), comp_rand.size());
+
+        // Empty data
+        auto comp_empty = compress_frame(nullptr, 0);
+        auto decomp_empty = decompress_frame(comp_empty.data(), comp_empty.size());
+        check("Empty round-trip", decomp_empty.empty());
+    }
+
+    // Phase 7: Encryption
+    {
+        printf("\n=== Encryption ===\n");
+
+        // Basic encrypt/decrypt round-trip
+        CryptoKey key = crypto_random_key();
+        const char* msg = "Secret message for encryption test!";
+        auto encrypted = crypto_encrypt((const uint8_t*)msg, strlen(msg), key);
+        check("Encrypted is larger", encrypted.size() > strlen(msg));
+        printf("  Plaintext: %zu -> Encrypted: %zu bytes (overhead: %zu)\n",
+               strlen(msg), encrypted.size(), encrypted.size() - strlen(msg));
+
+        auto decrypted = crypto_decrypt(encrypted.data(), encrypted.size(), key);
+        check("Decrypt round-trip",
+              decrypted.size() == strlen(msg) &&
+              memcmp(decrypted.data(), msg, strlen(msg)) == 0);
+
+        // Wrong key fails
+        CryptoKey bad_key = crypto_random_key();
+        auto bad_decrypt = crypto_decrypt(encrypted.data(), encrypted.size(), bad_key);
+        check("Wrong key fails", bad_decrypt.empty());
+
+        // Tampered ciphertext fails
+        auto tampered = encrypted;
+        tampered[tampered.size() - 1] ^= 0xFF;
+        auto tamper_decrypt = crypto_decrypt(tampered.data(), tampered.size(), key);
+        check("Tampered data fails", tamper_decrypt.empty());
+
+        // X25519 key exchange
+        auto alice = crypto_generate_keypair();
+        auto bob = crypto_generate_keypair();
+        auto shared_a = crypto_key_exchange(alice.secret, bob.public_key);
+        auto shared_b = crypto_key_exchange(bob.secret, alice.public_key);
+        check("X25519 shared secret matches", shared_a == shared_b);
+
+        // Encrypt with shared key
+        auto enc_shared = crypto_encrypt((const uint8_t*)msg, strlen(msg), shared_a);
+        auto dec_shared = crypto_decrypt(enc_shared.data(), enc_shared.size(), shared_b);
+        check("Encrypt with shared key round-trip",
+              dec_shared.size() == strlen(msg) &&
+              memcmp(dec_shared.data(), msg, strlen(msg)) == 0);
+
+        // Frame wrapper
+        auto enc_frame = encrypt_frame((const uint8_t*)msg, strlen(msg), key);
+        check("Frame header is 0x01", enc_frame[0] == 0x01);
+        auto dec_frame = decrypt_frame(enc_frame.data(), enc_frame.size(), key);
+        check("Frame decrypt round-trip",
+              dec_frame.size() == strlen(msg) &&
+              memcmp(dec_frame.data(), msg, strlen(msg)) == 0);
     }
 
     printf("\n============================\n");

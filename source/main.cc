@@ -201,8 +201,14 @@ int main(int argc, char** argv) {
     if (use_gui) {
         gui.init("Iris FM Data Modem");
         gui.set_callbacks({
-            [&]() { gui.log("Connect requested"); },
-            [&]() { gui.log("Disconnect requested"); },
+            [&]() {
+                modem.arq_connect("REMOTE");
+                gui.log("ARQ connect requested");
+            },
+            [&]() {
+                modem.arq_disconnect();
+                gui.log("ARQ disconnect requested");
+            },
             [&]() { modem.start_calibration(); gui.log("Calibration started"); },
             [&](const IrisConfig& new_cfg) {
                 config = new_cfg;
@@ -226,12 +232,19 @@ int main(int argc, char** argv) {
                 g_running = false;
         }
 
+        // ARQ timeouts
+        modem.tick();
+
         auto now = std::chrono::steady_clock::now();
         if (!use_gui && std::chrono::duration_cast<std::chrono::seconds>(now - last_status).count() >= 5) {
             auto diag = modem.get_diagnostics();
-            printf("[Status] KISS: %d, RX: %d, TX: %d, CRC: %d, SNR: %.1f dB, Level: %s\n",
+            const char* arq_str = "IDLE";
+            if (diag.arq_state == ArqState::CONNECTING) arq_str = "CONNECTING";
+            else if (diag.arq_state == ArqState::CONNECTED) arq_str = "CONNECTED";
+            else if (diag.arq_state == ArqState::DISCONNECTING) arq_str = "DISCONNECTING";
+            printf("[Status] KISS: %d, RX: %d, TX: %d, CRC: %d, SNR: %.1f dB, Level: %s, ARQ: %s\n",
                    kiss.client_count(), diag.frames_rx, diag.frames_tx, diag.crc_errors,
-                   diag.snr_db, SPEED_LEVELS[diag.speed_level].name);
+                   diag.snr_db, SPEED_LEVELS[diag.speed_level].name, arq_str);
             last_status = now;
         }
 

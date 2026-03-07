@@ -9,6 +9,7 @@
 #include "native/frame.h"
 #include "native/xid.h"
 #include "native/upconvert.h"
+#include "arq/arq.h"
 #include "ax25/hdlc.h"
 #include "ax25/afsk.h"
 #include "ax25/gfsk.h"
@@ -54,11 +55,15 @@ struct ModemDiag {
     int frames_rx;
     int frames_tx;
     int crc_errors;
+    int retransmits;
     float rx_rms;
     bool ptt_active;
     CalState cal_state;
     float cal_measured_rms;
+    ArqState arq_state;
+    ArqRole arq_role;
     std::vector<std::complex<float>> constellation;  // Last received symbols
+    std::vector<float> spectrum;   // Power spectrum for waterfall
 };
 
 class Modem {
@@ -71,8 +76,6 @@ public:
     void shutdown();
 
     // Main processing (call from audio callback or main loop)
-    // rx_audio: mono float samples from capture
-    // tx_audio: mono float samples to fill for playback
     void process_rx(const float* rx_audio, int frame_count);
     void process_tx(float* tx_audio, int frame_count);
 
@@ -85,6 +88,14 @@ public:
     // Auto level calibration
     void start_calibration();
     bool is_calibrating() const { return state_ == ModemState::CALIBRATING; }
+
+    // ARQ session control
+    void arq_connect(const std::string& remote_callsign);
+    void arq_disconnect();
+    ArqState arq_state() const { return arq_.state(); }
+
+    // Periodic tick for ARQ timeouts (call from main loop ~100ms)
+    void tick();
 
     // PTT control
     void set_ptt_controller(std::unique_ptr<PttController> ptt) { ptt_ = std::move(ptt); }
@@ -106,6 +117,9 @@ private:
     void ptt_on();
     void ptt_off();
 
+    // Compute power spectrum for waterfall display
+    void compute_spectrum(const float* audio, int count);
+
     IrisConfig config_;
     std::atomic<ModemState> state_{ModemState::IDLE};
 
@@ -115,6 +129,7 @@ private:
     GfskModulator gfsk_mod_;
     GfskDemodulator gfsk_demod_;
     HdlcDecoder hdlc_decoder_;
+    NrziDecoder nrzi_decoder_;
 
     // Native PHY
     PhyConfig phy_config_;
@@ -124,21 +139,28 @@ private:
     // Mode A upconversion
     Upconverter upconverter_;
     Downconverter downconverter_;
-    bool use_upconvert_ = false;  // true for Mode A
+    bool use_upconvert_ = false;
 
     // Engine
     Gearshift gearshift_;
     AGC agc_;
     float snr_db_ = 0;
 
+    // ARQ session
+    ArqSession arq_;
+
     // PTT
     std::unique_ptr<PttController> ptt_;
     bool ptt_active_ = false;
 
+    // TX/RX muting for half-duplex
+    std::atomic<bool> rx_muted_{false};
+    int rx_mute_holdoff_ = 0;  // Samples to remain muted after TX ends
+
     // TX queue
     std::mutex tx_mutex_;
     std::queue<std::vector<uint8_t>> tx_queue_;
-    std::vector<float> tx_buffer_;  // Samples being transmitted
+    std::vector<float> tx_buffer_;
     size_t tx_pos_ = 0;
 
     // RX state
@@ -161,11 +183,12 @@ private:
 
     // RX overlap buffer for native mode
     std::vector<float> rx_overlap_buf_;
-    static constexpr size_t RX_OVERLAP_MAX = 48000 * 2;  // 1 second of IQ at 48kHz
+    static constexpr size_t RX_OVERLAP_MAX = 48000 * 2;
 
-    // Last constellation for GUI
+    // Waterfall spectrum
     mutable std::mutex diag_mutex_;
     std::vector<std::complex<float>> last_constellation_;
+    std::vector<float> last_spectrum_;
 
     // Callback to deliver received frames
     std::function<void(const uint8_t*, size_t)> rx_callback_;
