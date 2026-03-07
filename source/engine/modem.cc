@@ -163,32 +163,69 @@ void Modem::process_rx_native(const float* audio, int count) {
     size_t iq_count;
 
     if (use_upconvert_) {
-        // Mode A: downconvert audio to IQ
         iq_buf = downconverter_.audio_to_iq(audio, count);
         iq_data = iq_buf.data();
         iq_count = iq_buf.size();
     } else {
-        // Mode B/C: audio is already baseband IQ (interleaved)
         iq_data = audio;
         iq_count = count * 2;
     }
 
-    int start = detect_frame_start(iq_data, iq_count, phy_config_.samples_per_symbol);
+    // Append new IQ data to overlap buffer
+    rx_overlap_buf_.insert(rx_overlap_buf_.end(), iq_data, iq_data + iq_count);
+
+    // Cap buffer size
+    if (rx_overlap_buf_.size() > RX_OVERLAP_MAX) {
+        size_t excess = rx_overlap_buf_.size() - RX_OVERLAP_MAX;
+        rx_overlap_buf_.erase(rx_overlap_buf_.begin(),
+                               rx_overlap_buf_.begin() + excess);
+    }
+
+    // Search for frames in the accumulated buffer
+    int start = detect_frame_start(rx_overlap_buf_.data(), rx_overlap_buf_.size(),
+                                    phy_config_.samples_per_symbol);
     if (start >= 0) {
         std::vector<uint8_t> payload;
-        if (decode_native_frame(iq_data, iq_count, start, phy_config_, payload)) {
+        if (decode_native_frame(rx_overlap_buf_.data(), rx_overlap_buf_.size(),
+                                 start, phy_config_, payload)) {
             frames_rx_++;
 
-            // Update constellation for GUI
+            // Estimate SNR from preamble and feed gearshift
+            {
+                auto preamble_ref = generate_preamble();
+                int sps = phy_config_.samples_per_symbol;
+                size_t n_iq = rx_overlap_buf_.size() / 2;
+                int preamble_syms = (int)preamble_ref.size();
+                std::vector<std::complex<float>> rx_preamble;
+                for (int i = 0; i < preamble_syms; i++) {
+                    size_t idx = start + i * sps;
+                    if (idx < n_iq)
+                        rx_preamble.push_back({rx_overlap_buf_[2 * idx],
+                                                rx_overlap_buf_[2 * idx + 1]});
+                }
+                if ((int)rx_preamble.size() >= preamble_syms) {
+                    float snr = estimate_snr(preamble_ref.data(), rx_preamble.data(),
+                                              preamble_syms);
+                    snr_db_ = snr;
+                    gearshift_.update(snr);
+                }
+            }
+
             {
                 std::lock_guard<std::mutex> lock(diag_mutex_);
-                if (native_demod_) {
+                if (native_demod_)
                     last_constellation_ = native_demod_->symbols();
-                }
             }
 
             if (rx_callback_)
                 rx_callback_(payload.data(), payload.size());
+
+            // Remove consumed data up to frame end
+            size_t consumed = start + phy_config_.samples_per_symbol * 128;
+            if (consumed > rx_overlap_buf_.size())
+                consumed = rx_overlap_buf_.size();
+            rx_overlap_buf_.erase(rx_overlap_buf_.begin(),
+                                   rx_overlap_buf_.begin() + consumed);
         } else {
             crc_errors_++;
         }
@@ -236,7 +273,9 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                 int level = gearshift_.current_level();
                 PhyConfig tx_config = phy_config_;
                 tx_config.modulation = SPEED_LEVELS[level].modulation;
-                auto iq = build_native_frame(frame_data.data(), frame_data.size(), tx_config);
+                LdpcRate fec = fec_to_ldpc_rate(SPEED_LEVELS[level].fec_rate_num,
+                                                 SPEED_LEVELS[level].fec_rate_den);
+                auto iq = build_native_frame(frame_data.data(), frame_data.size(), tx_config, fec);
 
                 if (use_upconvert_) {
                     // Mode A: upconvert IQ to audio
@@ -261,6 +300,16 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
             // Apply TX level
             for (auto& s : tx_buffer_)
                 s *= config_.tx_level;
+
+            // PTT pre-delay: silence at front for relay engage
+            int pre_samples = config_.ptt_pre_delay_ms * config_.sample_rate / 1000;
+            if (pre_samples > 0)
+                tx_buffer_.insert(tx_buffer_.begin(), pre_samples, 0.0f);
+
+            // PTT post-delay: silence at end for relay tail
+            int post_samples = config_.ptt_post_delay_ms * config_.sample_rate / 1000;
+            if (post_samples > 0)
+                tx_buffer_.insert(tx_buffer_.end(), post_samples, 0.0f);
 
             tx_pos_ = 0;
             frames_tx_++;

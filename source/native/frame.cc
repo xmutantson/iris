@@ -44,17 +44,14 @@ std::vector<std::complex<float>> generate_preamble() {
         int bit = lfsr & 1;
         preamble.push_back({bit ? 1.0f : -1.0f, 0.0f});
 
-        // x^6 + x + 1: feedback from bit 0 XOR bit 5
         int feedback = (lfsr & 1) ^ ((lfsr >> 5) & 1);
         lfsr = (lfsr >> 1) | (feedback << 5);
     }
     return preamble;
 }
 
-// 16-symbol sync word (Barker-13 + 3 padding, good autocorrelation)
+// 16-symbol sync word (Barker-13 + 3 padding)
 std::vector<std::complex<float>> generate_sync_word() {
-    // Barker-13: +1 +1 +1 +1 +1 -1 -1 +1 +1 -1 +1 -1 +1
-    // Pad to 16 with +1 +1 +1
     static const int barker16[] = {
         1, 1, 1, 1, 1, -1, -1, 1, 1, -1, 1, -1, 1, 1, 1, 1
     };
@@ -66,15 +63,35 @@ std::vector<std::complex<float>> generate_sync_word() {
     return sync;
 }
 
-std::vector<uint8_t> encode_header(Modulation mod, uint16_t payload_len) {
-    // 32 bits: [4 mod][12 payload_len][8 reserved][8 crc8]
+// Map LdpcRate to 2-bit field for header
+static uint8_t fec_to_field(LdpcRate fec) {
+    switch (fec) {
+        case LdpcRate::NONE:     return 0;
+        case LdpcRate::RATE_1_2: return 1;
+        case LdpcRate::RATE_3_4: return 2;
+        case LdpcRate::RATE_7_8: return 3;
+    }
+    return 0;
+}
+
+static LdpcRate field_to_fec(uint8_t field) {
+    switch (field & 0x03) {
+        case 0: return LdpcRate::NONE;
+        case 1: return LdpcRate::RATE_1_2;
+        case 2: return LdpcRate::RATE_3_4;
+        case 3: return LdpcRate::RATE_7_8;
+    }
+    return LdpcRate::NONE;
+}
+
+std::vector<uint8_t> encode_header(Modulation mod, uint16_t payload_len, LdpcRate fec) {
+    // 32 bits: [4 mod][12 payload_len][2 fec][6 reserved][8 crc8]
     uint8_t header_bytes[4];
     header_bytes[0] = ((uint8_t)mod << 4) | ((payload_len >> 8) & 0x0F);
     header_bytes[1] = payload_len & 0xFF;
-    header_bytes[2] = 0x00;  // reserved
+    header_bytes[2] = (fec_to_field(fec) << 6);
     header_bytes[3] = crc8(header_bytes, 3);
 
-    // Convert to bits (MSB first for header)
     std::vector<uint8_t> bits(32);
     for (int i = 0; i < 4; i++) {
         for (int j = 0; j < 8; j++) {
@@ -84,10 +101,9 @@ std::vector<uint8_t> encode_header(Modulation mod, uint16_t payload_len) {
     return bits;
 }
 
-bool decode_header(const std::vector<uint8_t>& bits, Modulation& mod, uint16_t& payload_len) {
+bool decode_header(const std::vector<uint8_t>& bits, Modulation& mod, uint16_t& payload_len, LdpcRate& fec) {
     if (bits.size() < 32) return false;
 
-    // Convert bits back to bytes
     uint8_t header_bytes[4] = {};
     for (int i = 0; i < 4; i++) {
         for (int j = 0; j < 8; j++) {
@@ -95,7 +111,6 @@ bool decode_header(const std::vector<uint8_t>& bits, Modulation& mod, uint16_t& 
         }
     }
 
-    // Check CRC-8
     if (crc8(header_bytes, 3) != header_bytes[3])
         return false;
 
@@ -105,22 +120,20 @@ bool decode_header(const std::vector<uint8_t>& bits, Modulation& mod, uint16_t& 
 
     mod = (Modulation)mod_val;
     payload_len = ((header_bytes[0] & 0x0F) << 8) | header_bytes[1];
+    fec = field_to_fec(header_bytes[2] >> 6);
     return true;
 }
 
 std::vector<float> build_native_frame(const uint8_t* payload, size_t len,
-                                       const PhyConfig& config) {
+                                       const PhyConfig& config,
+                                       LdpcRate fec) {
     NativeModulator mod(config);
 
-    // Build symbol sequence:
-    // 1. Preamble (BPSK, always)
     auto preamble = generate_preamble();
-    // 2. Sync word (BPSK, always)
     auto sync = generate_sync_word();
-    // 3. Header (BPSK, always — 32 bits = 32 BPSK symbols)
-    auto header_bits = encode_header(config.modulation, (uint16_t)len);
+    auto header_bits = encode_header(config.modulation, (uint16_t)len, fec);
 
-    // 4. Payload + CRC32
+    // Payload + CRC32
     std::vector<uint8_t> payload_with_crc(len + 4);
     for (size_t i = 0; i < len; i++)
         payload_with_crc[i] = payload[i];
@@ -132,36 +145,37 @@ std::vector<float> build_native_frame(const uint8_t* payload, size_t len,
 
     // Convert payload bytes to bits
     std::vector<uint8_t> payload_bits;
-    int bps = bits_per_symbol(config.modulation);
     for (size_t i = 0; i < payload_with_crc.size(); i++) {
         for (int j = 0; j < 8; j++) {
             payload_bits.push_back((payload_with_crc[i] >> j) & 1);
         }
     }
+
+    // Apply LDPC FEC encoding
+    if (fec != LdpcRate::NONE) {
+        payload_bits = LdpcCodec::encode(payload_bits, fec);
+    }
+
     // Pad to multiple of bits_per_symbol
+    int bps = bits_per_symbol(config.modulation);
     while (payload_bits.size() % bps != 0)
         payload_bits.push_back(0);
 
-    // Map payload to symbols
     auto payload_symbols = map_bits(payload_bits, config.modulation);
 
     // Concatenate all symbols
     std::vector<std::complex<float>> all_symbols;
     all_symbols.reserve(preamble.size() + sync.size() + 32 + payload_symbols.size());
 
-    // Preamble + sync + header are always BPSK
     for (auto& s : preamble) all_symbols.push_back(s);
     for (auto& s : sync) all_symbols.push_back(s);
 
-    // Header: 32 BPSK symbols
     for (int i = 0; i < 32; i++) {
         all_symbols.push_back({header_bits[i] ? -1.0f : 1.0f, 0.0f});
     }
 
-    // Payload symbols at configured modulation
     for (auto& s : payload_symbols) all_symbols.push_back(s);
 
-    // Modulate all symbols through pulse shaping
     return mod.modulate_symbols(all_symbols);
 }
 
@@ -169,7 +183,6 @@ int detect_frame_start(const float* iq_samples, size_t count, int sps) {
     auto preamble = generate_preamble();
     auto sync = generate_sync_word();
 
-    // Build reference sequence (preamble + sync)
     std::vector<std::complex<float>> ref;
     for (auto& s : preamble) ref.push_back(s);
     for (auto& s : sync) ref.push_back(s);
@@ -179,7 +192,6 @@ int detect_frame_start(const float* iq_samples, size_t count, int sps) {
 
     if (n_samples < ref_len * (size_t)sps) return -1;
 
-    // Correlate at symbol rate (every sps samples)
     float best_corr = 0;
     int best_offset = -1;
 
@@ -218,7 +230,6 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     int sps = default_config.samples_per_symbol;
     size_t n_samples = count / 2;
 
-    // Apply matched filter (RRC) to entire input
     auto rrc_taps = rrc_filter(default_config.rrc_alpha, RRC_SPAN, sps);
 
     std::vector<float> i_in(n_samples), q_in(n_samples);
@@ -230,11 +241,9 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     auto q_filt = fir_filter(q_in, rrc_taps);
     size_t filt_len = std::min(i_filt.size(), q_filt.size());
 
-    // After matched filter, frame_start shifts by RRC_SPAN*sps (filter group delay)
     int rx_delay = RRC_SPAN * sps;
     int rx_frame_start = frame_start + rx_delay;
 
-    // Skip preamble + sync
     int header_start = rx_frame_start + (IRIS_PREAMBLE_LEN + IRIS_SYNC_LEN) * sps;
 
     // Decode header (32 BPSK symbols)
@@ -248,31 +257,51 @@ bool decode_native_frame(const float* iq_samples, size_t count,
 
     Modulation mod;
     uint16_t payload_len;
-    if (!decode_header(header_bits, mod, payload_len))
+    LdpcRate fec;
+    if (!decode_header(header_bits, mod, payload_len, fec))
         return false;
 
     if (payload_len > AX25_MAX_FRAME * 4)
         return false;
 
-    // Payload starts after header
     int payload_start = header_start + IRIS_HEADER_LEN * sps;
     int bps = bits_per_symbol(mod);
-    int payload_bytes = payload_len + 4;  // +CRC32
-    int payload_bits_count = payload_bytes * 8;
-    int payload_symbols = (payload_bits_count + bps - 1) / bps;
+    int raw_data_bits = (payload_len + 4) * 8;  // payload + CRC32
 
-    // Extract payload symbols directly from matched-filtered output
+    // Compute encoded bit count after FEC
+    int encoded_bits;
+    if (fec != LdpcRate::NONE) {
+        int k = LdpcCodec::block_size(fec);
+        int n = LdpcCodec::codeword_size(fec);
+        int num_blocks = (raw_data_bits + k - 1) / k;
+        encoded_bits = num_blocks * n;
+    } else {
+        encoded_bits = raw_data_bits;
+    }
+
+    int padded_bits = encoded_bits;
+    if (padded_bits % bps != 0)
+        padded_bits += bps - (padded_bits % bps);
+    int payload_symbols = padded_bits / bps;
+
     std::vector<std::complex<float>> symbols;
-    for (int k = 0; k < payload_symbols; k++) {
-        size_t idx = payload_start + k * sps;
+    for (int k2 = 0; k2 < payload_symbols; k2++) {
+        size_t idx = payload_start + k2 * sps;
         if (idx >= filt_len) return false;
         symbols.push_back({i_filt[idx], q_filt[idx]});
     }
 
-    // Demap symbols to bits
     auto bits = demap_bits(symbols, mod);
 
-    // Convert bits to bytes
+    // LDPC decode
+    if (fec != LdpcRate::NONE) {
+        if ((int)bits.size() > encoded_bits)
+            bits.resize(encoded_bits);
+        bits = LdpcCodec::decode(bits, fec);
+        if (bits.empty())
+            return false;
+    }
+
     int total_bytes = payload_len + 4;
     if ((int)bits.size() < total_bytes * 8)
         return false;
@@ -284,7 +313,6 @@ bool decode_native_frame(const float* iq_samples, size_t count,
         }
     }
 
-    // Check CRC32
     uint32_t rx_crc = (uint32_t)decoded_bytes[payload_len + 0] |
                       ((uint32_t)decoded_bytes[payload_len + 1] << 8) |
                       ((uint32_t)decoded_bytes[payload_len + 2] << 16) |

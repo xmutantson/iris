@@ -33,6 +33,8 @@ struct IrisConfig {
     int rigctl_port = 4532;
     std::string serial_port;
     int serial_baud = 9600;
+    int ptt_pre_delay_ms = 100;   // Silence before frame (relay engage time)
+    int ptt_post_delay_ms = 50;   // Silence after frame (relay release tail)
 
     // Network
     int kiss_port = 8001;

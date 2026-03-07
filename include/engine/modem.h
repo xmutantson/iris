@@ -159,6 +159,10 @@ private:
     std::atomic<int> crc_errors_{0};
     float rx_rms_ = 0;
 
+    // RX overlap buffer for native mode
+    std::vector<float> rx_overlap_buf_;
+    static constexpr size_t RX_OVERLAP_MAX = 48000 * 2;  // 1 second of IQ at 48kHz
+
     // Last constellation for GUI
     mutable std::mutex diag_mutex_;
     std::vector<std::complex<float>> last_constellation_;

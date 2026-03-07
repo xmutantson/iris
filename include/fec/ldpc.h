@@ -9,10 +9,14 @@ namespace iris {
 
 // LDPC code rates supported by Iris
 enum class LdpcRate {
+    NONE,      // No FEC (passthrough)
     RATE_1_2,  // 1/2 code rate
     RATE_3_4,  // 3/4 code rate
     RATE_7_8,  // 7/8 code rate
 };
+
+// Map FEC rate fraction to LdpcRate enum
+LdpcRate fec_to_ldpc_rate(int num, int den);
 
 // LDPC encoder/decoder
 // Uses systematic encoding: output = [data | parity]

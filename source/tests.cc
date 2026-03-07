@@ -15,6 +15,7 @@
 #include "engine/gearshift.h"
 #include "engine/modem.h"
 #include "native/upconvert.h"
+#include "arq/arq.h"
 #include "config/config.h"
 #include <cstdio>
 #include <cstring>
@@ -640,6 +641,54 @@ int run_tests() {
         corrected = LdpcCodec::decode(corrupted, LdpcRate::RATE_1_2);
         check("LDPC 1/2 corrects 5-bit errors",
               corrected.size() == data.size() && corrected == data);
+
+        // LDPC NONE passthrough
+        auto passthrough = LdpcCodec::encode(data, LdpcRate::NONE);
+        check("LDPC NONE passthrough", passthrough == data);
+        auto pt_dec = LdpcCodec::decode(data, LdpcRate::NONE);
+        check("LDPC NONE decode passthrough", pt_dec == data);
+
+        // fec_to_ldpc_rate helper
+        check("fec_to_ldpc_rate(1,2)", fec_to_ldpc_rate(1, 2) == LdpcRate::RATE_1_2);
+        check("fec_to_ldpc_rate(3,4)", fec_to_ldpc_rate(3, 4) == LdpcRate::RATE_3_4);
+        check("fec_to_ldpc_rate(7,8)", fec_to_ldpc_rate(7, 8) == LdpcRate::RATE_7_8);
+        check("fec_to_ldpc_rate(0,0)", fec_to_ldpc_rate(0, 0) == LdpcRate::NONE);
+    }
+
+    // Native frame with LDPC FEC loopback
+    {
+        printf("\n=== Native Frame + LDPC FEC Loopback ===\n");
+        uint8_t payload[] = "FEC-protected Iris frame!";
+        size_t payload_len = strlen((char*)payload);
+
+        // Test each FEC rate
+        LdpcRate rates[] = {LdpcRate::NONE, LdpcRate::RATE_1_2, LdpcRate::RATE_3_4, LdpcRate::RATE_7_8};
+        const char* rate_names[] = {"NONE", "1/2", "3/4", "7/8"};
+
+        for (int r = 0; r < 4; r++) {
+            PhyConfig cfg = mode_b_config();
+            cfg.modulation = Modulation::QPSK;
+
+            auto iq = build_native_frame(payload, payload_len, cfg, rates[r]);
+            int start = detect_frame_start(iq.data(), iq.size(), cfg.samples_per_symbol);
+
+            char name[128];
+            snprintf(name, sizeof(name), "FEC %s frame detected", rate_names[r]);
+            check(name, start >= 0);
+
+            if (start >= 0) {
+                std::vector<uint8_t> rx_payload;
+                bool ok = decode_native_frame(iq.data(), iq.size(), start, cfg, rx_payload);
+                snprintf(name, sizeof(name), "FEC %s frame decoded", rate_names[r]);
+                check(name, ok);
+                if (ok) {
+                    bool match = (rx_payload.size() == payload_len) &&
+                                 (memcmp(rx_payload.data(), payload, payload_len) == 0);
+                    snprintf(name, sizeof(name), "FEC %s payload matches", rate_names[r]);
+                    check(name, match);
+                }
+            }
+        }
     }
 
     // Mode A upconversion
@@ -726,6 +775,8 @@ int run_tests() {
         cfg.mode = "A";
         cfg.callsign = "TEST01";
         cfg.ax25_baud = 1200;
+        cfg.ptt_pre_delay_ms = 0;
+        cfg.ptt_post_delay_ms = 0;
 
         Modem modem;
         bool ok = modem.init(cfg);
@@ -772,6 +823,205 @@ int run_tests() {
         check("Config callsign round-trip", loaded.callsign == "TEST01");
         check("Config mode round-trip", loaded.mode == "B");
         check("Config kiss_port round-trip", loaded.kiss_port == 9001);
+    }
+
+    // Phase 6: ARQ protocol
+    printf("\n--- Phase 6: ARQ Protocol ---\n");
+
+    // ARQ frame serialization
+    {
+        printf("\n=== ARQ Frame Serialization ===\n");
+        ArqFrame frame;
+        frame.type = ArqType::CONNECT;
+        frame.seq = 0;
+        frame.flags = 3;
+        frame.payload = {'T', 'E', 'S', 'T'};
+        auto data = frame.serialize();
+        check("ARQ frame serialized", data.size() == 7);
+        check("ARQ frame type byte", data[0] == 0x01);
+
+        ArqFrame decoded;
+        bool ok = ArqFrame::deserialize(data.data(), data.size(), decoded);
+        check("ARQ frame deserialized", ok);
+        check("ARQ frame type matches", decoded.type == ArqType::CONNECT);
+        check("ARQ frame seq matches", decoded.seq == 0);
+        check("ARQ frame flags matches", decoded.flags == 3);
+        check("ARQ frame payload matches",
+              decoded.payload == std::vector<uint8_t>{'T', 'E', 'S', 'T'});
+    }
+
+    // ARQ session loopback (commander + responder, direct frame exchange)
+    {
+        printf("\n=== ARQ Session Loopback ===\n");
+
+        ArqSession commander;
+        ArqSession responder;
+        commander.set_callsign("CMD01");
+        responder.set_callsign("RSP01");
+
+        // Cross-wire: commander's send goes to responder's receive and vice versa
+        std::vector<std::vector<uint8_t>> cmd_to_rsp;
+        std::vector<std::vector<uint8_t>> rsp_to_cmd;
+        std::vector<uint8_t> received_data;
+        bool transfer_done = false;
+        bool transfer_ok = false;
+
+        ArqCallbacks cmd_cb;
+        cmd_cb.send_frame = [&](const uint8_t* d, size_t l) {
+            cmd_to_rsp.push_back(std::vector<uint8_t>(d, d + l));
+        };
+        cmd_cb.on_transfer_complete = [&](bool ok) {
+            transfer_done = true;
+            transfer_ok = ok;
+        };
+        commander.set_callbacks(cmd_cb);
+
+        ArqCallbacks rsp_cb;
+        rsp_cb.send_frame = [&](const uint8_t* d, size_t l) {
+            rsp_to_cmd.push_back(std::vector<uint8_t>(d, d + l));
+        };
+        rsp_cb.on_data_received = [&](const uint8_t* d, size_t l) {
+            received_data.insert(received_data.end(), d, d + l);
+        };
+        responder.set_callbacks(rsp_cb);
+
+        // Commander connects
+        commander.connect("RSP01");
+        check("Commander state = CONNECTING", commander.state() == ArqState::CONNECTING);
+        check("Commander role = COMMANDER", commander.role() == ArqRole::COMMANDER);
+
+        // Deliver CONNECT to responder
+        check("CONNECT frame sent", cmd_to_rsp.size() == 1);
+        responder.on_frame_received(cmd_to_rsp[0].data(), cmd_to_rsp[0].size());
+        cmd_to_rsp.clear();
+        check("Responder state = CONNECTED", responder.state() == ArqState::CONNECTED);
+        check("Responder role = RESPONDER", responder.role() == ArqRole::RESPONDER);
+
+        // Deliver CONNECT_ACK to commander
+        check("CONNECT_ACK sent", rsp_to_cmd.size() == 1);
+        commander.on_frame_received(rsp_to_cmd[0].data(), rsp_to_cmd[0].size());
+        rsp_to_cmd.clear();
+        check("Commander state = CONNECTED", commander.state() == ArqState::CONNECTED);
+
+        // Queue data and send
+        const char* test_msg = "Hello from ARQ! This is a test transfer.";
+        commander.send_data((const uint8_t*)test_msg, strlen(test_msg));
+
+        // Pump frames back and forth until transfer completes (max 50 iterations)
+        int iters = 0;
+        while (!transfer_done && iters < 50) {
+            // Deliver commander->responder frames
+            auto c2r = std::move(cmd_to_rsp);
+            cmd_to_rsp.clear();
+            for (auto& f : c2r)
+                responder.on_frame_received(f.data(), f.size());
+
+            // Deliver responder->commander frames
+            auto r2c = std::move(rsp_to_cmd);
+            rsp_to_cmd.clear();
+            for (auto& f : r2c)
+                commander.on_frame_received(f.data(), f.size());
+
+            iters++;
+        }
+
+        check("Transfer completed", transfer_done);
+        check("Transfer successful", transfer_ok);
+        check("Data received correctly",
+              received_data.size() == strlen(test_msg) &&
+              memcmp(received_data.data(), test_msg, strlen(test_msg)) == 0);
+        printf("  ARQ completed in %d iterations, %d retransmits\n",
+               iters, commander.retransmit_count());
+
+        // Disconnect
+        commander.disconnect();
+        check("Commander disconnecting", commander.state() == ArqState::DISCONNECTING);
+        if (!cmd_to_rsp.empty()) {
+            responder.on_frame_received(cmd_to_rsp[0].data(), cmd_to_rsp[0].size());
+            cmd_to_rsp.clear();
+        }
+        check("Responder returned to IDLE", responder.state() == ArqState::IDLE);
+        if (!rsp_to_cmd.empty()) {
+            commander.on_frame_received(rsp_to_cmd[0].data(), rsp_to_cmd[0].size());
+            rsp_to_cmd.clear();
+        }
+        check("Commander returned to IDLE", commander.state() == ArqState::IDLE);
+    }
+
+    // ARQ multi-frame transfer (exceeds single DATA frame)
+    {
+        printf("\n=== ARQ Multi-Frame Transfer ===\n");
+
+        ArqSession commander;
+        ArqSession responder;
+        commander.set_callsign("CMD02");
+        responder.set_callsign("RSP02");
+
+        std::vector<std::vector<uint8_t>> cmd_to_rsp;
+        std::vector<std::vector<uint8_t>> rsp_to_cmd;
+        std::vector<uint8_t> received_data;
+        bool transfer_done = false;
+        bool transfer_ok = false;
+
+        ArqCallbacks cmd_cb;
+        cmd_cb.send_frame = [&](const uint8_t* d, size_t l) {
+            cmd_to_rsp.push_back(std::vector<uint8_t>(d, d + l));
+        };
+        cmd_cb.on_transfer_complete = [&](bool ok) {
+            transfer_done = true;
+            transfer_ok = ok;
+        };
+        commander.set_callbacks(cmd_cb);
+
+        ArqCallbacks rsp_cb;
+        rsp_cb.send_frame = [&](const uint8_t* d, size_t l) {
+            rsp_to_cmd.push_back(std::vector<uint8_t>(d, d + l));
+        };
+        rsp_cb.on_data_received = [&](const uint8_t* d, size_t l) {
+            received_data.insert(received_data.end(), d, d + l);
+        };
+        responder.set_callbacks(rsp_cb);
+
+        // Build a large payload (2KB)
+        std::vector<uint8_t> big_data(2048);
+        for (int i = 0; i < 2048; i++) big_data[i] = (uint8_t)(i & 0xFF);
+
+        // Connect
+        commander.connect("RSP02");
+        for (auto& f : cmd_to_rsp)
+            responder.on_frame_received(f.data(), f.size());
+        cmd_to_rsp.clear();
+        for (auto& f : rsp_to_cmd)
+            commander.on_frame_received(f.data(), f.size());
+        rsp_to_cmd.clear();
+
+        check("Multi-frame: connected", commander.state() == ArqState::CONNECTED);
+
+        // Queue all data
+        commander.send_data(big_data.data(), big_data.size());
+
+        // Pump until done
+        int iters = 0;
+        while (!transfer_done && iters < 200) {
+            auto c2r = std::move(cmd_to_rsp);
+            cmd_to_rsp.clear();
+            for (auto& f : c2r)
+                responder.on_frame_received(f.data(), f.size());
+
+            auto r2c = std::move(rsp_to_cmd);
+            rsp_to_cmd.clear();
+            for (auto& f : r2c)
+                commander.on_frame_received(f.data(), f.size());
+
+            iters++;
+        }
+
+        check("Multi-frame transfer completed", transfer_done);
+        check("Multi-frame transfer successful", transfer_ok);
+        check("Multi-frame data size correct", received_data.size() == big_data.size());
+        check("Multi-frame data matches", received_data == big_data);
+        printf("  2KB transferred in %d iterations, %d retransmits\n",
+               iters, commander.retransmit_count());
     }
 
     printf("\n============================\n");

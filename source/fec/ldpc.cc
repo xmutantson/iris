@@ -77,6 +77,7 @@ static LdpcMatrix& get_matrix(LdpcRate rate) {
 
 int LdpcCodec::block_size(LdpcRate rate) {
     switch (rate) {
+        case LdpcRate::NONE:     return 0;
         case LdpcRate::RATE_1_2: return LDPC_BLOCK_1_2;
         case LdpcRate::RATE_3_4: return LDPC_BLOCK_3_4;
         case LdpcRate::RATE_7_8: return LDPC_BLOCK_7_8;
@@ -96,7 +97,15 @@ float LdpcCodec::code_rate(LdpcRate rate) {
     return (float)block_size(rate) / (float)codeword_size(rate);
 }
 
+LdpcRate fec_to_ldpc_rate(int num, int den) {
+    if (num == 1 && den == 2) return LdpcRate::RATE_1_2;
+    if (num == 3 && den == 4) return LdpcRate::RATE_3_4;
+    if (num == 7 && den == 8) return LdpcRate::RATE_7_8;
+    return LdpcRate::NONE;
+}
+
 std::vector<uint8_t> LdpcCodec::encode(const std::vector<uint8_t>& data_bits, LdpcRate rate) {
+    if (rate == LdpcRate::NONE) return data_bits;
     int k = block_size(rate);
     int n = codeword_size(rate);
     auto& H = get_matrix(rate);
@@ -135,6 +144,8 @@ std::vector<uint8_t> LdpcCodec::encode(const std::vector<uint8_t>& data_bits, Ld
 }
 
 std::vector<uint8_t> LdpcCodec::decode(const std::vector<uint8_t>& codeword, LdpcRate rate) {
+    if (rate == LdpcRate::NONE) return codeword;
+
     int k = block_size(rate);
     int n = codeword_size(rate);
 
