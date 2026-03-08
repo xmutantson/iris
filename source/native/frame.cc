@@ -210,6 +210,19 @@ std::vector<float> build_native_frame(const uint8_t* payload, size_t len,
 
     auto payload_symbols = map_bits(payload_bits, config.modulation);
 
+    // Insert mid-frame pilots for 16QAM and above
+    bool use_pilots = (config.modulation >= Modulation::QAM16) && (PILOT_SPACING > 0);
+    if (use_pilots) {
+        std::vector<std::complex<float>> with_pilots;
+        with_pilots.reserve(payload_symbols.size() + payload_symbols.size() / PILOT_SPACING + 1);
+        for (size_t i = 0; i < payload_symbols.size(); i++) {
+            if (i > 0 && (i % PILOT_SPACING) == 0)
+                with_pilots.push_back({1.0f, 0.0f});  // Known +1 pilot
+            with_pilots.push_back(payload_symbols[i]);
+        }
+        payload_symbols = std::move(with_pilots);
+    }
+
     // Concatenate all symbols
     std::vector<std::complex<float>> all_symbols;
     all_symbols.reserve(preamble.size() + sync.size() + 32 + payload_symbols.size());
@@ -310,6 +323,27 @@ bool decode_native_frame(const float* iq_samples, size_t count,
         i_in[i] = iq_samples[2 * i];
         q_in[i] = iq_samples[2 * i + 1];
     }
+
+    // Impulse noise blanking: clip passband amplitude to 3.5x RMS.
+    // Prevents single loud clicks from corrupting multiple symbols.
+    {
+        float energy = 0;
+        for (size_t i = 0; i < n_samples; i++)
+            energy += i_in[i] * i_in[i] + q_in[i] * q_in[i];
+        float rms = std::sqrt(energy / (float)n_samples);
+        float clip_thresh = 3.5f * rms;
+        if (clip_thresh > 1e-6f) {
+            for (size_t i = 0; i < n_samples; i++) {
+                float mag = std::sqrt(i_in[i] * i_in[i] + q_in[i] * q_in[i]);
+                if (mag > clip_thresh) {
+                    float scale = clip_thresh / mag;
+                    i_in[i] *= scale;
+                    q_in[i] *= scale;
+                }
+            }
+        }
+    }
+
     auto i_filt = fir_filter(i_in, rrc_taps);
     auto q_filt = fir_filter(q_in, rrc_taps);
     size_t filt_len = std::min(i_filt.size(), q_filt.size());
@@ -438,11 +472,18 @@ bool decode_native_frame(const float* iq_samples, size_t count,
 
     int header_start = rx_frame_start + (IRIS_PREAMBLE_LEN + IRIS_SYNC_LEN) * sps;
 
-    // Decode header (32 BPSK symbols) with linear phase correction
-    // Decision-directed PLL: track phase variations within the frame.
-    // VB-Cable and real channels can have phase drift beyond the linear model.
-    float pll_phase = phase_ref;  // Start from preamble-estimated phase
-    float pll_alpha = 0.15f;      // PLL bandwidth (higher = tracks faster)
+    // Decode header (32 BPSK symbols) with recursive 2nd-order PLL
+    // Recursive PLL: running_phase advances by pll_freq each symbol, avoiding
+    // the linear extrapolation model (pll_phase + pll_freq * offset) which
+    // diverges over long frames (1600+ symbols) due to positive feedback
+    // between accumulated pll_freq corrections and growing symbol offsets.
+    float pll_freq = phase_per_symbol;  // Initialize from preamble estimate
+    float pll_alpha = 0.10f;  // Proportional gain (phase)
+    float pll_beta = 0.005f;  // Integral gain (frequency)
+
+    // Advance running_phase from preamble midpoint to header start
+    int header_sym_offset = IRIS_PREAMBLE_LEN + IRIS_SYNC_LEN;
+    float running_phase = phase_ref + pll_freq * (header_sym_offset - ref_symbol);
 
     std::vector<uint8_t> header_bits;
     for (int i = 0; i < IRIS_HEADER_LEN; i++) {
@@ -454,18 +495,19 @@ bool decode_native_frame(const float* iq_samples, size_t count,
         }
         float iv = interp(i_filt, pos);
         float qv = interp(q_filt, pos);
-        int sym_idx = IRIS_PREAMBLE_LEN + IRIS_SYNC_LEN + i;
-        float phase_corr = -(pll_phase + phase_per_symbol * (sym_idx - ref_symbol));
+        float phase_corr = -running_phase;
         float cc = std::cos(phase_corr) / channel_gain;
         float ss = std::sin(phase_corr) / channel_gain;
         float re = iv * cc - qv * ss;
         float im = iv * ss + qv * cc;
         header_bits.push_back(re < 0 ? 1 : 0);
 
-        // PLL update: BPSK decision-directed (header is always BPSK)
+        // Recursive 2nd-order PLL update: BPSK decision-directed
         float decided_re = re > 0 ? 1.0f : -1.0f;
         float phase_err = std::atan2(im * decided_re, re * decided_re);
-        pll_phase += pll_alpha * phase_err;
+        running_phase += pll_alpha * phase_err;
+        pll_freq += pll_beta * phase_err;
+        running_phase += pll_freq;  // Advance phase by current frequency estimate
     }
     Modulation mod;
     uint16_t payload_len;
@@ -500,7 +542,12 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     int padded_bits = encoded_bits;
     if (padded_bits % bps != 0)
         padded_bits += bps - (padded_bits % bps);
-    int payload_symbols = padded_bits / bps;
+    int data_symbols = padded_bits / bps;
+
+    // Account for mid-frame pilots (must match TX insertion logic)
+    bool use_pilots = (mod >= Modulation::QAM16) && (PILOT_SPACING > 0);
+    int n_pilots = use_pilots ? ((data_symbols > 0) ? ((data_symbols - 1) / PILOT_SPACING) : 0) : 0;
+    int payload_symbols = data_symbols + n_pilots;
 
     // Pre-check: verify buffer has enough data for ALL payload symbols
     // BEFORE extracting any. This avoids mid-decode overflow and ensures
@@ -534,11 +581,28 @@ bool decode_native_frame(const float* iq_samples, size_t count,
         IRIS_LOG("%s", ebuf);
     }
 
+    // Adaptive PLL bandwidth: tighten for high-order QAM (more noise-sensitive),
+    // widen for low-order (need to track faster without constellation ambiguity).
+    float payload_pll_alpha, payload_pll_beta;
+    if (mod == Modulation::BPSK || mod == Modulation::QPSK) {
+        payload_pll_alpha = 0.05f;  // Moderate: track phase, avoid noise amplification
+        payload_pll_beta = 0.0001f; // Near-zero: preamble freq estimate is accurate,
+                                     // integral gain causes random-walk divergence over
+                                     // 1600-symbol frames (phase drift ~ N^{3/2} * beta)
+    } else if (mod == Modulation::QAM16) {
+        payload_pll_alpha = 0.06f;
+        payload_pll_beta = 0.0005f; // Reduced: same random-walk concern for long frames
+    } else {
+        payload_pll_alpha = 0.03f;  // Tight: 64/128/256-QAM need stable phase
+        payload_pll_beta = 0.0002f; // Very low: short high-QAM frames, minimal drift
+    }
+
     std::vector<std::complex<float>> symbols;
     std::vector<float> sym_reliability;  // per-symbol magnitude for LLR weighting
     // Diagnostic: track raw IQ phase at sampled points
     char raw_diag[1024]; int rdp = 0;
     rdp += snprintf(raw_diag+rdp, sizeof(raw_diag)-rdp, "[DECODE] raw_phase: ");
+    int data_sym_count = 0;  // counts data symbols (excludes pilots)
     for (int k2 = 0; k2 < payload_symbols; k2++) {
         float pos = payload_start + k2 * sps + timing_frac;
         float iv = interp(i_filt, pos);
@@ -555,24 +619,43 @@ bool decode_native_frame(const float* iq_samples, size_t count,
                     "%d:(%.3f,%.3f,%.1f°) ", k2, iv, qv, raw_phase_deg);
         }
 
-        int sym_idx = IRIS_PREAMBLE_LEN + IRIS_SYNC_LEN + IRIS_HEADER_LEN + k2;
-        float phase_corr = -(pll_phase + phase_per_symbol * (sym_idx - ref_symbol));
+        // Recursive 2nd-order PLL: running_phase tracks cumulative phase
+        float phase_corr = -running_phase;
         float cc = std::cos(phase_corr) / channel_gain;
         float ss = std::sin(phase_corr) / channel_gain;
         float re = iv * cc - qv * ss;
         float im = iv * ss + qv * cc;
-        symbols.push_back({re, im});
-        sym_reliability.push_back(raw_mag);
 
-        // Decision-directed PLL: demap to nearest constellation point, compute phase error
-        uint8_t dec_bits[8];
-        demap_symbol({re, im}, dec_bits, mod);
-        auto decided = map_symbol(dec_bits, mod);
-        // Phase error = angle between received and decided
-        float phase_err = std::atan2(
-            im * decided.real() - re * decided.imag(),
-            re * decided.real() + im * decided.imag());
-        pll_phase += pll_alpha * phase_err;
+        // Check if this position is a pilot symbol
+        bool is_pilot = false;
+        if (use_pilots && data_sym_count > 0 && (data_sym_count % PILOT_SPACING) == 0) {
+            is_pilot = true;
+        }
+
+        if (is_pilot) {
+            // Pilot symbol: known +1 BPSK. Use for PLL update with known reference.
+            float phase_err = std::atan2(im, re);
+            running_phase += payload_pll_alpha * 2.0f * phase_err;
+            pll_freq += payload_pll_beta * 2.0f * phase_err;
+            // Update channel gain from pilot magnitude
+            float pilot_mag = std::sqrt(re * re + im * im);
+            channel_gain = 0.8f * channel_gain + 0.2f * pilot_mag;
+        } else {
+            symbols.push_back({re, im});
+            sym_reliability.push_back(raw_mag);
+            data_sym_count++;
+
+            // Decision-directed PLL: demap to nearest constellation point
+            uint8_t dec_bits[8];
+            demap_symbol({re, im}, dec_bits, mod);
+            auto decided = map_symbol(dec_bits, mod);
+            float phase_err = std::atan2(
+                im * decided.real() - re * decided.imag(),
+                re * decided.real() + im * decided.imag());
+            running_phase += payload_pll_alpha * phase_err;
+            pll_freq += payload_pll_beta * phase_err;
+        }
+        running_phase += pll_freq;  // Advance phase by current frequency estimate
     }
     IRIS_LOG("%s", raw_diag);
 

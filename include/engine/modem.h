@@ -63,6 +63,7 @@ struct ModemDiag {
     int crc_errors;
     int retransmits;
     float rx_rms;
+    float rx_peak = 0;           // Peak sample value (for OVL indicator)
     bool ptt_active;
     CalState cal_state;
     float cal_measured_rms;
@@ -77,6 +78,20 @@ struct ModemDiag {
     ProbeResult probe_their_tx;    // What we heard from them (B→A)
     NegotiatedPassband probe_negotiated;
     bool probe_has_results = false;
+
+    // Extended diagnostics for GUI status bar
+    bool native_mode = false;
+    uint64_t bytes_rx = 0;         // Cumulative bytes received
+    uint64_t bytes_tx = 0;         // Cumulative bytes transmitted
+    int phy_bps = 0;               // Current PHY bitrate
+    int app_bps = 0;               // Application-level bitrate
+    float compression_ratio = 0;   // 0 = off, >1 = active
+    int encryption_state = 0;      // 0=off, 1=kx, 2=encrypted, 3=psk_mismatch
+
+    // Negotiated band info (from probe or config)
+    float band_low_hz = 300.0f;
+    float band_high_hz = 3500.0f;
+    int baud_rate = 2400;
 };
 
 class Modem {
@@ -121,6 +136,9 @@ public:
 
     // PTT control
     void set_ptt_controller(std::unique_ptr<PttController> ptt) { ptt_ = std::move(ptt); }
+    void set_tx_drain_hooks(std::function<void()> mark, std::function<bool()> done) {
+        tx_drain_mark_ = mark; tx_drain_done_ = done;
+    }
 
     // Accessors
     ModemState state() const { return state_; }
@@ -131,6 +149,10 @@ public:
     void set_rx_callback(std::function<void(const uint8_t*, size_t)> cb) {
         rx_callback_ = cb;
     }
+
+    // GUI event log callback (frame events, not debug noise)
+    void set_gui_log(std::function<void(const std::string&)> cb) { gui_log_ = cb; }
+
 
     // Callback when ARQ state changes (for AGW notifications)
     void set_state_callback(std::function<void(ArqState, const std::string&)> cb) {
@@ -208,6 +230,20 @@ private:
     ProbeController probe_;
     int probe_fallback_ticks_ = 0;  // Fallback if peer has no probe support
 
+    // Simulated bandpass filter (--bandpass, for testing)
+    struct Biquad {
+        float b0=1, b1=0, b2=0, a1=0, a2=0;
+        float z1=0, z2=0;
+        float process(float x) {
+            float y = b0*x + z1;
+            z1 = b1*x - a1*y + z2;
+            z2 = b2*x - a2*y;
+            return y;
+        }
+    };
+    Biquad sim_bp_hi_[4], sim_bp_lo_[4];  // 4-stage HP + 4-stage LP = 8th order BP
+    bool sim_bp_enabled_ = false;
+
     // PTT
     std::unique_ptr<PttController> ptt_;
     bool ptt_active_ = false;
@@ -223,6 +259,9 @@ private:
     std::vector<float> probe_audio_pending_;          // probe tones waiting to TX
     std::vector<float> tx_buffer_;
     size_t tx_pos_ = 0;
+    bool tx_draining_ = false;  // waiting for audio pipeline to flush before PTT release
+    std::function<void()> tx_drain_mark_;     // snapshot current pipeline position
+    std::function<bool()> tx_drain_done_;     // true when pipeline has flushed past mark
 
     // RX state
     bool native_mode_ = false;      // RX can decode native frames
@@ -249,7 +288,11 @@ private:
     std::atomic<int> frames_rx_{0};
     std::atomic<int> frames_tx_{0};
     std::atomic<int> crc_errors_{0};
+    std::atomic<uint64_t> bytes_rx_{0};
+    std::atomic<uint64_t> bytes_tx_{0};
+    int crypto_state_ = 0;  // 0=off, 1=kx, 2=encrypted, 3=psk_mismatch
     float rx_rms_ = 0;
+    float rx_peak_ = 0;  // Peak sample value (decays over time)
     int rx_diag_counter_ = 0;  // Periodic RX diagnostic counter
 
     // RX overlap buffer for native mode
@@ -257,6 +300,7 @@ private:
     static constexpr size_t RX_OVERLAP_MAX = 48000 * 40;  // 20 seconds of IQ (floats=IQ×2)
     int pending_frame_start_ = -1;   // Cached frame start when waiting for more data
     size_t pending_need_floats_ = 0; // Min buffer size (floats) needed before retry
+    bool relisten_pending_ = false;  // Deferred return to LISTENING after failed hail
 
     // Waterfall spectrum
     mutable std::mutex diag_mutex_;
@@ -271,6 +315,9 @@ private:
 
     // Callback for AX.25 session state changes
     std::function<void(Ax25SessionState, const std::string&)> ax25_state_callback_;
+
+    // GUI event log
+    std::function<void(const std::string&)> gui_log_;
 };
 
 } // namespace iris

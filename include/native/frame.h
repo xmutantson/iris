@@ -18,7 +18,13 @@ uint32_t crc32(const uint8_t* data, size_t len);
 //   [Sync word: 16-symbol Barker-like (BPSK)]
 //   [Header: 32 bits BPSK — modulation, payload_len, fec_rate, header_crc8]
 //   [Payload: N symbols at configured modulation, LDPC-protected]
+//     For 16QAM and above: known BPSK pilot inserted every PILOT_SPACING symbols
 //   [CRC-32: 32 bits appended to payload before FEC encoding]
+
+// Mid-frame pilot spacing (symbols between pilots, 0 = disabled)
+// Pilots are known +1 BPSK symbols inserted after constellation mapping.
+// Active for 16QAM and above where phase drift is critical.
+constexpr int PILOT_SPACING = 32;  // 1 pilot every 32 data symbols
 
 // Preamble m-sequence (length 63, LFSR polynomial x^6+x+1)
 std::vector<std::complex<float>> generate_preamble();

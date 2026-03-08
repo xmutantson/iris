@@ -13,6 +13,43 @@
 
 namespace iris {
 
+// Describe an AX.25 frame for GUI logging
+static std::string describe_ax25(const uint8_t* data, size_t len) {
+    Ax25Frame f;
+    if (!ax25_parse(data, len, f))
+        return "AX.25 (" + std::to_string(len) + " bytes, unparseable)";
+
+    std::string desc = f.src.to_string() + ">" + f.dst.to_string() + " ";
+    switch (f.type()) {
+    case Ax25FrameType::I_FRAME:
+        desc += "I N(S)=" + std::to_string(f.ns()) + " N(R)=" + std::to_string(f.nr())
+              + " (" + std::to_string(f.info.size()) + " bytes)";
+        break;
+    case Ax25FrameType::S_FRAME:
+        switch (f.s_type()) {
+        case Ax25SType::RR:   desc += "RR";   break;
+        case Ax25SType::RNR:  desc += "RNR";  break;
+        case Ax25SType::REJ:  desc += "REJ";  break;
+        default:              desc += "S?";    break;
+        }
+        desc += " N(R)=" + std::to_string(f.nr());
+        break;
+    case Ax25FrameType::U_FRAME:
+        switch (f.u_type()) {
+        case Ax25UType::SABM: desc += "SABM"; break;
+        case Ax25UType::UA:   desc += "UA";   break;
+        case Ax25UType::DISC: desc += "DISC"; break;
+        case Ax25UType::DM:   desc += "DM";   break;
+        case Ax25UType::UI:   desc += "UI (" + std::to_string(f.info.size()) + " bytes)"; break;
+        case Ax25UType::XID:  desc += "XID";  break;
+        default:              desc += "U?";    break;
+        }
+        break;
+    }
+    if (f.poll_final()) desc += " P/F";
+    return desc;
+}
+
 static constexpr float CAL_TONE_FREQ = 1000.0f;
 static constexpr int   CAL_TONE_DURATION = 48000;
 static constexpr float CAL_TARGET_RMS = 0.3f;
@@ -23,6 +60,25 @@ Modem::~Modem() { shutdown(); }
 
 bool Modem::init(const IrisConfig& config) {
     config_ = config;
+
+    // Validate configuration bounds
+    if (config_.sample_rate < 8000 || config_.sample_rate > 192000) {
+        IRIS_LOG("ERROR: sample_rate %d out of range [8000, 192000]", config_.sample_rate);
+        return false;
+    }
+    if (config_.band_low_hz < 100.0f || config_.band_low_hz >= config_.band_high_hz) {
+        IRIS_LOG("ERROR: invalid band range %.0f-%.0f Hz", config_.band_low_hz, config_.band_high_hz);
+        return false;
+    }
+    if (config_.band_high_hz > config_.sample_rate / 2.0f) {
+        IRIS_LOG("ERROR: band_high %.0f Hz exceeds Nyquist (%.0f Hz)",
+                 config_.band_high_hz, config_.sample_rate / 2.0f);
+        return false;
+    }
+    if (config_.tx_level < 0.0f || config_.tx_level > 1.0f) {
+        IRIS_LOG("WARNING: tx_level %.2f clamped to [0, 1]", config_.tx_level);
+        config_.tx_level = std::clamp(config_.tx_level, 0.0f, 1.0f);
+    }
 
     if (config_.mode == "A" || config_.mode == "a") {
         phy_config_ = mode_a_config();
@@ -88,6 +144,48 @@ bool Modem::init(const IrisConfig& config) {
         ax25_tx_queue_.push(std::vector<uint8_t>(data, data + len));
     };
 
+    // Initialize simulated bandpass filter if configured
+    if (config_.sim_bandpass_low > 0 && config_.sim_bandpass_high > config_.sim_bandpass_low) {
+        sim_bp_enabled_ = true;
+        float fs = (float)config_.sample_rate;
+        // 8th-order Butterworth = 4 cascaded biquad sections.
+        // Q values for 8th-order Butterworth pole pairs:
+        const float Q8[4] = {0.5098f, 0.6013f, 0.9000f, 2.5629f};
+
+        // Highpass sections
+        {
+            float f0 = config_.sim_bandpass_low;
+            float w0 = 2.0f * 3.14159265f * f0 / fs;
+            float c = std::cos(w0), s = std::sin(w0);
+            for (int i = 0; i < 4; i++) {
+                float alpha = s / (2.0f * Q8[i]);
+                float a0 = 1.0f + alpha;
+                sim_bp_hi_[i].b0 = ((1.0f + c) / 2.0f) / a0;
+                sim_bp_hi_[i].b1 = -(1.0f + c) / a0;
+                sim_bp_hi_[i].b2 = ((1.0f + c) / 2.0f) / a0;
+                sim_bp_hi_[i].a1 = (-2.0f * c) / a0;
+                sim_bp_hi_[i].a2 = (1.0f - alpha) / a0;
+            }
+        }
+        // Lowpass sections
+        {
+            float f0 = config_.sim_bandpass_high;
+            float w0 = 2.0f * 3.14159265f * f0 / fs;
+            float c = std::cos(w0), s = std::sin(w0);
+            for (int i = 0; i < 4; i++) {
+                float alpha = s / (2.0f * Q8[i]);
+                float a0 = 1.0f + alpha;
+                sim_bp_lo_[i].b0 = ((1.0f - c) / 2.0f) / a0;
+                sim_bp_lo_[i].b1 = (1.0f - c) / a0;
+                sim_bp_lo_[i].b2 = ((1.0f - c) / 2.0f) / a0;
+                sim_bp_lo_[i].a1 = (-2.0f * c) / a0;
+                sim_bp_lo_[i].a2 = (1.0f - alpha) / a0;
+            }
+        }
+        IRIS_LOG("Simulated bandpass filter: %.0f-%.0f Hz (8th order Butterworth)",
+                 config_.sim_bandpass_low, config_.sim_bandpass_high);
+    }
+
     // Wire ARQ session
     arq_.set_callsign(config_.callsign);
     arq_.set_local_capabilities(local_cap_.capabilities);
@@ -138,6 +236,7 @@ bool Modem::init(const IrisConfig& config) {
             }
         }
 
+        bytes_rx_ += cur_len;
         rx_callback_(cur, cur_len);
     };
     arq_cb.on_state_changed = [this](ArqState state) {
@@ -171,6 +270,9 @@ bool Modem::init(const IrisConfig& config) {
                 cipher_.activate();
                 tx_batch_counter_ = 0;
                 rx_batch_counter_ = 0;
+                crypto_state_ = 2;  // ENCRYPTED
+            } else if (config_.encryption_mode > 0) {
+                crypto_state_ = 1;  // KEY EXCHANGE (wanted encryption but peer didn't negotiate)
             }
 
             // Init B2F handler if negotiated
@@ -178,11 +280,40 @@ bool Modem::init(const IrisConfig& config) {
                 b2f_handler_.init();
                 b2f_handler_.unroll_enabled = true;
             }
+
+            // Native hail: both sides are proven Iris-capable, skip XID
+            // and go straight to native mode.
+            if (config_.native_hail && !native_mode_) {
+                native_mode_ = true;
+                native_tx_ready_ = true;
+                xid_sent_ = true;  // Suppress XID handshake
+                IRIS_LOG("Native hail: skipping XID, native mode active");
+                // Cancel AX.25 session if it was still retrying SABM
+                if (ax25_session_.state() == Ax25SessionState::AWAITING_CONNECTION) {
+                    ax25_session_.reset();
+                    IRIS_LOG("Native hail: cancelled AX.25 SABM (native connected)");
+                }
+            }
         } else if (state == ArqState::IDLE) {
             tx_compressor_.deinit();
             rx_compressor_.deinit();
             cipher_.wipe();
+            crypto_state_ = 0;  // OFF
             b2f_handler_.deinit();
+
+            // Reset native mode so next session starts clean.
+            // Guard: if relisten_pending_ is already set, this IDLE came from
+            // listen()→reset()→set_state(IDLE) — don't re-trigger or clear buffer.
+            if (config_.native_hail && !relisten_pending_) {
+                native_mode_ = false;
+                native_tx_ready_ = false;
+                xid_sent_ = false;
+                rx_overlap_buf_.clear();
+                pending_frame_start_ = -1;
+                // Defer return to LISTENING (can't call listen() from
+                // inside the state callback — would cause recursion).
+                relisten_pending_ = true;
+            }
         }
         if (state_callback_)
             state_callback_(state, arq_.remote_callsign());
@@ -192,9 +323,11 @@ bool Modem::init(const IrisConfig& config) {
     // Wire AX.25 connected mode session
     ax25_session_.set_local_callsign(config_.callsign);
     ax25_session_.set_send_callback([this](const uint8_t* data, size_t len) {
-        // AX.25 session frames go directly to TX queue (already complete AX.25 frames)
+        // AX.25 session frames go to AFSK queue (SABM, UA, I-frames, etc.)
+        // This ensures AX.25 frames are always sent via AFSK/GFSK, never
+        // batched into native BPSK frames during native hail escalation.
         std::lock_guard<std::mutex> lock(tx_mutex_);
-        tx_queue_.push(std::vector<uint8_t>(data, data + len));
+        ax25_tx_queue_.push(std::vector<uint8_t>(data, data + len));
     });
     ax25_session_.set_data_callback([this](const uint8_t* data, size_t len) {
         // Received I-frame data — deliver to KISS/AGW
@@ -235,6 +368,13 @@ void Modem::ptt_off() {
 }
 
 void Modem::process_rx(const float* rx_audio, int frame_count) {
+    // Deferred relisten: return to LISTENING after failed hail
+    // (can't call from inside state callback due to recursion)
+    if (relisten_pending_) {
+        relisten_pending_ = false;
+        arq_listen();
+    }
+
     // In loopback mode, skip TX mute — the delay buffer handles timing
     if (!loopback_mode_) {
         if (state_ == ModemState::TX_AX25 || state_ == ModemState::TX_NATIVE)
@@ -273,9 +413,16 @@ void Modem::process_rx(const float* rx_audio, int frame_count) {
         agc_.process_block(audio.data(), frame_count);
 
     float sum_sq = 0;
-    for (int i = 0; i < frame_count; i++)
+    float peak = 0;
+    for (int i = 0; i < frame_count; i++) {
         sum_sq += audio[i] * audio[i];
+        float a = std::fabs(audio[i]);
+        if (a > peak) peak = a;
+    }
     rx_rms_ = std::sqrt(sum_sq / std::max(frame_count, 1));
+    // Peak with slow decay (~1s at 48kHz/1024 frame_count ≈ 47 frames/s)
+    if (peak > rx_peak_) rx_peak_ = peak;
+    else rx_peak_ *= 0.95f;
 
     // Periodic RX diagnostic (~every 5 seconds)
     rx_diag_counter_ += frame_count;
@@ -297,6 +444,16 @@ void Modem::process_rx(const float* rx_audio, int frame_count) {
         process_rx_native(audio.data(), frame_count);
     } else {
         process_rx_ax25(audio.data(), frame_count);
+
+        // Native hail: also run native demod during LISTENING/HAILING
+        // so we can detect native-mode HAIL frames from peers with native_hail enabled.
+        if (config_.native_hail && !config_.ax25_only) {
+            auto arq_st = arq_.state();
+            if (arq_st == ArqState::LISTENING || arq_st == ArqState::HAILING ||
+                arq_st == ArqState::CONNECTING) {
+                process_rx_native(audio.data(), frame_count);
+            }
+        }
     }
 }
 
@@ -392,10 +549,14 @@ void Modem::process_rx_ax25(const float* audio, int count) {
                             xid_fallback_ticks_ = 0;
 
                             // Start passband probe before switching to native mode.
-                            // Probe runs over AX.25 audio, discovers usable bandwidth,
-                            // then tick() activates native mode when probe completes.
-                            probe_.start_initiator(config_.sample_rate);
-                            IRIS_LOG("XID handshake complete (initiator), starting passband probe");
+                            // Probe only for Mode A (audio-coupled FM) where radio
+                            // passband filtering matters. Mode B/C skip probe.
+                            if (config_.mode == "A" || config_.mode == "a") {
+                                probe_.start_initiator(config_.sample_rate);
+                                IRIS_LOG("XID handshake complete (initiator), starting passband probe");
+                            } else {
+                                IRIS_LOG("XID handshake complete (initiator), mode %s — skipping probe", config_.mode.c_str());
+                            }
                         }
                     }
                     } // else (not ax25_only)
@@ -413,15 +574,19 @@ void Modem::process_rx_ax25(const float* audio, int count) {
             }
 
             // Don't forward XID, probe, or self-originated frames to KISS clients
-            if (!is_xid && !is_probe && rx_callback_ && frame.size() >= 14) {
+            if (!is_xid && !is_probe && frame.size() >= 14) {
                 // Check source callsign to filter self-hearing
                 std::string rx_src;
                 for (int ci = 7; ci < 13; ci++) {
                     char c = (char)(frame[ci] >> 1);
                     if (c != ' ') rx_src += c;
                 }
-                if (rx_src != config_.callsign)
-                    rx_callback_(frame.data(), frame.size());
+                if (rx_src != config_.callsign) {
+                    if (gui_log_)
+                        gui_log_("[RX] " + describe_ax25(frame.data(), frame.size()));
+                    if (rx_callback_)
+                        rx_callback_(frame.data(), frame.size());
+                }
             }
 
             hdlc_decoder_.reset();
@@ -609,6 +774,20 @@ void Modem::process_rx_native(const float* audio, int count) {
 }
 
 void Modem::process_tx(float* tx_audio, int frame_count) {
+    // Draining: TX buffer exhausted, waiting for audio pipeline to flush
+    if (tx_draining_) {
+        std::memset(tx_audio, 0, frame_count * sizeof(float));
+        bool done = tx_drain_done_ ? tx_drain_done_() : true;
+        if (done) {
+            tx_draining_ = false;
+            ptt_off();
+            rx_muted_ = true;
+            rx_mute_holdoff_ = RX_MUTE_HOLDOFF_SAMPLES;
+            state_ = ModemState::IDLE;
+        }
+        return;
+    }
+
     if (tx_pos_ < tx_buffer_.size()) {
         size_t remaining = tx_buffer_.size() - tx_pos_;
         size_t to_copy = std::min((size_t)frame_count, remaining);
@@ -618,15 +797,22 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
         if (to_copy < (size_t)frame_count)
             std::memset(tx_audio + to_copy, 0, (frame_count - to_copy) * sizeof(float));
 
+        // Apply simulated bandpass filter to TX audio
+        if (sim_bp_enabled_) {
+            for (int i = 0; i < frame_count; i++) {
+                float s = tx_audio[i];
+                for (int j = 0; j < 4; j++) s = sim_bp_hi_[j].process(s);
+                for (int j = 0; j < 4; j++) s = sim_bp_lo_[j].process(s);
+                tx_audio[i] = s;
+            }
+        }
+
         if (tx_pos_ >= tx_buffer_.size()) {
             tx_buffer_.clear();
             tx_pos_ = 0;
-            ptt_off();
-            // Always set RX holdoff after TX to prevent self-hearing
-            // (VB-Cable and soundcard loopback buffer our own TX)
-            rx_muted_ = true;
-            rx_mute_holdoff_ = RX_MUTE_HOLDOFF_SAMPLES;
-            state_ = ModemState::IDLE;
+            // Mark current pipeline position, then wait for render to catch up
+            if (tx_drain_mark_) tx_drain_mark_();
+            tx_draining_ = true;
         }
         return;
     }
@@ -647,25 +833,28 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
             ax25_tx_queue_.pop();
             IRIS_LOG("TX frame %zu bytes (forced AX.25)", frame_data.size());
             state_ = ModemState::TX_AX25;
-            auto bits = hdlc_encode(frame_data.data(), frame_data.size(), 8, 4);
+            // Preamble flags: TXDelay worth of 0x7E flags for receiver sync
+            int preamble_flags = std::max(8, config_.ptt_pre_delay_ms * config_.ax25_baud / 8000);
+            auto bits = hdlc_encode(frame_data.data(), frame_data.size(), preamble_flags, 4);
             if (config_.ax25_baud == 9600)
                 tx_buffer_ = gfsk_mod_.modulate(bits);
             else
                 tx_buffer_ = afsk_mod_.modulate(bits);
             have_frame = true;
         } else if (!tx_queue_.empty()) {
-            if (native_mode_ && native_tx_ready_) {
+            // Native hail: use native PHY for ARQ hail/connect frames
+            bool native_hail_active = false;
+            if (config_.native_hail && !native_mode_) {
+                auto arq_st = arq_.state();
+                // Only active hail/connect phases — LISTENING is passive (responder
+                // only replies via native after receiving a native hail frame).
+                native_hail_active = (arq_st == ArqState::HAILING ||
+                                       arq_st == ArqState::CONNECTING);
+            }
+            if ((native_mode_ && native_tx_ready_) || native_hail_active) {
                 // Batch multiple queued frames into one multi-payload frame.
                 // Limit total payload based on speed level to cap air time at ~3s.
                 int level = gearshift_.current_level();
-                int bps_sym = bits_per_symbol(SPEED_LEVELS[level].modulation);
-                // Max payload bytes ≈ target_air_symbols × bps / 8 × FEC_rate - CRC
-                // Simpler: use a lookup. Higher modes = more payload per second of air.
-                // At 2400 baud, 3s = 7200 symbols - 111 overhead = 7089 payload symbols
-                // BPSK r1/2: 7089 sym → 7089 bits → 7089/16*800 = ~355 data bits → ~44 bytes (too small!)
-                // Actually compute from target air time:
-                int fec_n = SPEED_LEVELS[level].fec_rate_num;
-                int fec_d = SPEED_LEVELS[level].fec_rate_den;
                 // PHY bps already accounts for modulation and FEC
                 int phy_bps = net_throughput(level, phy_config_.baud_rate);
                 // 3 seconds of payload at PHY rate, minus overhead
@@ -708,9 +897,22 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
 
                 state_ = ModemState::TX_NATIVE;
                 PhyConfig tx_config = phy_config_;
-                tx_config.modulation = SPEED_LEVELS[level].modulation;
-                LdpcRate fec = fec_to_ldpc_rate(SPEED_LEVELS[level].fec_rate_num,
-                                                 SPEED_LEVELS[level].fec_rate_den);
+
+                Modulation tx_mod;
+                int tx_fec_n, tx_fec_d;
+                if (native_hail_active) {
+                    // Native hail: BPSK + LDPC rate 1/2 for maximum sensitivity
+                    tx_mod = Modulation::BPSK;
+                    tx_fec_n = 1;
+                    tx_fec_d = 2;
+                    IRIS_LOG("TX native hail frame %zu bytes (BPSK r1/2)", frame_data.size());
+                } else {
+                    tx_mod = SPEED_LEVELS[level].modulation;
+                    tx_fec_n = SPEED_LEVELS[level].fec_rate_num;
+                    tx_fec_d = SPEED_LEVELS[level].fec_rate_den;
+                }
+                tx_config.modulation = tx_mod;
+                LdpcRate fec = fec_to_ldpc_rate(tx_fec_n, tx_fec_d);
                 auto iq = build_native_frame(frame_data.data(), frame_data.size(), tx_config, fec);
 
                 if (use_upconvert_) {
@@ -725,7 +927,8 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                 tx_queue_.pop();
                 IRIS_LOG("TX frame %zu bytes (native=0)", frame_data.size());
                 state_ = ModemState::TX_AX25;
-                auto bits = hdlc_encode(frame_data.data(), frame_data.size(), 8, 4);
+                int preamble_flags = std::max(8, config_.ptt_pre_delay_ms * config_.ax25_baud / 8000);
+                auto bits = hdlc_encode(frame_data.data(), frame_data.size(), preamble_flags, 4);
                 if (config_.ax25_baud == 9600)
                     tx_buffer_ = gfsk_mod_.modulate(bits);
                 else
@@ -736,8 +939,8 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
 
         // Append any pending probe audio to tx_buffer_ (same PTT cycle).
         // This ensures RESULT AFSK goes out before probe tones in Turn 2.
+        // Don't scale here — tx_level is applied to entire buffer below.
         if (!probe_audio_pending_.empty()) {
-            for (auto& s : probe_audio_pending_) s *= config_.tx_level;
             tx_buffer_.insert(tx_buffer_.end(),
                               probe_audio_pending_.begin(),
                               probe_audio_pending_.end());
@@ -747,12 +950,18 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
         }
 
         if (have_frame) {
-            IRIS_LOG("TX buffer %zu samples", tx_buffer_.size());
+            int air_ms = (int)(tx_buffer_.size() * 1000 / config_.sample_rate);
+            IRIS_LOG("TX buffer %zu samples (%d ms)", tx_buffer_.size(), air_ms);
+            if (gui_log_)
+                gui_log_("[TX] " + std::to_string(air_ms) + " ms on air");
 
             for (auto& s : tx_buffer_)
                 s *= config_.tx_level;
 
-            int pre_samples = config_.ptt_pre_delay_ms * config_.sample_rate / 1000;
+            // Short silence for PTT hardware settle (50ms), then flag preamble provides
+            // the rest of TXDelay for receiver DCD/clock sync
+            int ptt_settle_ms = 50;
+            int pre_samples = ptt_settle_ms * config_.sample_rate / 1000;
             if (pre_samples > 0)
                 tx_buffer_.insert(tx_buffer_.begin(), pre_samples, 0.0f);
 
@@ -769,6 +978,16 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
             tx_pos_ = to_copy;
             if (to_copy < (size_t)frame_count)
                 std::memset(tx_audio + to_copy, 0, (frame_count - to_copy) * sizeof(float));
+
+            // Apply simulated bandpass filter
+            if (sim_bp_enabled_) {
+                for (int i = 0; i < frame_count; i++) {
+                    float s = tx_audio[i];
+                    for (int j = 0; j < 4; j++) s = sim_bp_hi_[j].process(s);
+                    for (int j = 0; j < 4; j++) s = sim_bp_lo_[j].process(s);
+                    tx_audio[i] = s;
+                }
+            }
             return;
         }
     }
@@ -777,6 +996,7 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
 }
 
 void Modem::queue_tx_frame(const uint8_t* frame, size_t len) {
+    bytes_tx_ += len;
     if (native_mode_ && native_tx_ready_ && arq_.state() == ArqState::CONNECTED) {
         const uint8_t* cur = frame;
         size_t cur_len = len;
@@ -815,6 +1035,9 @@ void Modem::queue_tx_frame(const uint8_t* frame, size_t len) {
             if (enc_len > 0) {
                 cur = encrypted.data();
                 cur_len = enc_len;
+            } else {
+                IRIS_LOG("[CRYPTO] CRITICAL: encryption failed (len=%zu), dropping frame to prevent data leak", cur_len);
+                return;  // Do NOT send unencrypted data when encryption is active
             }
         }
 
@@ -846,6 +1069,8 @@ void Modem::queue_tx_frame(const uint8_t* frame, size_t len) {
     }
 
     tx_queue_.push(std::vector<uint8_t>(frame, frame + len));
+    if (gui_log_ && len >= 14)
+        gui_log_("[TX] " + describe_ax25(frame, len));
 }
 
 void Modem::ax25_connect(const std::string& remote_callsign) {
@@ -880,6 +1105,12 @@ void Modem::arq_disconnect() {
 }
 
 void Modem::arq_listen() {
+    // Skip if already listening (prevents recursion from state callbacks)
+    if (arq_.state() == ArqState::LISTENING)
+        return;
+    // When native_hail relisten is pending, let the deferred path handle it
+    if (relisten_pending_)
+        return;
     // Always start in AX.25 mode. Native upgrade happens via XID negotiation
     // when the remote station proves it supports Iris native PHY.
     // --ax25-only suppresses XID entirely.
@@ -887,10 +1118,31 @@ void Modem::arq_listen() {
     arq_.listen();
 }
 
+// After this many AFSK SABM failures, escalate to native BPSK hailing
+static constexpr int NATIVE_HAIL_ESCALATION_RETRIES = 3;
+
 void Modem::tick() {
     arq_.tick();
     ax25_session_.tick();
     probe_.tick();
+
+    // Native hail escalation: after a few AFSK SABM failures, switch to
+    // native BPSK hailing. Cancel AFSK retries so native hail gets exclusive
+    // TX time — interleaved AFSK+native leaves no RX window for the 717ms
+    // native response from the remote.
+    if (config_.native_hail &&
+        ax25_session_.state() == Ax25SessionState::AWAITING_CONNECTION &&
+        ax25_session_.retry_count() >= NATIVE_HAIL_ESCALATION_RETRIES &&
+        arq_.state() == ArqState::LISTENING) {
+        std::string remote = ax25_session_.remote_callsign();
+        int retries = ax25_session_.retry_count();
+        IRIS_LOG("Native hail: AFSK SABM failed %d times, escalating to native BPSK",
+                 retries);
+        // Start native ARQ first so state is HAILING when AX.25 DISCONNECTED
+        // callback fires (callback guards against HAILING/CONNECTING).
+        arq_connect(remote);
+        ax25_session_.reset();  // Stop AFSK retries
+    }
 
     // Count down native mode holdoff (set after queuing XID reply)
     // During holdoff, stay in AX.25 mode to decode any remaining AX.25 frames.
@@ -898,14 +1150,18 @@ void Modem::tick() {
     if (native_tx_holdoff_ > 0) {
         native_tx_holdoff_--;
         if (native_tx_holdoff_ == 0) {
-            // Don't go native yet — run passband probe first.
-            // In the 3-turn protocol the initiator sends tones immediately
-            // after XID completes. We (responder) start listening now.
-            probe_.start_responder(config_.sample_rate);
-            IRIS_LOG("Native holdoff expired, starting passband probe (responder)");
-            // Fallback: if probe doesn't complete within 10s,
-            // go native anyway (peer may be an older version without probe).
-            probe_fallback_ticks_ = 100;  // 10s at 100ms/tick
+            if (config_.mode == "A" || config_.mode == "a") {
+                // Don't go native yet — run passband probe first.
+                // In the 3-turn protocol the initiator sends tones immediately
+                // after XID completes. We (responder) start listening now.
+                probe_.start_responder(config_.sample_rate);
+                IRIS_LOG("Native holdoff expired, starting passband probe (responder)");
+                // Fallback: if probe doesn't complete within 10s,
+                // go native anyway (peer may be an older version without probe).
+                probe_fallback_ticks_ = 100;  // 10s at 100ms/tick
+            } else {
+                IRIS_LOG("Native holdoff expired, mode %s — skipping probe, going native", config_.mode.c_str());
+            }
         }
     }
 
@@ -913,18 +1169,53 @@ void Modem::tick() {
     if (probe_.is_done() && !native_mode_) {
         native_mode_ = true;
         native_tx_ready_ = true;
-        // Apply negotiated passband if valid
+        // Apply negotiated passband and baud rate
         if (probe_.has_results() && probe_.negotiated().valid) {
             float low = probe_.negotiated().low_hz;
             float high = probe_.negotiated().high_hz;
+            float bandwidth = high - low;
             config_.band_low_hz = low;
             config_.band_high_hz = high;
             float center = (low + high) / 2.0f;
+
             if (use_upconvert_) {
                 upconverter_ = Upconverter(center, config_.sample_rate);
                 downconverter_ = Downconverter(center, config_.sample_rate);
+
+                // Auto-negotiate baud rate: pick highest that fits in passband.
+                // Signal BW = baud * (1 + alpha). Any integer SPS works.
+                // Both sides compute the same answer from the same negotiated band.
+                // Sweep SPS from min (fastest) to max (slowest), pick first that fits.
+                // Regulatory cap: FCC Part 97 limits 2m to 19.6 kilobaud / 20 kHz BW,
+                // 70cm to 56 kilobaud / 100 kHz BW. We cap occupied BW at 20 kHz
+                // to stay safe for VHF use (Mode B/C). Mode A (HF) is well below.
+                constexpr float MAX_OCCUPIED_BW_HZ = 20000.0f;
+                float usable_bw = std::min(bandwidth - 200.0f, MAX_OCCUPIED_BW_HZ);  // 100 Hz margin each edge
+                constexpr int SPS_MIN = 6;    // 8000 baud max
+                constexpr int SPS_MAX = 30;   // 1600 baud min
+                int new_sps = 20;             // default: 2400 baud
+                int new_baud = config_.sample_rate / new_sps;
+                for (int sps = SPS_MIN; sps <= SPS_MAX; sps++) {
+                    int baud = config_.sample_rate / sps;
+                    float sig_bw = baud * (1.0f + phy_config_.rrc_alpha);
+                    if (sig_bw <= usable_bw) {
+                        new_sps = sps;
+                        new_baud = baud;
+                        break;
+                    }
+                }
+
+                if (new_baud != phy_config_.baud_rate) {
+                    phy_config_.baud_rate = new_baud;
+                    phy_config_.samples_per_symbol = new_sps;
+                    native_mod_ = std::make_unique<NativeModulator>(phy_config_, config_.sample_rate);
+                    native_demod_ = std::make_unique<NativeDemodulator>(phy_config_, config_.sample_rate);
+                    IRIS_LOG("Probe: upgraded baud rate to %d (SPS=%d, sig BW=%.0f Hz)",
+                             new_baud, new_sps, new_baud * (1.0f + phy_config_.rrc_alpha));
+                }
             }
-            IRIS_LOG("Probe complete: band %.0f-%.0f Hz, center %.0f Hz", low, high, center);
+            IRIS_LOG("Probe complete: band %.0f-%.0f Hz (%.0f Hz), center %.0f Hz, baud %d",
+                     low, high, bandwidth, center, phy_config_.baud_rate);
         }
         // Flush deferred data (now goes via native PHY)
         {
@@ -986,6 +1277,7 @@ ModemDiag Modem::get_diagnostics() const {
     diag.crc_errors = crc_errors_;
     diag.retransmits = arq_.retransmit_count();
     diag.rx_rms = rx_rms_;
+    diag.rx_peak = rx_peak_;
     diag.ptt_active = ptt_active_;
     diag.cal_state = cal_state_;
     diag.cal_measured_rms = cal_measured_rms_;
@@ -1007,16 +1299,35 @@ ModemDiag Modem::get_diagnostics() const {
         diag.probe_negotiated = probe_.negotiated();
     }
 
+    // Extended diagnostics
+    diag.native_mode = native_mode_;
+    diag.bytes_rx = bytes_rx_;
+    diag.bytes_tx = bytes_tx_;
+    diag.phy_bps = net_throughput(diag.speed_level, phy_config_.baud_rate);
+    diag.app_bps = diag.phy_bps;  // Same as PHY unless compression active
+    diag.compression_ratio = tx_compressor_.last_ratio();
+    if (diag.compression_ratio > 1.0f)
+        diag.app_bps = (int)(diag.phy_bps * diag.compression_ratio);
+    diag.encryption_state = crypto_state_;
+    diag.band_low_hz = config_.band_low_hz;
+    diag.band_high_hz = config_.band_high_hz;
+    diag.baud_rate = phy_config_.baud_rate;
+
     return diag;
 }
 
 void Modem::compute_spectrum(const float* audio, int count) {
-    constexpr int NFFT = 256;
+    constexpr int NFFT = 512;
     if (count < NFFT) return;
 
-    std::vector<float> spec(NFFT / 2, 0.0f);
+    float bin_hz = (float)config_.sample_rate / NFFT;
+    int k_lo = std::max(1, (int)(config_.band_low_hz / bin_hz));
+    int k_hi = std::min(NFFT / 2, (int)(config_.band_high_hz / bin_hz) + 1);
+    if (k_hi <= k_lo) return;
+
+    std::vector<float> spec(k_hi - k_lo, 0.0f);
     const float* src = audio + count - NFFT;
-    for (int k = 0; k < NFFT / 2; k++) {
+    for (int k = k_lo; k < k_hi; k++) {
         float re = 0, im = 0;
         for (int n = 0; n < NFFT; n++) {
             float w = 0.5f * (1.0f - std::cos(2.0f * (float)M_PI * n / (NFFT - 1)));
@@ -1025,7 +1336,7 @@ void Modem::compute_spectrum(const float* audio, int count) {
             im += src[n] * w * std::sin(angle);
         }
         float pwr = (re * re + im * im) / (NFFT * NFFT);
-        spec[k] = 10.0f * std::log10(std::max(pwr, 1e-12f));
+        spec[k - k_lo] = 10.0f * std::log10(std::max(pwr, 1e-12f));
     }
 
     std::lock_guard<std::mutex> lock(diag_mutex_);

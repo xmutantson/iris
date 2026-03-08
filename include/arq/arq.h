@@ -76,8 +76,8 @@ static constexpr int ARQ_MAX_ACK_TIMEOUT_MS = 10000;
 static constexpr int ARQ_MAX_PAYLOAD = 256;
 
 // HAIL beacon constants
-static constexpr int HAIL_INTERVAL_MS = 1500;   // Must exceed round-trip audio latency (~1s on VB-Cable)
-static constexpr int HAIL_MAX_ATTEMPTS = 10;     // 15 seconds of hailing
+static constexpr int HAIL_INTERVAL_MS = 3500;   // Must exceed full round-trip: TX(717ms) + responder accumulate/decode(~800ms) + response TX(717ms)
+static constexpr int HAIL_MAX_ATTEMPTS = 10;     // ~35 seconds of hailing
 
 // Turboshift constants
 static constexpr int TURBO_PROBE_RETRIES = 2;

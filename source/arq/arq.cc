@@ -360,6 +360,10 @@ void ArqSession::handle_connect(const ArqFrame& frame) {
         remote_callsign_.assign(frame.payload.begin(), frame.payload.end());
     }
 
+    // Reset per-session state to prevent stale flags from previous session
+    batch_data_delivered_ = false;
+    last_received_eob_seq_ = -1;
+
     set_state(ArqState::CONNECTED);
 
     ArqFrame ack;
@@ -383,6 +387,10 @@ void ArqSession::handle_connect_ack(const ArqFrame& frame) {
         peer_caps_ = 0;
         remote_callsign_.assign(frame.payload.begin(), frame.payload.end());
     }
+
+    // Reset per-session state to prevent stale flags from previous session
+    batch_data_delivered_ = false;
+    last_received_eob_seq_ = -1;
 
     set_state(ArqState::CONNECTED);
     start_turboshift();

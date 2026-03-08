@@ -29,6 +29,7 @@ using namespace iris;
 extern int run_tests();
 
 static std::atomic<bool> g_running{true};
+static std::atomic<bool> g_restart{false};
 
 static void signal_handler(int) {
     g_running = false;
@@ -57,6 +58,7 @@ static void print_usage() {
     printf("\nModem:\n");
     printf("  --mode <A|B|C>     Set channel mode\n");
     printf("  --ax25-only        Disable native PHY upgrade\n");
+    printf("  --native-hail      Use native PHY for hailing (both sides must enable)\n");
     printf("  --ax25-baud <n>    AX.25 baud rate (1200 or 9600)\n");
     printf("  --max-mod <mod>    Max modulation (BPSK,QPSK,QAM16,QAM64,QAM256)\n");
     printf("  --speed-level <n>  Force speed level 0-7 (default: auto)\n");
@@ -119,6 +121,7 @@ int main(int argc, char** argv) {
     // Extended CLI overrides (applied after config load)
     int cli_ssid = -1;
     bool cli_ax25_only = false;
+    bool cli_native_hail = false;
     int cli_ax25_baud = -1;
     std::string cli_max_mod;
     float cli_tx_level = -1.0f;
@@ -144,6 +147,7 @@ int main(int argc, char** argv) {
     float cli_center_freq = -1.0f;
     int cli_speed_level = -1;
     float cli_noise = 0.0f;
+    float cli_bp_low = 0.0f, cli_bp_high = 0.0f;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--test") == 0) {
@@ -166,6 +170,8 @@ int main(int argc, char** argv) {
             cli_mode = argv[++i];
         } else if (strcmp(argv[i], "--ax25-only") == 0) {
             cli_ax25_only = true;
+        } else if (strcmp(argv[i], "--native-hail") == 0) {
+            cli_native_hail = true;
         } else if (strcmp(argv[i], "--ax25-baud") == 0 && i + 1 < argc) {
             cli_ax25_baud = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--max-mod") == 0 && i + 1 < argc) {
@@ -222,6 +228,15 @@ int main(int argc, char** argv) {
             cli_speed_level = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--noise") == 0 && i + 1 < argc) {
             cli_noise = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--bandpass") == 0 && i + 1 < argc) {
+            // Parse "low-high" format, e.g. "300-3000"
+            char* bp = argv[++i];
+            char* dash = strchr(bp, '-');
+            if (dash) {
+                *dash = '\0';
+                cli_bp_low = (float)atof(bp);
+                cli_bp_high = (float)atof(dash + 1);
+            }
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage();
             return 0;
@@ -250,6 +265,7 @@ int main(int argc, char** argv) {
     if (cli_ssid >= 0) config.ssid = cli_ssid;
     if (!cli_mode.empty()) config.mode = cli_mode;
     if (cli_ax25_only) config.ax25_only = true;
+    if (cli_native_hail) config.native_hail = true;
     if (cli_ax25_baud > 0) config.ax25_baud = cli_ax25_baud;
     if (!cli_max_mod.empty()) config.max_modulation = parse_modulation(cli_max_mod.c_str());
     if (cli_tx_level >= 0.0f) config.tx_level = cli_tx_level;
@@ -273,6 +289,10 @@ int main(int argc, char** argv) {
     if (cli_band_low >= 0.0f) config.band_low_hz = cli_band_low;
     if (cli_band_high >= 0.0f) config.band_high_hz = cli_band_high;
     if (cli_center_freq >= 0.0f) config.center_freq_hz = cli_center_freq;
+    if (cli_bp_low > 0.0f && cli_bp_high > cli_bp_low) {
+        config.sim_bandpass_low = cli_bp_low;
+        config.sim_bandpass_high = cli_bp_high;
+    }
     if (!cli_encrypt.empty()) {
         if (cli_encrypt == "strict") config.encryption_mode = 1;
         else if (cli_encrypt == "fast") config.encryption_mode = 2;
@@ -349,20 +369,31 @@ int main(int argc, char** argv) {
     // Start listening for incoming ARQ connections
     modem.arq_listen();
 
-    // Initialize PTT
-    auto ptt = create_ptt(config.ptt_method, config.rigctl_host, config.rigctl_port,
-                          config.serial_port, config.serial_baud);
-    if (ptt) {
-        modem.set_ptt_controller(std::move(ptt));
-        printf("  PTT: %s\n", config.ptt_method.c_str());
-    } else {
-        printf("  PTT: none\n");
-    }
-
     // Initialize KISS server
     KissServer kiss;
     kiss.set_tx_callback([&modem](const uint8_t* frame, size_t len) {
         modem.queue_tx_frame(frame, len);
+    });
+    kiss.set_param_callback([&config](uint8_t cmd, uint8_t value) {
+        switch (cmd) {
+            case KISS_CMD_TXDELAY:
+                config.ptt_pre_delay_ms = value * 10;
+                printf("[KISS] TXDELAY = %d ms\n", config.ptt_pre_delay_ms);
+                break;
+            case KISS_CMD_P:
+                config.persist = value;
+                printf("[KISS] Persist = %d\n", config.persist);
+                break;
+            case KISS_CMD_SLOT:
+                config.slottime_ms = value * 10;
+                printf("[KISS] SlotTime = %d ms\n", config.slottime_ms);
+                break;
+            case KISS_CMD_TXTAIL:
+                config.ptt_post_delay_ms = value * 10;
+                printf("[KISS] TXTail = %d ms\n", config.ptt_post_delay_ms);
+                break;
+            default: break;
+        }
     });
 
     if (!kiss.start(config.kiss_port)) {
@@ -377,9 +408,10 @@ int main(int argc, char** argv) {
     agw.set_tx_callback([&modem](const uint8_t* frame, size_t len) {
         modem.queue_tx_frame(frame, len);
     });
-    agw.set_connect_callback([&modem](const std::string& remote) {
-        // Use AX.25 connected mode (standard protocol, works with any TNC).
-        // Native ARQ upgrade happens via XID after AX.25 connection established.
+    agw.set_connect_callback([&modem, &config](const std::string& remote) {
+        // Always start with AX.25 SABM (works with any TNC).
+        // If native_hail is enabled and AFSK fails after a few retries,
+        // the modem escalates to native BPSK hailing automatically.
         modem.ax25_connect(remote);
     });
     agw.set_disconnect_callback([&modem]() {
@@ -419,8 +451,13 @@ int main(int argc, char** argv) {
         if (state == Ax25SessionState::CONNECTED)
             agw.notify_connected(config.callsign, remote);
         else if (state == Ax25SessionState::DISCONNECTED) {
-            agw.notify_disconnected(config.callsign, remote);
-            modem.arq_listen();
+            // Don't notify disconnect or relisten if ARQ is actively hailing
+            // (native hail escalation in progress — AX.25 gave up but ARQ continues)
+            if (modem.arq_state() != ArqState::HAILING &&
+                modem.arq_state() != ArqState::CONNECTING) {
+                agw.notify_disconnected(config.callsign, remote);
+                modem.arq_listen();
+            }
         }
     });
 
@@ -476,6 +513,12 @@ int main(int argc, char** argv) {
             }
         });
 
+        // Let modem wait for audio pipeline to flush before releasing PTT
+        auto* pb_ptr = playback.get();
+        modem.set_tx_drain_hooks(
+            [pb_ptr]() { pb_ptr->mark_drain(); },
+            [pb_ptr]() { return pb_ptr->is_drained(); });
+
         bool cap_ok = capture->open(config.capture_device, config.sample_rate, 1, 480);
         bool play_ok = playback->open(config.playback_device, config.sample_rate, 1, 480);
 
@@ -513,10 +556,33 @@ int main(int argc, char** argv) {
             [&](const IrisConfig& new_cfg) {
                 config = new_cfg;
                 save_config(config_path, config);
-                gui.log("Config saved");
+                gui.log("Config saved — restarting...");
+                g_restart = true;
+                g_running = false;
             },
             [&]() { g_running = false; }
         });
+    }
+
+    // Set up rigctl log callback to forward to GUI event log
+    rigctl_set_log_callback([&gui](const std::string& msg) {
+        gui.log(msg);
+    });
+
+    // Modem frame events → GUI event log
+    modem.set_gui_log([&gui](const std::string& msg) {
+        gui.log(msg);
+    });
+
+    // Initialize PTT (after GUI so log messages appear in event log)
+    auto ptt = create_ptt(config.ptt_method, config.rigctl_host, config.rigctl_port,
+                          config.serial_port, config.serial_baud,
+                          config.rigctld_model, config.rigctld_device);
+    if (ptt) {
+        modem.set_ptt_controller(std::move(ptt));
+        printf("  PTT: %s\n", config.ptt_method.c_str());
+    } else {
+        printf("  PTT: none\n");
     }
 
     printf("  Modem running. Press Ctrl+C to quit.\n\n");
@@ -560,8 +626,35 @@ int main(int argc, char** argv) {
     agw.stop();
     kiss.stop();
     modem.shutdown();
+    rigctld_shutdown();
     save_config(config_path, config);
     Logger::instance().close();
+
+    if (g_restart) {
+        printf("Restarting...\n");
+#ifdef _WIN32
+        // Re-launch ourselves with same arguments
+        char exe_path[MAX_PATH];
+        GetModuleFileNameA(NULL, exe_path, MAX_PATH);
+        std::string cmd = std::string("\"") + exe_path + "\"";
+        for (int i = 1; i < argc; i++) {
+            cmd += " \"";
+            cmd += argv[i];
+            cmd += "\"";
+        }
+        STARTUPINFOA si = {};
+        si.cb = sizeof(si);
+        PROCESS_INFORMATION pi = {};
+        CreateProcessA(exe_path, (LPSTR)cmd.c_str(), NULL, NULL, FALSE,
+                       0, NULL, NULL, &si, &pi);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+#else
+        execv(argv[0], argv);
+        // If execv fails, just exit normally
+#endif
+    }
+
     printf("Done.\n");
     return 0;
 }
