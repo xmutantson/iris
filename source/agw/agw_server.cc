@@ -247,9 +247,12 @@ void AgwServer::handle_frame(int sock, const AgwHeader& hdr, const std::vector<u
         }
 
         case AGW_DATA: {
-            // Connected-mode data from client
-            if (!data.empty() && tx_callback_) {
-                tx_callback_(data.data(), data.size());
+            // Connected-mode data from client — route to AX.25 session or ARQ
+            if (!data.empty()) {
+                if (connected_data_callback_)
+                    connected_data_callback_(data.data(), data.size());
+                else if (tx_callback_)
+                    tx_callback_(data.data(), data.size());
             }
             break;
         }

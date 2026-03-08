@@ -39,6 +39,8 @@ struct IrisConfig {
     int rigctl_port = 4532;
     std::string serial_port;
     int serial_baud = 9600;
+    int serial_ptt_line = 0;    // 0=RTS, 1=DTR
+    int cm108_gpio = 3;         // CM108 GPIO pin for PTT (typically 3)
     int ptt_pre_delay_ms = 100;   // TXDelay: PTT key-up settle time (FT-60 ~100ms)
     int ptt_post_delay_ms = 50;   // TXTail: PTT release tail (FT-60 ~50ms)
 

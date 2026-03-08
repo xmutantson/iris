@@ -378,13 +378,23 @@ int main(int argc, char** argv) {
         modem.queue_tx_frame(frame, len);
     });
     agw.set_connect_callback([&modem](const std::string& remote) {
-        modem.arq_connect(remote);
+        // Use AX.25 connected mode (standard protocol, works with any TNC).
+        // Native ARQ upgrade happens via XID after AX.25 connection established.
+        modem.ax25_connect(remote);
     });
     agw.set_disconnect_callback([&modem]() {
-        modem.arq_disconnect();
+        if (modem.ax25_state() != Ax25SessionState::DISCONNECTED)
+            modem.ax25_disconnect();
+        else
+            modem.arq_disconnect();
     });
     agw.set_outstanding_callback([&modem]() -> int {
+        if (modem.ax25_state() != Ax25SessionState::DISCONNECTED)
+            return modem.ax25_pending_frames();
         return modem.arq_pending_frames();
+    });
+    agw.set_connected_data_callback([&modem](const uint8_t* data, size_t len) {
+        modem.send_connected_data(data, len);
     });
 
     // Deliver RX frames to both KISS and AGW clients
@@ -400,6 +410,16 @@ int main(int argc, char** argv) {
         else if (state == ArqState::IDLE) {
             agw.notify_disconnected(config.callsign, remote);
             // Re-enter LISTENING so we can accept new connections
+            modem.arq_listen();
+        }
+    });
+
+    // Notify AGW clients when AX.25 session state changes
+    modem.set_ax25_state_callback([&agw, &modem, &config](Ax25SessionState state, const std::string& remote) {
+        if (state == Ax25SessionState::CONNECTED)
+            agw.notify_connected(config.callsign, remote);
+        else if (state == Ax25SessionState::DISCONNECTED) {
+            agw.notify_disconnected(config.callsign, remote);
             modem.arq_listen();
         }
     });

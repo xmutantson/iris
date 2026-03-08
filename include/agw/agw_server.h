@@ -50,6 +50,11 @@ public:
     void set_disconnect_callback(DisconnectCallback cb) { disconnect_callback_ = cb; }
     void set_outstanding_callback(OutstandingCallback cb) { outstanding_callback_ = cb; }
 
+    // Separate callback for connected-mode data ('D' frames from AGW client).
+    // This routes to AX.25 session or native ARQ, not raw TX queue.
+    using ConnectedDataCallback = std::function<void(const uint8_t*, size_t)>;
+    void set_connected_data_callback(ConnectedDataCallback cb) { connected_data_callback_ = cb; }
+
     // Start listening on given port
     bool start(int port = 8000);
     void stop();
@@ -82,6 +87,7 @@ private:
     std::atomic<bool> running_{false};
     std::thread accept_thread_;
     TxCallback tx_callback_;
+    ConnectedDataCallback connected_data_callback_;
     ConnectCallback connect_callback_;
     DisconnectCallback disconnect_callback_;
     OutstandingCallback outstanding_callback_;
