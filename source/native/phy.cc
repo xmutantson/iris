@@ -49,12 +49,22 @@ std::vector<float> NativeModulator::modulate_symbols(
     auto i_shaped = fir_filter(i_up, rrc_taps_);
     auto q_shaped = fir_filter(q_up, rrc_taps_);
 
-    // Interleave I/Q
+    // Interleave I/Q and normalize RMS to match AFSK output level (1/sqrt(2))
+    // Without this, the RRC pulse-shaped + upsampled signal is ~6 dB quieter
+    // than AFSK's constant-envelope sinusoid at the same tx_level setting.
     size_t n = std::min(i_shaped.size(), q_shaped.size());
     std::vector<float> iq(n * 2);
+    float energy = 0;
     for (size_t i = 0; i < n; i++) {
         iq[2 * i]     = i_shaped[i];
         iq[2 * i + 1] = q_shaped[i];
+        energy += i_shaped[i] * i_shaped[i] + q_shaped[i] * q_shaped[i];
+    }
+    float rms = std::sqrt(energy / (float)n);
+    float target_rms = 1.0f / std::sqrt(2.0f);  // match AFSK sine wave RMS
+    if (rms > 1e-6f) {
+        float scale = target_rms / rms;
+        for (auto& s : iq) s *= scale;
     }
 
     return iq;
