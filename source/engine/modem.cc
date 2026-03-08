@@ -285,6 +285,18 @@ void Modem::process_rx_ax25(const float* audio, int count) {
             const auto& frame = hdlc_decoder_.frame();
             frames_rx_++;
 
+            // Try ARQ session first — ARQ frames are raw bytes without
+            // AX.25 headers, so they must be handled before the AX.25 checks.
+            {
+                ArqState arq_st = arq_.state();
+                if (arq_st != ArqState::IDLE) {
+                    if (arq_.on_frame_received(frame.data(), frame.size())) {
+                        hdlc_decoder_.reset();
+                        continue;  // ARQ handled it
+                    }
+                }
+            }
+
             bool is_xid = false;
             if (frame.size() >= 24 && frame[15] == IRIS_PID) {
                 // Extract source callsign from AX.25 header (bytes 7-12, shifted)

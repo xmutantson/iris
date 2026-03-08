@@ -38,6 +38,7 @@ static constexpr uint8_t AGW_OUTSTANDING  = 'Y';  // Outstanding frames query
 static constexpr uint8_t AGW_HEARD        = 'H';  // Heard stations query
 static constexpr uint8_t AGW_MON_ON       = 'k';  // Monitor on
 static constexpr uint8_t AGW_RAW          = 'K';  // Raw AX.25 frame
+static constexpr uint8_t AGW_PORT_OUTSTANDING = 'y'; // Outstanding frames (port-level)
 
 static void set_call(char* dst, const std::string& call) {
     memset(dst, 0, 10);
@@ -287,6 +288,15 @@ void AgwServer::handle_frame(int sock, const AgwHeader& hdr, const std::vector<u
             if (!data.empty() && tx_callback_) {
                 tx_callback_(data.data(), data.size());
             }
+            break;
+        }
+
+        case AGW_PORT_OUTSTANDING: {
+            // Port-level outstanding frames (Direwolf >= 1.2 / Pat fallback)
+            uint32_t count = 0;
+            if (outstanding_callback_) count = (uint32_t)outstanding_callback_();
+            send_frame(sock, 'y', get_call(hdr.call_from), get_call(hdr.call_to),
+                       (const uint8_t*)&count, 4);
             break;
         }
 
