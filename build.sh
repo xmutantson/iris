@@ -4,7 +4,7 @@
 
 set -e
 
-MODE="${1:-release}"
+MODE="${1:-gui}"
 CXX="${CXX:-g++}"
 OUTDIR="build"
 BINARY="iris"
@@ -22,7 +22,7 @@ case "$MODE" in
     o1)           OPT_LEVEL="-O1"; MODE="release" ;;
     o2)           OPT_LEVEL="-O2"; MODE="release" ;;
     o3)           OPT_LEVEL="-O3 -march=native"; MODE="release" ;;
-    gui)          MODE="release"; USE_IMGUI=1 ;;
+    gui)          OPT_LEVEL="-O3 -march=native"; MODE="release"; USE_IMGUI=1 ;;
     gui-debug)    MODE="debug";   USE_IMGUI=1 ;;
     gui-sdl)      MODE="release"; USE_IMGUI=1; USE_SDL2=1 ;;
     gui-sdl-debug) MODE="debug";  USE_IMGUI=1; USE_SDL2=1 ;;
@@ -155,3 +155,16 @@ $CXX $CXX_OBJS "$MONOCYPHER_OBJ" "$ZSTD_OBJ" $PPMD_OBJS "$LZHUF_OBJ" "$MLKEM_OBJ
 
 echo "=== Build complete: $OUTDIR/$BINARY ==="
 ls -la "$OUTDIR/$BINARY"
+
+# Install reminder
+echo ""
+if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "mingw"* || "$OSTYPE" == "cygwin" ]]; then
+    INSTALL_DIR="/c/Program Files/Iris"
+    mkdir -p "$INSTALL_DIR" 2>/dev/null && cp "$OUTDIR/$BINARY" "$INSTALL_DIR/" && \
+        echo "*** Installed to $INSTALL_DIR/$BINARY" || \
+        echo "*** REMINDER: Install to Program Files with:
+    cp $OUTDIR/$BINARY \"$INSTALL_DIR/\""
+elif [[ "$OSTYPE" == "linux"* || "$OSTYPE" == "darwin"* ]]; then
+    echo "*** REMINDER: Install with:"
+    echo "    sudo install -m 755 $OUTDIR/$BINARY /usr/local/bin/$BINARY"
+fi

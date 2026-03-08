@@ -59,8 +59,9 @@ private:
     int selected_capture_ = 0;
     int selected_playback_ = 0;
     int selected_mode_ = 0;  // 0=A, 1=B, 2=C
-    int selected_ax25_baud_ = 0; // 0=1200, 1=9600
     bool show_config_ = false;
+    bool show_log_ = false;
+    int settings_tab_ = 0;
 };
 
 } // namespace iris

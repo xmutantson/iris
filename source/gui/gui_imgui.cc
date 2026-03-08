@@ -6,6 +6,7 @@
 #include "imgui_impl_opengl3.h"
 #include "engine/speed_level.h"
 #include "arq/arq.h"
+#include "probe/passband_probe.h"
 
 #include <cstdio>
 #include <cmath>
@@ -164,6 +165,11 @@ static bool platform_init(const char* title, int w, int h) {
     ImGui_ImplWin32_InitForOpenGL(g_hwnd);
     ImGui_ImplOpenGL3_Init("#version 130");
     g_want_close = false;
+
+    // Hide the console window when running with GUI
+    HWND console = GetConsoleWindow();
+    if (console) ShowWindow(console, SW_HIDE);
+
     return true;
 }
 
@@ -192,6 +198,10 @@ static void platform_render() {
 }
 
 static void platform_shutdown() {
+    // Show console again on shutdown so error messages are visible
+    HWND console = GetConsoleWindow();
+    if (console) ShowWindow(console, SW_SHOW);
+
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplWin32_Shutdown();
     if (g_hglrc) { wglMakeCurrent(nullptr, nullptr); wglDeleteContext(g_hglrc); g_hglrc = nullptr; }
@@ -203,7 +213,7 @@ static void platform_shutdown() {
 #endif // platform backends
 
 // ============================================================
-// Custom widgets (Mercury-style meters and indicators)
+// Custom widgets
 // ============================================================
 
 static void DrawMeter(const char* label, float value, float min_val, float max_val,
@@ -295,7 +305,8 @@ static void DrawConstellation(const std::vector<std::complex<float>>& points, fl
     ImGui::Dummy(ImVec2(width, height));
 }
 
-static void DrawSpectrum(const std::vector<float>& spectrum, float width, float height) {
+static void DrawSpectrum(const std::vector<float>& spectrum, float width, float height,
+                         float band_low_hz, float band_high_hz) {
     ImVec2 pos = ImGui::GetCursorScreenPos();
     ImDrawList* dl = ImGui::GetWindowDrawList();
 
@@ -330,22 +341,34 @@ static void DrawSpectrum(const std::vector<float>& spectrum, float width, float 
     }
 
     dl->AddRect(pos, ImVec2(pos.x + width, pos.y + height), IM_COL32(80, 80, 80, 255));
-    ImGui::Dummy(ImVec2(width, height));
-}
 
-// ============================================================
-// State name helper
-// ============================================================
-static const char* state_name(ModemState s) {
-    switch (s) {
-        case ModemState::IDLE: return "IDLE";
-        case ModemState::RX_AX25: return "RX AX.25";
-        case ModemState::RX_NATIVE: return "RX Native";
-        case ModemState::TX_AX25: return "TX AX.25";
-        case ModemState::TX_NATIVE: return "TX Native";
-        case ModemState::CALIBRATING: return "CALIBRATING";
+    // Frequency axis labels
+    float label_y = pos.y + height + 2;
+    int n_labels = 5;
+    for (int i = 0; i <= n_labels; i++) {
+        float frac_x = (float)i / n_labels;
+        float freq = band_low_hz + frac_x * (band_high_hz - band_low_hz);
+        float lx = pos.x + frac_x * width;
+        char lbl[32];
+        if (freq >= 1000.0f)
+            snprintf(lbl, sizeof(lbl), "%.1fk", freq / 1000.0f);
+        else
+            snprintf(lbl, sizeof(lbl), "%.0f", freq);
+        ImVec2 ts = ImGui::CalcTextSize(lbl);
+        float tx = lx - ts.x * 0.5f;
+        if (tx < pos.x) tx = pos.x;
+        if (tx + ts.x > pos.x + width) tx = pos.x + width - ts.x;
+        dl->AddText(ImVec2(tx, label_y), IM_COL32(140, 140, 140, 200), lbl);
+        // Tick mark
+        dl->AddLine(ImVec2(lx, pos.y + height - 3), ImVec2(lx, pos.y + height),
+                     IM_COL32(100, 100, 100, 200));
     }
-    return "?";
+
+    // dB axis label
+    dl->AddText(ImVec2(pos.x + 2, pos.y + 1), IM_COL32(100, 100, 100, 180), "0 dB");
+    dl->AddText(ImVec2(pos.x + 2, pos.y + height - 14), IM_COL32(100, 100, 100, 180), "-80");
+
+    ImGui::Dummy(ImVec2(width, height + 16));  // Extra space for labels
 }
 
 // ============================================================
@@ -366,6 +389,7 @@ bool IrisGui::init(const std::string& title, int width, int height) {
     style.WindowRounding = 2.0f;
     style.FrameRounding = 2.0f;
     style.GrabRounding = 2.0f;
+    style.TabRounding = 2.0f;
     style.WindowPadding = ImVec2(6, 6);
     style.ItemSpacing = ImVec2(6, 4);
     style.FramePadding = ImVec2(4, 2);
@@ -394,7 +418,7 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
 
     // === Main Menu Bar ===
     if (ImGui::BeginMainMenuBar()) {
-        if (ImGui::BeginMenu("Settings")) {
+        if (ImGui::BeginMenu("File")) {
             if (ImGui::MenuItem("Setup...")) show_config_ = true;
             ImGui::Separator();
             if (ImGui::MenuItem("Quit")) {
@@ -402,10 +426,15 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
             }
             ImGui::EndMenu();
         }
+        if (ImGui::BeginMenu("View")) {
+            if (ImGui::MenuItem("Event Log...", nullptr, show_log_))
+                show_log_ = !show_log_;
+            ImGui::EndMenu();
+        }
         ImGui::EndMainMenuBar();
     }
 
-    // === Full-window main panel (Mercury style) ===
+    // === Full-window main panel ===
     float menu_h = ImGui::GetFrameHeight();
     ImGui::SetNextWindowPos(ImVec2(0, menu_h));
     ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x, io.DisplaySize.y - menu_h));
@@ -456,7 +485,7 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
     ImGui::Columns(1);
     ImGui::EndChild();
 
-    // ========== Signal Quality Row: Constellation + Indicators + Status + Controls ==========
+    // ========== Signal Quality Row ==========
     ImGui::BeginChild("SignalQuality", ImVec2(0, 150), true, ImGuiWindowFlags_NoScrollbar);
     {
         ImVec2 avail = ImGui::GetContentRegionAvail();
@@ -533,18 +562,21 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
 
         ImGui::SameLine();
 
-        // Speed level ladder
+        // Speed level indicators (read-only, not clickable)
         ImGui::BeginGroup();
         {
-            ImGui::Text("Speed Levels:");
+            ImGui::Text("Speed Level:");
             for (int i = 0; i < NUM_SPEED_LEVELS; i++) {
                 bool active = (i == diag.speed_level);
-                if (active)
-                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.7f, 0.2f, 1.0f));
-                else
-                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.15f, 0.18f, 1.0f));
+                ImVec4 col = active ? ImVec4(0.2f, 0.7f, 0.2f, 1.0f)
+                                    : ImVec4(0.22f, 0.22f, 0.25f, 1.0f);
+                ImVec4 text_col = active ? ImVec4(1, 1, 1, 1) : ImVec4(0.5f, 0.5f, 0.5f, 1);
+                ImGui::PushStyleColor(ImGuiCol_Button, col);
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, col);  // No hover effect
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, col);   // No click effect
+                ImGui::PushStyleColor(ImGuiCol_Text, text_col);
                 ImGui::SmallButton(SPEED_LEVELS[i].name);
-                ImGui::PopStyleColor();
+                ImGui::PopStyleColor(4);
                 if (i < NUM_SPEED_LEVELS - 1) ImGui::SameLine();
             }
         }
@@ -597,192 +629,403 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
 
         ImGui::NextColumn();
 
-        ImGui::Text("AX.25: %d baud  |  %s",
-                     config.ax25_baud, config.ax25_only ? "AX.25 Only" : "Native OK");
+        int baud = config.mode == "B" ? 9600 : 1200;
+        ImGui::Text("AX.25: %d baud  |  %s", baud,
+                     config.ax25_only ? "AX.25 Only" : "Native OK");
 
         ImGui::Columns(1);
     }
     ImGui::EndChild();
 
-    // ========== Spectrum / Waterfall ==========
+    // ========== Spectrum ==========
     if (!diag.spectrum.empty()) {
         float spec_h = 80.0f;
-        ImGui::BeginChild("Spectrum", ImVec2(0, spec_h + 8), true,
+        ImGui::BeginChild("Spectrum", ImVec2(0, spec_h + 26), true,
                            ImGuiWindowFlags_NoScrollbar);
-        DrawSpectrum(diag.spectrum, ImGui::GetContentRegionAvail().x, spec_h);
+        DrawSpectrum(diag.spectrum, ImGui::GetContentRegionAvail().x, spec_h,
+                     config.band_low_hz, config.band_high_hz);
         ImGui::EndChild();
     }
 
-    // ========== Log Panel (fills remaining space) ==========
-    {
-        float log_h = ImGui::GetContentRegionAvail().y;
-        if (log_h < 60) log_h = 60;
-        ImGui::BeginChild("Log", ImVec2(0, log_h), true);
-        for (const auto& line : log_lines_)
-            ImGui::TextUnformatted(line.c_str());
-        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
-            ImGui::SetScrollHereY(1.0f);
+    // ========== Passband Probe Visualization ==========
+    if (diag.probe_has_results) {
+        ImGui::BeginChild("ProbeVis", ImVec2(0, 110), true, ImGuiWindowFlags_NoScrollbar);
+        {
+            ImVec2 avail = ImGui::GetContentRegionAvail();
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            float w = avail.x;
+            float row_h = 14.0f;  // Height per tone row
+            float bar_h = row_h - 2.0f;
+            float label_w = 70.0f;
+            float tone_w = (w - label_w - 10.0f) / PassbandProbeConfig::N_TONES;
+            if (tone_w < 2.0f) tone_w = 2.0f;
+
+            // Title + negotiated band info
+            if (diag.probe_negotiated.valid) {
+                ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f),
+                    "Passband: %.0f - %.0f Hz (%.0f Hz usable)",
+                    diag.probe_negotiated.low_hz, diag.probe_negotiated.high_hz,
+                    diag.probe_negotiated.bandwidth_hz);
+            } else {
+                ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.2f, 1.0f), "Passband: probing...");
+            }
+
+            // Row 1: Our TX → Their RX (what they heard from us)
+            ImVec2 r1 = ImGui::GetCursorScreenPos();
+            dl->AddText(ImVec2(r1.x, r1.y + 1), IM_COL32(180, 180, 180, 255), "TX\xe2\x86\x92RX");
+            for (int k = 0; k < PassbandProbeConfig::N_TONES; k++) {
+                float x0 = r1.x + label_w + k * tone_w;
+                float y0 = r1.y;
+                ImU32 col;
+                if (diag.probe_my_tx.tone_detected[k])
+                    col = IM_COL32(0, 200, 100, 220);  // Green = detected
+                else
+                    col = IM_COL32(60, 20, 20, 180);   // Dark red = missing
+                dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + tone_w - 1, y0 + bar_h), col);
+            }
+            ImGui::Dummy(ImVec2(w, row_h));
+
+            // Row 2: Their TX → Our RX (what we heard from them)
+            ImVec2 r2 = ImGui::GetCursorScreenPos();
+            dl->AddText(ImVec2(r2.x, r2.y + 1), IM_COL32(180, 180, 180, 255), "RX\xe2\x86\x90TX");
+            for (int k = 0; k < PassbandProbeConfig::N_TONES; k++) {
+                float x0 = r2.x + label_w + k * tone_w;
+                float y0 = r2.y;
+                ImU32 col;
+                if (diag.probe_their_tx.tone_detected[k])
+                    col = IM_COL32(100, 150, 255, 220);  // Blue = detected
+                else
+                    col = IM_COL32(20, 20, 60, 180);     // Dark blue = missing
+                dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + tone_w - 1, y0 + bar_h), col);
+            }
+            ImGui::Dummy(ImVec2(w, row_h));
+
+            // Row 3: Negotiated overlap (intersection)
+            ImVec2 r3 = ImGui::GetCursorScreenPos();
+            dl->AddText(ImVec2(r3.x, r3.y + 1), IM_COL32(180, 180, 180, 255), "Usable");
+            for (int k = 0; k < PassbandProbeConfig::N_TONES; k++) {
+                float x0 = r3.x + label_w + k * tone_w;
+                float y0 = r3.y;
+                bool both = diag.probe_my_tx.tone_detected[k] &&
+                            diag.probe_their_tx.tone_detected[k];
+                ImU32 col;
+                if (both) {
+                    // Check if within negotiated band (with margin applied)
+                    float freq = PassbandProbeConfig::TONE_LOW_HZ +
+                                 k * PassbandProbeConfig::TONE_SPACING_HZ;
+                    if (diag.probe_negotiated.valid &&
+                        freq >= diag.probe_negotiated.low_hz &&
+                        freq <= diag.probe_negotiated.high_hz)
+                        col = IM_COL32(255, 220, 50, 240);  // Gold = in-band
+                    else
+                        col = IM_COL32(120, 100, 30, 180);  // Dim gold = overlap but outside margin
+                } else {
+                    col = IM_COL32(30, 30, 30, 150);  // Dark = no overlap
+                }
+                dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + tone_w - 1, y0 + bar_h), col);
+            }
+            ImGui::Dummy(ImVec2(w, row_h));
+
+            // Frequency labels under the tone bars
+            ImVec2 r4 = ImGui::GetCursorScreenPos();
+            int label_every = PassbandProbeConfig::N_TONES / 8;  // ~8 labels
+            if (label_every < 1) label_every = 1;
+            for (int k = 0; k < PassbandProbeConfig::N_TONES; k += label_every) {
+                float freq = PassbandProbeConfig::TONE_LOW_HZ +
+                             k * PassbandProbeConfig::TONE_SPACING_HZ;
+                float x0 = r4.x + label_w + k * tone_w;
+                char lbl[16];
+                if (freq >= 1000.0f)
+                    snprintf(lbl, sizeof(lbl), "%.1fk", freq / 1000.0f);
+                else
+                    snprintf(lbl, sizeof(lbl), "%.0f", freq);
+                ImVec2 ts = ImGui::CalcTextSize(lbl);
+                dl->AddText(ImVec2(x0 - ts.x * 0.3f, r4.y),
+                            IM_COL32(120, 120, 120, 200), lbl);
+            }
+            ImGui::Dummy(ImVec2(w, 14));
+        }
         ImGui::EndChild();
     }
 
     ImGui::End(); // ##Main
 
-    // ========== Settings Window (popup) ==========
+    // ========== Event Log Window (separate, toggled from View menu) ==========
+    if (show_log_) {
+        ImGui::SetNextWindowSize(ImVec2(500, 300), ImGuiCond_FirstUseEver);
+        ImGui::Begin("Event Log", &show_log_);
+        for (const auto& line : log_lines_)
+            ImGui::TextUnformatted(line.c_str());
+        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
+            ImGui::SetScrollHereY(1.0f);
+        ImGui::End();
+    }
+
+    // ========== Settings Window (tabs, not collapsible) ==========
     if (show_config_) {
-        ImGui::SetNextWindowSize(ImVec2(420, 520), ImGuiCond_FirstUseEver);
-        ImGui::Begin("Setup", &show_config_);
+        ImGui::SetNextWindowSize(ImVec2(440, 480), ImGuiCond_FirstUseEver);
+        ImGui::Begin("Setup", &show_config_, ImGuiWindowFlags_NoCollapse);
 
-        if (ImGui::CollapsingHeader("Station", ImGuiTreeNodeFlags_DefaultOpen)) {
-            char cs_buf[16];
-            strncpy(cs_buf, config.callsign.c_str(), sizeof(cs_buf) - 1);
-            cs_buf[sizeof(cs_buf) - 1] = '\0';
-            if (ImGui::InputText("Callsign", cs_buf, sizeof(cs_buf)))
-                config.callsign = cs_buf;
+        if (ImGui::BeginTabBar("SettingsTabs")) {
 
-            const char* modes[] = {"A (Standard FM)", "B (9600 baud FM)"};
-            int mi = config.mode == "B" ? 1 : 0;
-            if (ImGui::Combo("Channel Mode", &mi, modes, 2))
-                config.mode = mi == 0 ? "A" : "B";
+            // --- Station Tab ---
+            if (ImGui::BeginTabItem("Station")) {
+                ImGui::Spacing();
+                char cs_buf[16];
+                strncpy(cs_buf, config.callsign.c_str(), sizeof(cs_buf) - 1);
+                cs_buf[sizeof(cs_buf) - 1] = '\0';
+                if (ImGui::InputText("Callsign", cs_buf, sizeof(cs_buf)))
+                    config.callsign = cs_buf;
 
-            const char* bauds[] = {"1200", "9600"};
-            int bi = config.ax25_baud == 9600 ? 1 : 0;
-            if (ImGui::Combo("AX.25 Baud", &bi, bauds, 2))
-                config.ax25_baud = bi ? 9600 : 1200;
-
-            ImGui::Checkbox("AX.25 Only (no native upgrade)", &config.ax25_only);
-        }
-
-        if (ImGui::CollapsingHeader("Modem")) {
-            const char* mod_names[] = {"BPSK", "QPSK", "QAM16", "QAM64", "QAM256"};
-            int mod_idx = (int)config.max_modulation;
-            if (mod_idx < 0) mod_idx = 0;
-            if (mod_idx > 4) mod_idx = 4;
-            if (ImGui::Combo("Max Modulation", &mod_idx, mod_names, 5))
-                config.max_modulation = (Modulation)mod_idx;
-
-            ImGui::SliderFloat("TX Level", &config.tx_level, 0.0f, 1.0f, "%.2f");
-            ImGui::SliderFloat("RX Gain", &config.rx_gain, 0.1f, 10.0f, "%.1f");
-
-            ImGui::Separator();
-            ImGui::Text("Band Plan (Hz)");
-            ImGui::SliderFloat("Low Edge", &config.band_low_hz, 200.0f, 1000.0f, "%.0f Hz");
-            ImGui::SliderFloat("High Edge", &config.band_high_hz, 2000.0f, 5000.0f, "%.0f Hz");
-            ImGui::SliderFloat("Center Freq", &config.center_freq_hz, 0.0f, 4000.0f, "%.0f Hz");
-            if (config.center_freq_hz < 1.0f)
-                ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
-                    "Center: auto (%.0f Hz)", (config.band_low_hz + config.band_high_hz) / 2.0f);
-            float bw = (config.band_high_hz - config.band_low_hz);
-            ImGui::TextColored(ImVec4(0.5f, 0.7f, 1.0f, 1.0f),
-                "Band: %.0f Hz wide (%.0f - %.0f)", bw, config.band_low_hz, config.band_high_hz);
-            if (config.band_low_hz < 255.0f)
-                ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
-                    "Warning: Low edge below CTCSS max (254 Hz)!");
-        }
-
-        if (ImGui::CollapsingHeader("Audio Devices")) {
-            if (!audio_devices.empty()) {
-                std::vector<std::string> cap_names, play_names;
-                for (const auto& d : audio_devices) {
-                    if (d.max_input_channels > 0) cap_names.push_back(d.name);
-                    if (d.max_output_channels > 0) play_names.push_back(d.name);
+                const char* modes[] = {"A - 1200 baud (Standard FM)", "B - 9600 baud (9600 FM)"};
+                int mi = config.mode == "B" ? 1 : 0;
+                if (ImGui::Combo("Channel Mode", &mi, modes, 2)) {
+                    config.mode = mi == 0 ? "A" : "B";
+                    config.ax25_baud = mi == 0 ? 1200 : 9600;
                 }
-                if (!cap_names.empty()) {
-                    if (selected_capture_ >= (int)cap_names.size()) selected_capture_ = 0;
-                    if (ImGui::BeginCombo("Capture", cap_names[selected_capture_].c_str())) {
-                        for (int i = 0; i < (int)cap_names.size(); i++)
-                            if (ImGui::Selectable(cap_names[i].c_str(), i == selected_capture_))
-                                selected_capture_ = i;
-                        ImGui::EndCombo();
+
+                ImGui::Checkbox("AX.25 Only (no native upgrade)", &config.ax25_only);
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                const char* mod_names[] = {"BPSK", "QPSK", "QAM16", "QAM64", "QAM256"};
+                int mod_idx = (int)config.max_modulation;
+                if (mod_idx < 0) mod_idx = 0;
+                if (mod_idx > 4) mod_idx = 4;
+                if (ImGui::Combo("Max Modulation", &mod_idx, mod_names, 5))
+                    config.max_modulation = (Modulation)mod_idx;
+
+                ImGui::SliderFloat("TX Level", &config.tx_level, 0.0f, 1.0f, "%.2f");
+                ImGui::SliderFloat("RX Gain", &config.rx_gain, 0.1f, 10.0f, "%.1f");
+
+                ImGui::EndTabItem();
+            }
+
+            // --- Audio Tab ---
+            if (ImGui::BeginTabItem("Audio")) {
+                ImGui::Spacing();
+                if (!audio_devices.empty()) {
+                    std::vector<std::string> cap_names, play_names;
+                    for (const auto& d : audio_devices) {
+                        if (d.max_input_channels > 0) cap_names.push_back(d.name);
+                        if (d.max_output_channels > 0) play_names.push_back(d.name);
+                    }
+                    if (!cap_names.empty()) {
+                        if (selected_capture_ >= (int)cap_names.size()) selected_capture_ = 0;
+                        if (ImGui::BeginCombo("Capture Device", cap_names[selected_capture_].c_str())) {
+                            for (int i = 0; i < (int)cap_names.size(); i++)
+                                if (ImGui::Selectable(cap_names[i].c_str(), i == selected_capture_))
+                                    selected_capture_ = i;
+                            ImGui::EndCombo();
+                        }
+                    }
+                    if (!play_names.empty()) {
+                        if (selected_playback_ >= (int)play_names.size()) selected_playback_ = 0;
+                        if (ImGui::BeginCombo("Playback Device", play_names[selected_playback_].c_str())) {
+                            for (int i = 0; i < (int)play_names.size(); i++)
+                                if (ImGui::Selectable(play_names[i].c_str(), i == selected_playback_))
+                                    selected_playback_ = i;
+                            ImGui::EndCombo();
+                        }
+                    }
+                    ImGui::Spacing();
+                    ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+                        "Changing audio devices requires a modem restart.");
+                } else {
+                    ImGui::TextColored(ImVec4(1, 1, 0, 1), "No audio devices found");
+                }
+                ImGui::EndTabItem();
+            }
+
+            // --- Radio / PTT Tab ---
+            if (ImGui::BeginTabItem("Radio")) {
+                ImGui::Spacing();
+                const char* ptt_methods[] = {"None", "Rig Control (rigctld)", "VOX", "CM108 GPIO", "Serial Port"};
+                int pi = 0;
+                if (config.ptt_method == "rigctl") pi = 1;
+                else if (config.ptt_method == "vox") pi = 2;
+                else if (config.ptt_method == "cm108") pi = 3;
+                else if (config.ptt_method == "serial") pi = 4;
+                if (ImGui::Combo("PTT Method", &pi, ptt_methods, 5)) {
+                    const char* method_ids[] = {"none", "rigctl", "vox", "cm108", "serial"};
+                    config.ptt_method = method_ids[pi];
+                }
+
+                ImGui::Spacing();
+
+                if (pi == 1) {
+                    // Rig Control
+                    char hb[64];
+                    strncpy(hb, config.rigctl_host.c_str(), sizeof(hb) - 1);
+                    hb[sizeof(hb) - 1] = '\0';
+                    if (ImGui::InputText("rigctld Host", hb, sizeof(hb)))
+                        config.rigctl_host = hb;
+                    ImGui::InputInt("rigctld Port", &config.rigctl_port);
+                    ImGui::TextWrapped("Connect to Hamlib rigctld for PTT and frequency control.");
+                }
+
+                if (pi == 3) {
+                    // CM108 GPIO
+                    const char* gpio_pins[] = {"GPIO 1", "GPIO 2", "GPIO 3", "GPIO 4",
+                                               "GPIO 5", "GPIO 6", "GPIO 7", "GPIO 8"};
+                    int gpi = config.cm108_gpio - 1;
+                    if (gpi < 0) gpi = 2;  // Default GPIO 3
+                    if (gpi > 7) gpi = 7;
+                    if (ImGui::Combo("GPIO Pin", &gpi, gpio_pins, 8))
+                        config.cm108_gpio = gpi + 1;
+                    ImGui::TextWrapped("CM108/CM119 USB audio GPIO PTT (Digirig, Masters, etc.).");
+                }
+
+                if (pi == 4) {
+                    // Serial port
+                    char sp[64];
+                    strncpy(sp, config.serial_port.c_str(), sizeof(sp) - 1);
+                    sp[sizeof(sp) - 1] = '\0';
+
+                    // Auto-detect serial ports on Windows
+#ifdef _WIN32
+                    std::vector<std::string> com_ports;
+                    for (int c = 1; c <= 32; c++) {
+                        char pname[16];
+                        snprintf(pname, sizeof(pname), "COM%d", c);
+                        HANDLE h = CreateFileA(pname, GENERIC_READ | GENERIC_WRITE, 0,
+                                               nullptr, OPEN_EXISTING, 0, nullptr);
+                        if (h != INVALID_HANDLE_VALUE) {
+                            com_ports.push_back(pname);
+                            CloseHandle(h);
+                        }
+                    }
+                    if (!com_ports.empty()) {
+                        int sel = 0;
+                        for (int i = 0; i < (int)com_ports.size(); i++)
+                            if (com_ports[i] == config.serial_port) sel = i;
+                        if (ImGui::BeginCombo("Serial Port", com_ports.empty() ? "(none)" :
+                                              com_ports[sel].c_str())) {
+                            for (int i = 0; i < (int)com_ports.size(); i++)
+                                if (ImGui::Selectable(com_ports[i].c_str(), i == sel)) {
+                                    config.serial_port = com_ports[i];
+                                }
+                            ImGui::EndCombo();
+                        }
+                    } else {
+                        if (ImGui::InputText("Serial Port", sp, sizeof(sp)))
+                            config.serial_port = sp;
+                        ImGui::TextColored(ImVec4(1, 1, 0, 1), "No COM ports detected");
+                    }
+#else
+                    if (ImGui::InputText("Serial Port", sp, sizeof(sp)))
+                        config.serial_port = sp;
+                    ImGui::TextWrapped("e.g. /dev/ttyUSB0, /dev/ttyAMA0");
+#endif
+
+                    const char* ptt_lines[] = {"RTS", "DTR"};
+                    if (ImGui::Combo("PTT Line", &config.serial_ptt_line, ptt_lines, 2)) {}
+
+                    const char* ser_bauds[] = {"9600", "19200", "38400", "57600", "115200"};
+                    int sb = 0;
+                    if (config.serial_baud == 19200) sb = 1;
+                    else if (config.serial_baud == 38400) sb = 2;
+                    else if (config.serial_baud == 57600) sb = 3;
+                    else if (config.serial_baud == 115200) sb = 4;
+                    if (ImGui::Combo("Serial Baud", &sb, ser_bauds, 5)) {
+                        const int baud_vals[] = {9600, 19200, 38400, 57600, 115200};
+                        config.serial_baud = baud_vals[sb];
                     }
                 }
-                if (!play_names.empty()) {
-                    if (selected_playback_ >= (int)play_names.size()) selected_playback_ = 0;
-                    if (ImGui::BeginCombo("Playback", play_names[selected_playback_].c_str())) {
-                        for (int i = 0; i < (int)play_names.size(); i++)
-                            if (ImGui::Selectable(play_names[i].c_str(), i == selected_playback_))
-                                selected_playback_ = i;
-                        ImGui::EndCombo();
-                    }
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+                ImGui::Text("AX.25 Timing");
+                ImGui::SliderInt("TXDelay (ms)", &config.ptt_pre_delay_ms, 0, 1000);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Delay after keying PTT before sending data");
+                ImGui::SliderInt("TXTail (ms)", &config.ptt_post_delay_ms, 0, 500);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Extra TX time after data before releasing PTT");
+                ImGui::SliderInt("SlotTime (ms)", &config.slottime_ms, 10, 500);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("CSMA channel access slot time");
+                ImGui::SliderInt("Persist", &config.persist, 0, 255);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("p-persistence 0-255 (63 = 25%% chance per slot)");
+
+                ImGui::EndTabItem();
+            }
+
+            // --- Network Tab ---
+            if (ImGui::BeginTabItem("Network")) {
+                ImGui::Spacing();
+                ImGui::InputInt("KISS Port", &config.kiss_port);
+                ImGui::InputInt("AGW Port", &config.agw_port);
+                ImGui::Spacing();
+                ImGui::TextWrapped("KISS: Used by Winlink Express, APRS clients.");
+                ImGui::TextWrapped("AGW: Used by Pat and AGW-compatible software.");
+                ImGui::EndTabItem();
+            }
+
+            // --- Security Tab ---
+            if (ImGui::BeginTabItem("Security")) {
+                ImGui::Spacing();
+                const char* enc_modes[] = {"Off", "Strict", "Fast"};
+                if (ImGui::Combo("Encryption", &config.encryption_mode, enc_modes, 3)) {}
+                if (config.encryption_mode > 0) {
+                    char psk_buf[130];
+                    strncpy(psk_buf, config.psk_hex.c_str(), sizeof(psk_buf) - 1);
+                    psk_buf[sizeof(psk_buf) - 1] = '\0';
+                    if (ImGui::InputText("PSK (hex)", psk_buf, sizeof(psk_buf),
+                                          ImGuiInputTextFlags_Password))
+                        config.psk_hex = psk_buf;
+                    ImGui::TextWrapped("Pre-shared key in hex. Both sides must match.");
                 }
-            } else {
-                ImGui::TextColored(ImVec4(1, 1, 0, 1), "No audio devices found");
-            }
-        }
-
-        if (ImGui::CollapsingHeader("Radio / PTT")) {
-            const char* ptt_methods[] = {"none", "rigctl", "vox", "cm108", "serial"};
-            int pi = 0;
-            if (config.ptt_method == "rigctl") pi = 1;
-            else if (config.ptt_method == "vox") pi = 2;
-            else if (config.ptt_method == "cm108") pi = 3;
-            else if (config.ptt_method == "serial") pi = 4;
-            if (ImGui::Combo("PTT Method", &pi, ptt_methods, 5))
-                config.ptt_method = ptt_methods[pi];
-
-            if (pi == 1) {
-                char hb[64];
-                strncpy(hb, config.rigctl_host.c_str(), sizeof(hb) - 1);
-                hb[sizeof(hb) - 1] = '\0';
-                if (ImGui::InputText("rigctl Host", hb, sizeof(hb)))
-                    config.rigctl_host = hb;
-                ImGui::InputInt("rigctl Port", &config.rigctl_port);
-            }
-            if (pi == 4) {
-                char sp[64];
-                strncpy(sp, config.serial_port.c_str(), sizeof(sp) - 1);
-                sp[sizeof(sp) - 1] = '\0';
-                if (ImGui::InputText("Serial Port", sp, sizeof(sp)))
-                    config.serial_port = sp;
-                const char* ser_bauds[] = {"9600", "19200", "38400", "57600", "115200"};
-                int sb = 0;
-                if (config.serial_baud == 19200) sb = 1;
-                else if (config.serial_baud == 38400) sb = 2;
-                else if (config.serial_baud == 57600) sb = 3;
-                else if (config.serial_baud == 115200) sb = 4;
-                if (ImGui::Combo("Serial Baud", &sb, ser_bauds, 5)) {
-                    const int baud_vals[] = {9600, 19200, 38400, 57600, 115200};
-                    config.serial_baud = baud_vals[sb];
-                }
+                ImGui::EndTabItem();
             }
 
-            ImGui::Separator();
-            ImGui::Text("Timing (Direwolf-compatible)");
-            ImGui::SliderInt("TXDelay (ms)", &config.ptt_pre_delay_ms, 0, 1000);
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Delay after keying before data (default 300ms)");
-            ImGui::SliderInt("TXTail (ms)", &config.ptt_post_delay_ms, 0, 500);
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Extra TX time after data (default 100ms)");
-            ImGui::SliderInt("SlotTime (ms)", &config.slottime_ms, 10, 500);
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("CSMA slot time (default 100ms)");
-            ImGui::SliderInt("Persist", &config.persist, 0, 255);
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("p-persistence 0-255 (63=25%%, default 63)");
-        }
+            // --- Advanced Tab ---
+            if (ImGui::BeginTabItem("Advanced")) {
+                ImGui::Spacing();
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+                    "These are development settings. Changing them may cause "
+                    "incompatibility with other modems. All stations in a "
+                    "session must use identical settings.");
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
 
-        if (ImGui::CollapsingHeader("Network")) {
-            ImGui::InputInt("KISS Port", &config.kiss_port);
-            ImGui::InputInt("AGW Port", &config.agw_port);
-        }
+                ImGui::Text("Frequency Configuration");
+                ImGui::SliderFloat("Low Edge (Hz)", &config.band_low_hz, 200.0f, 1000.0f, "%.0f Hz");
+                ImGui::SliderFloat("High Edge (Hz)", &config.band_high_hz, 2000.0f, 5000.0f, "%.0f Hz");
 
-        if (ImGui::CollapsingHeader("Security")) {
-            const char* enc_modes[] = {"Off", "Strict", "Fast"};
-            if (ImGui::Combo("Encryption", &config.encryption_mode, enc_modes, 3)) {}
-            if (config.encryption_mode > 0) {
-                char psk_buf[130];
-                strncpy(psk_buf, config.psk_hex.c_str(), sizeof(psk_buf) - 1);
-                psk_buf[sizeof(psk_buf) - 1] = '\0';
-                if (ImGui::InputText("PSK (hex)", psk_buf, sizeof(psk_buf),
-                                      ImGuiInputTextFlags_Password))
-                    config.psk_hex = psk_buf;
-                ImGui::TextWrapped("Pre-shared key in hex. Both sides must match.");
+                // Center frequency: show "Auto" when at 0
+                char center_label[32];
+                if (config.center_freq_hz < 1.0f)
+                    snprintf(center_label, sizeof(center_label), "Auto (%.0f Hz)",
+                             (config.band_low_hz + config.band_high_hz) / 2.0f);
+                else
+                    snprintf(center_label, sizeof(center_label), "%.0f Hz", config.center_freq_hz);
+                ImGui::SliderFloat("Center Freq", &config.center_freq_hz, 0.0f, 4000.0f, center_label);
+
+                float bw = (config.band_high_hz - config.band_low_hz);
+                ImGui::TextColored(ImVec4(0.5f, 0.7f, 1.0f, 1.0f),
+                    "Bandwidth: %.0f Hz (%.0f - %.0f)", bw, config.band_low_hz, config.band_high_hz);
+                if (config.band_low_hz < 255.0f)
+                    ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
+                        "Warning: Low edge below CTCSS max (254 Hz)!");
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                ImGui::Text("Logging");
+                ImGui::Checkbox("Enable log file output", &config.log_enabled);
+                ImGui::TextWrapped("Logs to AppData/Iris/logs/ (Win) or ~/.config/iris/logs/ (Linux).");
+
+                ImGui::EndTabItem();
             }
-        }
 
-        if (ImGui::CollapsingHeader("Logging")) {
-            ImGui::Checkbox("Enable log file output", &config.log_enabled);
-            ImGui::TextWrapped("Logs to AppData/Iris/logs/ (Win) or ~/.config/iris/logs/ (Linux).");
+            ImGui::EndTabBar();
         }
 
         ImGui::Spacing();
