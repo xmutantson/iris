@@ -9,6 +9,8 @@
 #include <functiondiscoverykeys_devpkey.h>
 #include <thread>
 #include <atomic>
+#include <mutex>
+#include <condition_variable>
 #include <cmath>
 #include <cstring>
 
@@ -23,6 +25,8 @@ struct ComInit {
 };
 
 // WASAPI Capture implementation
+// Audio capture and decode are on SEPARATE threads to prevent decode latency
+// from causing WASAPI buffer overflows and sample drops.
 class WasapiCapture : public AudioCapture {
 public:
     WasapiCapture() = default;
@@ -40,13 +44,16 @@ public:
     bool start() override {
         if (running_) return false;
         running_ = true;
-        thread_ = std::thread(&WasapiCapture::capture_thread, this);
+        capture_thread_ = std::thread(&WasapiCapture::capture_thread, this);
+        delivery_thread_ = std::thread(&WasapiCapture::delivery_thread, this);
         return true;
     }
 
     bool stop() override {
         running_ = false;
-        if (thread_.joinable()) thread_.join();
+        fifo_cv_.notify_all();
+        if (capture_thread_.joinable()) capture_thread_.join();
+        if (delivery_thread_.joinable()) delivery_thread_.join();
         return true;
     }
 
@@ -64,6 +71,48 @@ public:
     }
 
 private:
+    // Push audio into FIFO (called from capture thread, must be fast)
+    void fifo_push(const float* data, size_t count, int channels) {
+        std::lock_guard<std::mutex> lock(fifo_mutex_);
+        // Limit FIFO to ~10 seconds of audio to prevent unbounded growth
+        size_t max_fifo = (size_t)sample_rate_ * channels * 10;
+        if (fifo_.size() + count > max_fifo) {
+            printf("[Audio] Capture: FIFO overflow, dropping %zu samples\n", count);
+            return;
+        }
+        fifo_.insert(fifo_.end(), data, data + count);
+        fifo_channels_ = channels;
+        fifo_cv_.notify_one();
+    }
+
+    // Delivery thread: pulls from FIFO, calls callback (may block for decode)
+    void delivery_thread() {
+        std::vector<float> chunk;
+        while (running_) {
+            {
+                std::unique_lock<std::mutex> lock(fifo_mutex_);
+                fifo_cv_.wait(lock, [this] { return !fifo_.empty() || !running_; });
+                if (!running_ && fifo_.empty()) break;
+                chunk.swap(fifo_);
+                fifo_.clear();
+            }
+            if (chunk.empty()) continue;
+
+            int channels = fifo_channels_;
+            int frame_count = (int)chunk.size() / std::max(channels, 1);
+
+            // Apply volume
+            if (volume_ != 1.0f) {
+                for (auto& s : chunk) s *= volume_;
+            }
+
+            if (callback_)
+                callback_(chunk.data(), frame_count, channels);
+
+            chunk.clear();
+        }
+    }
+
     void capture_thread() {
         ComInit com;
 
@@ -117,6 +166,12 @@ private:
         }
         CoTaskMemFree(mix_fmt);
 
+        UINT32 actual_buffer_frames = 0;
+        client->GetBufferSize(&actual_buffer_frames);
+        printf("[Audio] Capture: requested %d frames (%dms), got %u frames (%ums)\n",
+               buffer_frames_, buffer_frames_ * 1000 / actual_rate,
+               actual_buffer_frames, actual_buffer_frames * 1000 / actual_rate);
+
         hr = client->GetService(__uuidof(IAudioCaptureClient), (void**)&capture);
         if (FAILED(hr)) {
             printf("[Audio] Capture: GetService failed 0x%08lx\n", hr);
@@ -139,16 +194,11 @@ private:
 
                 hr = capture->GetBuffer(&data, &frames_available, &flags, nullptr, nullptr);
                 if (SUCCEEDED(hr) && frames_available > 0) {
-                    float* fdata = (float*)data;
+                    if ((flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) && discont_count_++ < 3)
+                        printf("[Audio] Capture: DATA_DISCONTINUITY (%u frames)\n", frames_available);
 
-                    // Apply volume
-                    if (volume_ != 1.0f) {
-                        std::vector<float> buf(fdata, fdata + frames_available * actual_channels);
-                        for (auto& s : buf) s *= volume_;
-                        if (callback_) callback_(buf.data(), frames_available, actual_channels);
-                    } else {
-                        if (callback_) callback_(fdata, frames_available, actual_channels);
-                    }
+                    float* fdata = (float*)data;
+                    fifo_push(fdata, frames_available * actual_channels, actual_channels);
 
                     capture->ReleaseBuffer(frames_available);
                 }
@@ -168,13 +218,24 @@ private:
     int sample_rate_ = 48000;
     int channels_ = 1;
     int buffer_frames_ = 1024;
+    int discont_count_ = 0;
     std::atomic<bool> running_{false};
     std::atomic<float> volume_{1.0f};
     AudioCallback callback_;
-    std::thread thread_;
+    std::thread capture_thread_;
+    std::thread delivery_thread_;
+
+    // FIFO between capture and delivery threads
+    std::mutex fifo_mutex_;
+    std::condition_variable fifo_cv_;
+    std::vector<float> fifo_;
+    int fifo_channels_ = 1;
 };
 
 // WASAPI Playback implementation
+// Two-thread architecture: producer thread runs process_tx into a FIFO,
+// render thread copies from FIFO into WASAPI buffer. This prevents
+// crackling caused by process_tx latency starving the render buffer.
 class WasapiPlayback : public AudioPlayback {
 public:
     WasapiPlayback() = default;
@@ -192,13 +253,17 @@ public:
     bool start() override {
         if (running_) return false;
         running_ = true;
-        thread_ = std::thread(&WasapiPlayback::playback_thread, this);
+        render_thread_ = std::thread(&WasapiPlayback::render_thread_func, this);
+        producer_thread_ = std::thread(&WasapiPlayback::producer_thread_func, this);
         return true;
     }
 
     bool stop() override {
         running_ = false;
-        if (thread_.joinable()) thread_.join();
+        fifo_cv_.notify_all();
+        producer_cv_.notify_all();
+        if (producer_thread_.joinable()) producer_thread_.join();
+        if (render_thread_.joinable()) render_thread_.join();
         return true;
     }
 
@@ -216,7 +281,56 @@ public:
     }
 
 private:
-    void playback_thread() {
+    // Producer thread: generates TX samples via callback into FIFO
+    void producer_thread_func() {
+        // Produce in fixed chunks to keep latency predictable
+        const int chunk_frames = 512;
+        int channels = 0;
+
+        // Wait until render thread sets actual_channels_
+        while (running_ && actual_channels_.load() == 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        channels = actual_channels_.load();
+        if (!channels) return;
+
+        std::vector<float> buf(chunk_frames * channels, 0.0f);
+
+        while (running_) {
+            // Wait if FIFO is already well-stocked (>100ms worth)
+            {
+                std::unique_lock<std::mutex> lock(fifo_mutex_);
+                size_t high_water = (size_t)actual_rate_.load() * channels * 100 / 1000;
+                if (fifo_.size() >= high_water) {
+                    producer_cv_.wait_for(lock, std::chrono::milliseconds(5),
+                        [&] { return fifo_.size() < high_water || !running_; });
+                    if (!running_) break;
+                }
+            }
+
+            // Generate samples
+            std::fill(buf.begin(), buf.end(), 0.0f);
+            if (callback_) {
+                callback_(buf.data(), chunk_frames, channels);
+            }
+
+            // Apply volume
+            if (volume_ != 1.0f) {
+                float v = volume_.load();
+                for (auto& s : buf) s *= v;
+            }
+
+            // Push to FIFO
+            {
+                std::lock_guard<std::mutex> lock(fifo_mutex_);
+                fifo_.insert(fifo_.end(), buf.begin(), buf.end());
+            }
+            fifo_cv_.notify_one();
+        }
+    }
+
+    // Render thread: drains FIFO into WASAPI buffer
+    void render_thread_func() {
         ComInit com;
 
         IMMDeviceEnumerator* enumerator = nullptr;
@@ -245,7 +359,6 @@ private:
                               (void**)&client);
         if (FAILED(hr)) { printf("[Audio] Playback: Activate failed 0x%08lx\n", hr); device->Release(); enumerator->Release(); running_ = false; return; }
 
-        // Use device's mix format (WASAPI shared mode requires it)
         WAVEFORMATEX* mix_fmt = nullptr;
         hr = client->GetMixFormat(&mix_fmt);
         if (FAILED(hr) || !mix_fmt) {
@@ -254,13 +367,13 @@ private:
             running_ = false; return;
         }
 
-        int actual_channels = mix_fmt->nChannels;
-        int actual_rate = mix_fmt->nSamplesPerSec;
+        int channels = mix_fmt->nChannels;
+        int rate = mix_fmt->nSamplesPerSec;
         printf("[Audio] Playback dev %d: %d ch, %d Hz, %d bit\n",
-               device_id_, actual_channels, actual_rate, mix_fmt->wBitsPerSample);
+               device_id_, channels, rate, mix_fmt->wBitsPerSample);
 
-        UINT32 buffer_size = 0;
-        REFERENCE_TIME duration = (REFERENCE_TIME)(10000000.0 * buffer_frames_ / actual_rate);
+        // Request 50ms buffer for comfortable margin
+        REFERENCE_TIME duration = 500000;  // 50ms in 100ns units
         hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, duration, 0, mix_fmt, nullptr);
         if (FAILED(hr)) {
             printf("[Audio] Playback: Initialize failed 0x%08lx\n", hr);
@@ -270,7 +383,10 @@ private:
         }
         CoTaskMemFree(mix_fmt);
 
+        UINT32 buffer_size = 0;
         client->GetBufferSize(&buffer_size);
+        printf("[Audio] Playback: buffer %u frames (%.1f ms)\n",
+               buffer_size, 1000.0 * buffer_size / rate);
 
         hr = client->GetService(__uuidof(IAudioRenderClient), (void**)&render);
         if (FAILED(hr)) {
@@ -279,35 +395,51 @@ private:
             running_ = false; return;
         }
 
+        // Signal producer thread with actual device parameters
+        actual_channels_.store(channels);
+        actual_rate_.store(rate);
+
         client->Start();
+        int underrun_count = 0;
 
         while (running_) {
-            Sleep(5);
+            Sleep(2);  // ~2ms polling — finer than 5ms, still low CPU
 
             UINT32 padding = 0;
             client->GetCurrentPadding(&padding);
             UINT32 available = buffer_size - padding;
 
-            if (available > 0) {
-                BYTE* data = nullptr;
-                hr = render->GetBuffer(available, &data);
-                if (SUCCEEDED(hr)) {
-                    float* fdata = (float*)data;
+            if (available == 0) continue;
 
-                    if (callback_) {
-                        callback_(fdata, available, actual_channels);
-                        // Apply volume
-                        if (volume_ != 1.0f) {
-                            for (UINT32 i = 0; i < available * (UINT32)actual_channels; i++)
-                                fdata[i] *= volume_;
-                        }
-                    } else {
-                        std::memset(data, 0, available * actual_channels * sizeof(float));
-                    }
+            BYTE* data = nullptr;
+            hr = render->GetBuffer(available, &data);
+            if (FAILED(hr)) continue;
 
-                    render->ReleaseBuffer(available, 0);
+            float* fdata = (float*)data;
+            size_t samples_needed = (size_t)available * channels;
+
+            // Drain from FIFO
+            size_t copied = 0;
+            {
+                std::lock_guard<std::mutex> lock(fifo_mutex_);
+                copied = std::min(fifo_.size(), samples_needed);
+                if (copied > 0) {
+                    std::memcpy(fdata, fifo_.data(), copied * sizeof(float));
+                    fifo_.erase(fifo_.begin(), fifo_.begin() + copied);
                 }
             }
+            producer_cv_.notify_one();
+
+            // Zero-fill any remainder (underrun)
+            if (copied < samples_needed) {
+                std::memset(fdata + copied, 0, (samples_needed - copied) * sizeof(float));
+                if (copied > 0 && underrun_count++ < 3) {
+                    printf("[Audio] Playback: underrun, had %zu/%zu samples\n",
+                           copied, samples_needed);
+                }
+            }
+
+            render->ReleaseBuffer(available, 0);
         }
 
         client->Stop();
@@ -323,8 +455,15 @@ private:
     int buffer_frames_ = 1024;
     std::atomic<bool> running_{false};
     std::atomic<float> volume_{1.0f};
+    std::atomic<int> actual_channels_{0};
+    std::atomic<int> actual_rate_{48000};
     AudioCallback callback_;
-    std::thread thread_;
+    std::thread render_thread_;
+    std::thread producer_thread_;
+    std::mutex fifo_mutex_;
+    std::condition_variable fifo_cv_;
+    std::condition_variable producer_cv_;
+    std::vector<float> fifo_;
 };
 
 // Device enumeration
