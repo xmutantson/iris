@@ -312,13 +312,17 @@ void Modem::process_rx_ax25(const float* audio, int count) {
                 XidCapability remote_cap;
                 if (!is_self && xid_decode(&frame[16], frame.size() - 16, remote_cap)) {
                     is_xid = true;
+                    if (config_.ax25_only) {
+                        // ax25-only mode: ignore XID entirely, stay in AX.25
+                        IRIS_LOG("XID received but ax25_only=1, ignoring");
+                    } else {
                     auto agreed = negotiate(local_cap_, remote_cap);
                     if (agreed.capabilities != 0) {
                         int mod_level = std::min((int)agreed.max_modulation,
                                                 (int)config_.max_modulation);
                         phy_config_.modulation = (Modulation)mod_level;
 
-                        if (!xid_sent_ && !config_.ax25_only) {
+                        if (!xid_sent_) {
                             // We're the responder. Delay XID reply by ~500ms
                             // so we stay in AX.25 RX mode and can decode any
                             // trailing data frames from the initiator before
@@ -347,6 +351,7 @@ void Modem::process_rx_ax25(const float* audio, int count) {
                             IRIS_LOG("XID handshake complete (initiator), native mode active, flushed deferred");
                         }
                     }
+                    } // else (not ax25_only)
                 }
             }
 
@@ -827,6 +832,8 @@ void Modem::tick() {
                 deferred_tx_queue_.pop();
                 count++;
             }
+            // Clear xid_sent_ so subsequent data isn't deferred
+            xid_sent_ = false;
             if (count > 0)
                 IRIS_LOG("XID fallback: flushed %d deferred frames as AX.25", count);
         }

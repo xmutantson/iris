@@ -242,6 +242,12 @@ void ArqSession::send_data(const uint8_t* data, size_t len) {
     if ((state_ == ArqState::CONNECTED || state_ == ArqState::TURBOSHIFT) &&
         role_ == ArqRole::COMMANDER)
         send_next_data();
+    else if (state_ == ArqState::CONNECTED && role_ == ArqRole::RESPONDER) {
+        // Responder needs to become commander to send data — request role switch
+        printf("[ARQ] Responder has data to send, requesting role switch\n");
+        fflush(stdout);
+        initiate_role_switch();
+    }
 }
 
 int ArqSession::tx_queue_bytes() const {
@@ -696,17 +702,35 @@ void ArqSession::handle_switch_role(const ArqFrame& frame) {
         set_state(ArqState::CONNECTED);
     } else if (role_ == ArqRole::RESPONDER) {
         role_ = ArqRole::COMMANDER;
-        turbo_phase_ = TurboPhase::REVERSE;
-        turbo_retries_ = 0;
-        turbo_last_good_ = speed_level_;
-        turbo_verification_count_ = 0;
+        // Reset TX window for new commander direction
+        tx_base_ = 0;
+        tx_next_ = 0;
+        end_of_data_ = false;
+        for (int i = 0; i < ARQ_WINDOW_SIZE; i++)
+            tx_window_[i] = TxSlot{};
 
-        int suggested = snr_to_speed_level(remote_snr_);
-        turbo_target_speed_ = std::max(suggested, speed_level_ + 1);
-        turbo_target_speed_ = std::min(turbo_target_speed_, NUM_SPEED_LEVELS - 1);
+        if (!tx_data_queue_.empty()) {
+            // Data waiting — skip turboshift, send immediately
+            printf("[ARQ] Role switch complete, sending queued data (%d chunks)\n",
+                   (int)tx_data_queue_.size());
+            fflush(stdout);
+            turbo_phase_ = TurboPhase::DONE;
+            set_state(ArqState::CONNECTED);
+            send_next_data();
+        } else {
+            // No data — turboshift probe (original turboshift path)
+            turbo_phase_ = TurboPhase::REVERSE;
+            turbo_retries_ = 0;
+            turbo_last_good_ = speed_level_;
+            turbo_verification_count_ = 0;
 
-        set_state(ArqState::TURBOSHIFT);
-        turbo_probe_up();
+            int suggested = snr_to_speed_level(remote_snr_);
+            turbo_target_speed_ = std::max(suggested, speed_level_ + 1);
+            turbo_target_speed_ = std::min(turbo_target_speed_, NUM_SPEED_LEVELS - 1);
+
+            set_state(ArqState::TURBOSHIFT);
+            turbo_probe_up();
+        }
     }
 
     // ACK the role switch
