@@ -10,6 +10,7 @@
 #include "native/xid.h"
 #include "native/upconvert.h"
 #include "arq/arq.h"
+#include "ax25/ax25_session.h"
 #include "compress/compress.h"
 #include "crypto/crypto.h"
 #include "b2f/b2f_handler.h"
@@ -18,6 +19,8 @@
 #include "ax25/gfsk.h"
 #include "kiss/kiss_server.h"
 #include "radio/rigctl.h"
+#include "probe/passband_probe.h"
+#include "probe/probe_controller.h"
 #include <vector>
 #include <mutex>
 #include <queue>
@@ -67,6 +70,13 @@ struct ModemDiag {
     ArqRole arq_role;
     std::vector<std::complex<float>> constellation;  // Last received symbols
     std::vector<float> spectrum;   // Power spectrum for waterfall
+
+    // Passband probe results
+    ProbeState probe_state = ProbeState::IDLE;
+    ProbeResult probe_my_tx;       // What they heard from us (A→B)
+    ProbeResult probe_their_tx;    // What we heard from them (B→A)
+    NegotiatedPassband probe_negotiated;
+    bool probe_has_results = false;
 };
 
 class Modem {
@@ -92,11 +102,19 @@ public:
     void start_calibration();
     bool is_calibrating() const { return state_ == ModemState::CALIBRATING; }
 
-    // ARQ session control
+    // ARQ session control (native Iris protocol)
     void arq_connect(const std::string& remote_callsign);
     void arq_disconnect();
     void arq_listen();
     ArqState arq_state() const { return arq_.state(); }
+
+    // AX.25 connected mode (standard protocol, interop with any TNC)
+    void ax25_connect(const std::string& remote_callsign);
+    void ax25_disconnect();
+    void send_connected_data(const uint8_t* data, size_t len);
+    Ax25SessionState ax25_state() const { return ax25_session_.state(); }
+    int ax25_pending_frames() const { return ax25_session_.pending_frames(); }
+    const std::string& ax25_remote_callsign() const { return ax25_session_.remote_callsign(); }
 
     // Periodic tick for ARQ timeouts (call from main loop ~100ms)
     void tick();
@@ -117,6 +135,11 @@ public:
     // Callback when ARQ state changes (for AGW notifications)
     void set_state_callback(std::function<void(ArqState, const std::string&)> cb) {
         state_callback_ = cb;
+    }
+
+    // Callback when AX.25 session state changes
+    void set_ax25_state_callback(std::function<void(Ax25SessionState, const std::string&)> cb) {
+        ax25_state_callback_ = cb;
     }
 
     // ARQ accessors for AGW flow control
@@ -162,8 +185,11 @@ private:
     AGC agc_;
     float snr_db_ = 0;
 
-    // ARQ session
+    // ARQ session (native Iris protocol)
     ArqSession arq_;
+
+    // AX.25 connected mode session (standard protocol)
+    Ax25Session ax25_session_;
 
     // Compression (used when ARQ peers negotiate CAP_COMPRESSION)
     Compressor tx_compressor_;
@@ -178,6 +204,10 @@ private:
     // B2F unroll/reroll (used when ARQ peers negotiate CAP_B2F_UNROLL)
     B2fHandler b2f_handler_;
 
+    // Passband probe controller
+    ProbeController probe_;
+    int probe_fallback_ticks_ = 0;  // Fallback if peer has no probe support
+
     // PTT
     std::unique_ptr<PttController> ptt_;
     bool ptt_active_ = false;
@@ -190,6 +220,7 @@ private:
     std::mutex tx_mutex_;
     std::queue<std::vector<uint8_t>> tx_queue_;
     std::queue<std::vector<uint8_t>> ax25_tx_queue_;  // forced AX.25 (XID replies)
+    std::vector<float> probe_audio_pending_;          // probe tones waiting to TX
     std::vector<float> tx_buffer_;
     size_t tx_pos_ = 0;
 
@@ -237,6 +268,9 @@ private:
 
     // Callback for ARQ state changes (state, remote_callsign)
     std::function<void(ArqState, const std::string&)> state_callback_;
+
+    // Callback for AX.25 session state changes
+    std::function<void(Ax25SessionState, const std::string&)> ax25_state_callback_;
 };
 
 } // namespace iris

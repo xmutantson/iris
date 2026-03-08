@@ -1,4 +1,5 @@
 #include "engine/modem.h"
+#include "ax25/ax25_protocol.h"
 #include "native/frame.h"
 #include "fec/ldpc.h"
 #include "common/logging.h"
@@ -73,6 +74,19 @@ bool Modem::init(const IrisConfig& config) {
         }
     }
     gearshift_.set_max_level(max_level);
+
+    // Wire probe controller
+    probe_.on_send_audio = [this](const float* audio, int count) {
+        // Queue probe audio — appended to tx_buffer_ in process_tx
+        // after any pending AFSK messages (RESULT before tones, same PTT cycle)
+        std::lock_guard<std::mutex> lock(tx_mutex_);
+        probe_audio_pending_.insert(probe_audio_pending_.end(), audio, audio + count);
+    };
+    probe_.on_send_msg = [this](const uint8_t* data, size_t len) {
+        // Send probe messages via forced AX.25 queue (bypasses XID deferral)
+        std::lock_guard<std::mutex> lock(tx_mutex_);
+        ax25_tx_queue_.push(std::vector<uint8_t>(data, data + len));
+    };
 
     // Wire ARQ session
     arq_.set_callsign(config_.callsign);
@@ -175,6 +189,23 @@ bool Modem::init(const IrisConfig& config) {
     };
     arq_.set_callbacks(arq_cb);
 
+    // Wire AX.25 connected mode session
+    ax25_session_.set_local_callsign(config_.callsign);
+    ax25_session_.set_send_callback([this](const uint8_t* data, size_t len) {
+        // AX.25 session frames go directly to TX queue (already complete AX.25 frames)
+        std::lock_guard<std::mutex> lock(tx_mutex_);
+        tx_queue_.push(std::vector<uint8_t>(data, data + len));
+    });
+    ax25_session_.set_data_callback([this](const uint8_t* data, size_t len) {
+        // Received I-frame data — deliver to KISS/AGW
+        if (rx_callback_) rx_callback_(data, len);
+    });
+    ax25_session_.set_state_callback([this](Ax25SessionState state, const std::string& remote) {
+        IRIS_LOG("AX25 state -> %d (remote=%s)", (int)state, remote.c_str());
+        if (ax25_state_callback_)
+            ax25_state_callback_(state, remote);
+    });
+
     state_ = ModemState::IDLE;
     return true;
 }
@@ -272,6 +303,11 @@ void Modem::process_rx(const float* rx_audio, int frame_count) {
 void Modem::process_rx_ax25(const float* audio, int count) {
     state_ = ModemState::RX_AX25;
 
+    // Feed raw audio to probe controller if it's listening
+    if (probe_.state() == ProbeState::LISTENING_PROBE) {
+        probe_.feed_rx(audio, count);
+    }
+
     std::vector<uint8_t> rx_nrzi;
     if (config_.ax25_baud == 9600)
         rx_nrzi = gfsk_demod_.demodulate(audio, count);
@@ -297,6 +333,21 @@ void Modem::process_rx_ax25(const float* audio, int count) {
                 }
             }
 
+            // Try AX.25 connected mode session (only when native ARQ not active)
+            {
+                bool native_active = (arq_.state() != ArqState::IDLE &&
+                                      arq_.state() != ArqState::LISTENING);
+                if (!native_active || ax25_session_.is_active()) {
+                    Ax25Frame ax_frame;
+                    if (ax25_parse(frame.data(), frame.size(), ax_frame)) {
+                        if (ax25_session_.on_frame_received(ax_frame)) {
+                            hdlc_decoder_.reset();
+                            continue;  // AX.25 session consumed it
+                        }
+                    }
+                }
+            }
+
             bool is_xid = false;
             if (frame.size() >= 24 && frame[15] == IRIS_PID) {
                 // Extract source callsign from AX.25 header (bytes 7-12, shifted)
@@ -310,6 +361,7 @@ void Modem::process_rx_ax25(const float* audio, int count) {
                 // Ignore our own XID (self-hearing on shared channel)
                 bool is_self = (src_call == config_.callsign);
                 XidCapability remote_cap;
+                IRIS_LOG("XID frame from '%s' (self=%d, xid_sent=%d)", src_call.c_str(), is_self ? 1 : 0, xid_sent_ ? 1 : 0);
                 if (!is_self && xid_decode(&frame[16], frame.size() - 16, remote_cap)) {
                     is_xid = true;
                     if (config_.ax25_only) {
@@ -336,27 +388,32 @@ void Modem::process_rx_ax25(const float* audio, int count) {
                             IRIS_LOG("XID received (responder): reply delayed 500ms, holdoff=%d", native_tx_holdoff_);
                         } else {
                             // We're the initiator — we already sent XID, remote
-                            // is replying. Both sides are Iris-aware, switch now.
-                            native_mode_ = true;
-                            native_tx_ready_ = true;
-                            // Flush deferred data to TX queue (now goes native)
-                            {
-                                std::lock_guard<std::mutex> lock(tx_mutex_);
-                                while (!deferred_tx_queue_.empty()) {
-                                    tx_queue_.push(std::move(deferred_tx_queue_.front()));
-                                    deferred_tx_queue_.pop();
-                                }
-                            }
+                            // is replying. Both sides are Iris-aware.
                             xid_fallback_ticks_ = 0;
-                            IRIS_LOG("XID handshake complete (initiator), native mode active, flushed deferred");
+
+                            // Start passband probe before switching to native mode.
+                            // Probe runs over AX.25 audio, discovers usable bandwidth,
+                            // then tick() activates native mode when probe completes.
+                            probe_.start_initiator(config_.sample_rate);
+                            IRIS_LOG("XID handshake complete (initiator), starting passband probe");
                         }
                     }
                     } // else (not ax25_only)
                 }
             }
 
-            // Don't forward XID or self-originated frames to KISS clients
-            if (!is_xid && rx_callback_ && frame.size() >= 14) {
+            // Check for probe protocol messages (RESULT is the only message type)
+            bool is_probe = false;
+            if (!is_xid && frame.size() >= 2) {
+                uint8_t first = frame[0];
+                if (first == PROBE_MSG_RESULT) {
+                    probe_.on_message(frame.data(), frame.size());
+                    is_probe = true;
+                }
+            }
+
+            // Don't forward XID, probe, or self-originated frames to KISS clients
+            if (!is_xid && !is_probe && rx_callback_ && frame.size() >= 14) {
                 // Check source callsign to filter self-hearing
                 std::string rx_src;
                 for (int ci = 7; ci < 13; ci++) {
@@ -677,6 +734,18 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
             have_frame = true;
         }
 
+        // Append any pending probe audio to tx_buffer_ (same PTT cycle).
+        // This ensures RESULT AFSK goes out before probe tones in Turn 2.
+        if (!probe_audio_pending_.empty()) {
+            for (auto& s : probe_audio_pending_) s *= config_.tx_level;
+            tx_buffer_.insert(tx_buffer_.end(),
+                              probe_audio_pending_.begin(),
+                              probe_audio_pending_.end());
+            probe_audio_pending_.clear();
+            if (!have_frame) have_frame = true;
+            IRIS_LOG("TX probe audio appended (%zu total samples)", tx_buffer_.size());
+        }
+
         if (have_frame) {
             IRIS_LOG("TX buffer %zu samples", tx_buffer_.size());
 
@@ -779,6 +848,26 @@ void Modem::queue_tx_frame(const uint8_t* frame, size_t len) {
     tx_queue_.push(std::vector<uint8_t>(frame, frame + len));
 }
 
+void Modem::ax25_connect(const std::string& remote_callsign) {
+    IRIS_LOG("AX25 connect to %s", remote_callsign.c_str());
+    ax25_session_.connect(remote_callsign);
+}
+
+void Modem::ax25_disconnect() {
+    IRIS_LOG("AX25 disconnect");
+    ax25_session_.disconnect();
+}
+
+void Modem::send_connected_data(const uint8_t* data, size_t len) {
+    // Route to AX.25 session if active, otherwise fall back to native ARQ path
+    if (ax25_session_.state() == Ax25SessionState::CONNECTED ||
+        ax25_session_.state() == Ax25SessionState::TIMER_RECOVERY) {
+        ax25_session_.send_data(data, len);
+    } else {
+        queue_tx_frame(data, len);
+    }
+}
+
 void Modem::arq_connect(const std::string& remote_callsign) {
     IRIS_LOG("ARQ connect to %s", remote_callsign.c_str());
     // Start in AX.25 — upgrade to native after XID negotiation
@@ -800,16 +889,60 @@ void Modem::arq_listen() {
 
 void Modem::tick() {
     arq_.tick();
+    ax25_session_.tick();
+    probe_.tick();
 
     // Count down native mode holdoff (set after queuing XID reply)
     // During holdoff, stay in AX.25 mode to decode any remaining AX.25 frames.
-    // When holdoff expires, switch both RX and TX to native.
+    // When holdoff expires, start passband probe (responder side).
     if (native_tx_holdoff_ > 0) {
         native_tx_holdoff_--;
         if (native_tx_holdoff_ == 0) {
+            // Don't go native yet — run passband probe first.
+            // In the 3-turn protocol the initiator sends tones immediately
+            // after XID completes. We (responder) start listening now.
+            probe_.start_responder(config_.sample_rate);
+            IRIS_LOG("Native holdoff expired, starting passband probe (responder)");
+            // Fallback: if probe doesn't complete within 10s,
+            // go native anyway (peer may be an older version without probe).
+            probe_fallback_ticks_ = 100;  // 10s at 100ms/tick
+        }
+    }
+
+    // Probe completion: activate native mode with negotiated band parameters
+    if (probe_.is_done() && !native_mode_) {
+        native_mode_ = true;
+        native_tx_ready_ = true;
+        // Apply negotiated passband if valid
+        if (probe_.has_results() && probe_.negotiated().valid) {
+            float low = probe_.negotiated().low_hz;
+            float high = probe_.negotiated().high_hz;
+            config_.band_low_hz = low;
+            config_.band_high_hz = high;
+            float center = (low + high) / 2.0f;
+            if (use_upconvert_) {
+                upconverter_ = Upconverter(center, config_.sample_rate);
+                downconverter_ = Downconverter(center, config_.sample_rate);
+            }
+            IRIS_LOG("Probe complete: band %.0f-%.0f Hz, center %.0f Hz", low, high, center);
+        }
+        // Flush deferred data (now goes via native PHY)
+        {
+            std::lock_guard<std::mutex> lock(tx_mutex_);
+            while (!deferred_tx_queue_.empty()) {
+                tx_queue_.push(std::move(deferred_tx_queue_.front()));
+                deferred_tx_queue_.pop();
+            }
+        }
+        IRIS_LOG("Native mode active (post-probe)");
+    }
+
+    // Probe fallback: if probe didn't complete (old peer or stuck), go native anyway
+    if (probe_fallback_ticks_ > 0) {
+        probe_fallback_ticks_--;
+        if (probe_fallback_ticks_ == 0 && !native_mode_ && !probe_.is_done()) {
             native_mode_ = true;
             native_tx_ready_ = true;
-            // Flush deferred data (now goes via native PHY)
             {
                 std::lock_guard<std::mutex> lock(tx_mutex_);
                 while (!deferred_tx_queue_.empty()) {
@@ -817,7 +950,7 @@ void Modem::tick() {
                     deferred_tx_queue_.pop();
                 }
             }
-            IRIS_LOG("Native holdoff expired, native mode active (RX+TX)");
+            IRIS_LOG("Probe fallback: no probe received, native mode active");
         }
     }
 
@@ -863,6 +996,15 @@ ModemDiag Modem::get_diagnostics() const {
         std::lock_guard<std::mutex> lock(diag_mutex_);
         diag.constellation = last_constellation_;
         diag.spectrum = last_spectrum_;
+    }
+
+    // Probe results
+    diag.probe_state = probe_.state();
+    diag.probe_has_results = probe_.has_results();
+    if (diag.probe_has_results) {
+        diag.probe_my_tx = probe_.my_tx_result();
+        diag.probe_their_tx = probe_.their_tx_result();
+        diag.probe_negotiated = probe_.negotiated();
     }
 
     return diag;
