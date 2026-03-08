@@ -1,0 +1,880 @@
+#include "ax25/ax25_session.h"
+#include "common/logging.h"
+#include <algorithm>
+#include <cstdio>
+
+namespace iris {
+
+Ax25Session::Ax25Session() = default;
+
+// ---------------------------------------------------------------------------
+// State management
+// ---------------------------------------------------------------------------
+
+void Ax25Session::set_state(Ax25SessionState s) {
+    if (s == state_) return;
+    state_ = s;
+    static const char* names[] = {
+        "DISCONNECTED", "AWAITING_CONNECTION", "CONNECTED",
+        "TIMER_RECOVERY", "AWAITING_RELEASE"
+    };
+    IRIS_LOG("AX25 state -> %s (remote=%s)", names[(int)s], remote_call_.c_str());
+    if (state_changed_) state_changed_(s, remote_call_);
+}
+
+void Ax25Session::reset_session() {
+    vs_ = vr_ = va_ = 0;
+    t1_ = t2_ = t3_ = 0;
+    retry_count_ = 0;
+    peer_busy_ = false;
+    own_busy_ = false;
+    reject_exception_ = false;
+    acknowledge_pending_ = false;
+    last_received_ctrl_ = 0;
+    while (!tx_queue_.empty()) tx_queue_.pop();
+    for (int i = 0; i < 8; i++) tx_window_[i] = TxIFrame{};
+}
+
+void Ax25Session::reset() {
+    reset_session();
+    remote_call_.clear();
+    set_state(Ax25SessionState::DISCONNECTED);
+}
+
+void Ax25Session::clear_exception_conditions() {
+    peer_busy_ = false;
+    reject_exception_ = false;
+    acknowledge_pending_ = false;
+}
+
+void Ax25Session::establish_data_link() {
+    clear_exception_conditions();
+    retry_count_ = 0;
+    send_sabm();
+    t1_ = T1_TICKS;
+    t3_ = 0;  // Stop T3
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+void Ax25Session::connect(const std::string& remote_call) {
+    reset_session();
+    remote_call_ = remote_call;
+    local_addr_ = ax25_make_addr(local_call_);
+    remote_addr_ = ax25_make_addr(remote_call_);
+    establish_data_link();
+    set_state(Ax25SessionState::AWAITING_CONNECTION);
+}
+
+void Ax25Session::send_data(const uint8_t* data, size_t len) {
+    if (state_ != Ax25SessionState::CONNECTED &&
+        state_ != Ax25SessionState::TIMER_RECOVERY)
+        return;
+
+    // Fragment into MAX_INFO chunks
+    size_t offset = 0;
+    while (offset < len) {
+        size_t chunk = std::min((size_t)MAX_INFO, len - offset);
+        tx_queue_.push(std::vector<uint8_t>(data + offset, data + offset + chunk));
+        offset += chunk;
+    }
+
+    send_next_iframe();
+}
+
+void Ax25Session::disconnect() {
+    if (state_ == Ax25SessionState::DISCONNECTED) return;
+
+    // Discard pending I-frames
+    while (!tx_queue_.empty()) tx_queue_.pop();
+    for (int i = 0; i < 8; i++) tx_window_[i] = TxIFrame{};
+
+    retry_count_ = 0;
+    send_disc();
+    t1_ = T1_TICKS;
+    t3_ = 0;
+    set_state(Ax25SessionState::AWAITING_RELEASE);
+}
+
+int Ax25Session::pending_frames() const {
+    int count = (int)tx_queue_.size();
+    for (int i = 0; i < 8; i++) {
+        if (!tx_window_[i].info.empty()) count++;
+    }
+    return count;
+}
+
+// ---------------------------------------------------------------------------
+// N(R) validation (AX.25 2.2 Section 4.3.3.3)
+// V(A) <= N(R) <= V(S) (modulo 8)
+// ---------------------------------------------------------------------------
+
+bool Ax25Session::nr_valid(uint8_t nr) const {
+    // N(R) is valid if V(A) <= N(R) <= V(S) in modulo-8 arithmetic
+    nr &= 0x07;
+    for (uint8_t i = va_; ; i = (i + 1) & 0x07) {
+        if (i == nr) return true;
+        if (i == vs_) return false;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Frame building and sending
+// ---------------------------------------------------------------------------
+
+void Ax25Session::send_sabm() {
+    auto frame = ax25_build_u(remote_addr_, local_addr_, AX25_CTRL_SABM, true, true);
+    IRIS_LOG("AX25 TX SABM to %s (P=1)", remote_call_.c_str());
+    if (send_frame_) send_frame_(frame.data(), frame.size());
+}
+
+void Ax25Session::send_ua(bool pf) {
+    auto frame = ax25_build_u(remote_addr_, local_addr_, AX25_CTRL_UA, pf, false);
+    IRIS_LOG("AX25 TX UA to %s (F=%d)", remote_call_.c_str(), pf ? 1 : 0);
+    if (send_frame_) send_frame_(frame.data(), frame.size());
+}
+
+void Ax25Session::send_disc() {
+    auto frame = ax25_build_u(remote_addr_, local_addr_, AX25_CTRL_DISC, true, true);
+    IRIS_LOG("AX25 TX DISC to %s (P=1)", remote_call_.c_str());
+    if (send_frame_) send_frame_(frame.data(), frame.size());
+}
+
+void Ax25Session::send_dm(bool pf) {
+    auto frame = ax25_build_u(remote_addr_, local_addr_, AX25_CTRL_DM, pf, false);
+    IRIS_LOG("AX25 TX DM to %s (F=%d)",
+             remote_call_.empty() ? "?" : remote_call_.c_str(), pf ? 1 : 0);
+    if (send_frame_) send_frame_(frame.data(), frame.size());
+}
+
+void Ax25Session::send_rr(bool pf, bool command) {
+    auto frame = ax25_build_s(remote_addr_, local_addr_, Ax25SType::RR, vr_, pf, command);
+    IRIS_LOG("AX25 TX RR N(R)=%d %s=%d %s", vr_,
+             command ? "P" : "F", pf ? 1 : 0,
+             command ? "cmd" : "rsp");
+    if (send_frame_) send_frame_(frame.data(), frame.size());
+}
+
+void Ax25Session::send_rnr(bool pf, bool command) {
+    auto frame = ax25_build_s(remote_addr_, local_addr_, Ax25SType::RNR, vr_, pf, command);
+    IRIS_LOG("AX25 TX RNR N(R)=%d %s=%d %s", vr_,
+             command ? "P" : "F", pf ? 1 : 0,
+             command ? "cmd" : "rsp");
+    if (send_frame_) send_frame_(frame.data(), frame.size());
+}
+
+void Ax25Session::send_rej(bool pf, bool command) {
+    auto frame = ax25_build_s(remote_addr_, local_addr_, Ax25SType::REJ, vr_, pf, command);
+    IRIS_LOG("AX25 TX REJ N(R)=%d %s=%d %s", vr_,
+             command ? "P" : "F", pf ? 1 : 0,
+             command ? "cmd" : "rsp");
+    if (send_frame_) send_frame_(frame.data(), frame.size());
+}
+
+void Ax25Session::send_frmr(uint8_t rejected_ctrl, uint8_t vs, uint8_t vr, bool cr,
+                              bool w_bit, bool x_bit, bool y_bit, bool z_bit) {
+    auto frame = ax25_build_frmr(remote_addr_, local_addr_,
+                                  rejected_ctrl, vs, vr, cr, w_bit, x_bit, y_bit, z_bit);
+    IRIS_LOG("AX25 TX FRMR ctrl=0x%02X W=%d X=%d Y=%d Z=%d",
+             rejected_ctrl, w_bit, x_bit, y_bit, z_bit);
+    if (send_frame_) send_frame_(frame.data(), frame.size());
+}
+
+void Ax25Session::send_next_iframe() {
+    if (peer_busy_) return;
+    if (state_ != Ax25SessionState::CONNECTED &&
+        state_ != Ax25SessionState::TIMER_RECOVERY)
+        return;
+
+    // Fill window from queue
+    while (!tx_queue_.empty()) {
+        int window_used = (vs_ - va_ + 8) % 8;
+        if (window_used >= K) break;
+
+        int slot = vs_ % 8;
+        tx_window_[slot].info = std::move(tx_queue_.front());
+        tx_queue_.pop();
+        tx_window_[slot].sent = false;
+        vs_ = (vs_ + 1) % 8;
+    }
+
+    // Send unsent frames in window
+    for (uint8_t seq = va_; seq != vs_; seq = (seq + 1) % 8) {
+        int slot = seq % 8;
+        if (!tx_window_[slot].sent && !tx_window_[slot].info.empty()) {
+            auto frame = ax25_build_i(remote_addr_, local_addr_,
+                                       seq, vr_, false, AX25_PID_NONE,
+                                       tx_window_[slot].info.data(),
+                                       tx_window_[slot].info.size());
+            IRIS_LOG("AX25 TX I N(S)=%d N(R)=%d (%zu bytes) [V(A)=%d V(S)=%d]",
+                     seq, vr_, tx_window_[slot].info.size(), va_, vs_);
+            if (send_frame_) send_frame_(frame.data(), frame.size());
+            tx_window_[slot].sent = true;
+            acknowledge_pending_ = false;  // Piggyback ack on I-frame
+            if (t1_ == 0)
+                t1_ = T1_TICKS;  // Start T1 if not running
+            t3_ = 0;  // Stop T3 while transmitting
+        }
+    }
+}
+
+void Ax25Session::ack_frames(uint8_t nr) {
+    // Acknowledge all frames with seq < nr (mod 8)
+    while (va_ != nr) {
+        int slot = va_ % 8;
+        if (!tx_window_[slot].info.empty()) {
+            IRIS_LOG("AX25 ACK frame N(S)=%d", va_);
+        }
+        tx_window_[slot] = TxIFrame{};
+        va_ = (va_ + 1) % 8;
+    }
+
+    if (va_ == vs_) {
+        t1_ = 0;           // All acknowledged — stop T1
+        t3_ = T3_TICKS;    // Start idle supervision
+    } else {
+        t1_ = T1_TICKS;    // Restart T1 for remaining frames
+    }
+    retry_count_ = 0;
+}
+
+void Ax25Session::retransmit_from(uint8_t nr) {
+    // Mark frames from nr to vs_ as unsent for retransmission
+    for (uint8_t seq = nr; seq != vs_; seq = (seq + 1) % 8)
+        tx_window_[seq % 8].sent = false;
+    send_next_iframe();
+}
+
+bool Ax25Session::in_window(uint8_t ns) const {
+    for (int i = 0; i < K; i++) {
+        if (((vr_ + i) % 8) == ns) return true;
+    }
+    return false;
+}
+
+void Ax25Session::invoke_retransmission() {
+    // Retransmit all unacknowledged I-frames (from V(A))
+    retransmit_from(va_);
+}
+
+void Ax25Session::nr_error_recovery() {
+    // N(R) error — send FRMR with Z bit (invalid N(R))
+    IRIS_LOG("AX25 N(R) error — invalid N(R) received");
+    send_frmr(last_received_ctrl_, vs_, vr_, false,
+              false, false, false, true);
+    // Per AX.25 2.2: establish data link
+    establish_data_link();
+    set_state(Ax25SessionState::AWAITING_CONNECTION);
+}
+
+void Ax25Session::enquiry_response(bool pf) {
+    // Respond to a P=1 poll (Section 6.2)
+    if (own_busy_) {
+        send_rnr(pf, false);  // Response
+    } else {
+        send_rr(pf, false);  // Response
+    }
+    acknowledge_pending_ = false;
+}
+
+void Ax25Session::check_iframe_queued() {
+    // If I-frames pending, try to send
+    if (!tx_queue_.empty() || va_ != vs_)
+        send_next_iframe();
+}
+
+void Ax25Session::check_need_for_response(bool pf) {
+    // If P/F=1 (poll), must respond
+    if (pf) {
+        enquiry_response(true);
+    } else if (acknowledge_pending_) {
+        // T2 will handle delayed ack
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Frame receiving — AX.25 2.2 state machine
+// ---------------------------------------------------------------------------
+
+bool Ax25Session::on_frame_received(const Ax25Frame& frame) {
+    // Check if addressed to us
+    if (!frame.dst.matches(local_call_))
+        return false;
+
+    last_received_ctrl_ = frame.control;
+
+    Ax25FrameType ft = frame.type();
+
+    // -----------------------------------------------------------------------
+    // STATE 1: DISCONNECTED
+    // -----------------------------------------------------------------------
+    if (state_ == Ax25SessionState::DISCONNECTED) {
+        if (ft == Ax25FrameType::U_FRAME) {
+            Ax25UType ut = frame.u_type();
+
+            if (ut == Ax25UType::SABM) {
+                // Incoming connection request
+                IRIS_LOG("AX25 RX SABM from %s (P=%d) [DISCONNECTED -> accept]",
+                         frame.src.to_string().c_str(), frame.poll_final() ? 1 : 0);
+                reset_session();
+                remote_call_ = frame.src.to_string();
+                local_addr_ = ax25_make_addr(local_call_);
+                remote_addr_ = frame.src;
+                send_ua(frame.poll_final());
+                t3_ = T3_TICKS;
+                set_state(Ax25SessionState::CONNECTED);
+                return true;
+            }
+
+            if (ut == Ax25UType::UI) {
+                // UI frames pass through regardless of state
+                return false;
+            }
+
+            if (ut == Ax25UType::DISC) {
+                // DISC while disconnected — respond DM (F=P)
+                IRIS_LOG("AX25 RX DISC from %s while DISCONNECTED",
+                         frame.src.to_string().c_str());
+                remote_addr_ = frame.src;
+                send_dm(frame.poll_final());
+                return true;
+            }
+
+            // Any other command frame while disconnected: respond with DM
+            IRIS_LOG("AX25 RX unexpected U-frame (0x%02X) from %s while DISCONNECTED",
+                     frame.control, frame.src.to_string().c_str());
+            remote_addr_ = frame.src;
+            send_dm(frame.poll_final());
+            return true;
+        }
+
+        // I or S frame while disconnected — send DM
+        if (ft == Ax25FrameType::I_FRAME || ft == Ax25FrameType::S_FRAME) {
+            IRIS_LOG("AX25 RX %s from %s while DISCONNECTED -> DM",
+                     ft == Ax25FrameType::I_FRAME ? "I" : "S",
+                     frame.src.to_string().c_str());
+            remote_addr_ = frame.src;
+            send_dm(frame.poll_final());
+            return true;
+        }
+
+        return false;
+    }
+
+    // For connected states, verify source matches our peer
+    if (state_ != Ax25SessionState::DISCONNECTED) {
+        if (!frame.src.matches(remote_call_))
+            return false;
+    }
+
+    // -----------------------------------------------------------------------
+    // STATE 2: AWAITING_CONNECTION (sent SABM, waiting UA)
+    // -----------------------------------------------------------------------
+    if (state_ == Ax25SessionState::AWAITING_CONNECTION) {
+        if (ft == Ax25FrameType::U_FRAME) {
+            Ax25UType ut = frame.u_type();
+
+            if (ut == Ax25UType::UA) {
+                IRIS_LOG("AX25 RX UA from %s (F=%d) [AWAITING_CONNECTION -> CONNECTED]",
+                         frame.src.to_string().c_str(), frame.poll_final() ? 1 : 0);
+                if (frame.poll_final()) {
+                    // Expected UA with F=1
+                    t1_ = 0;
+                    t3_ = T3_TICKS;
+                    vs_ = vr_ = va_ = 0;
+                    clear_exception_conditions();
+                    set_state(Ax25SessionState::CONNECTED);
+                    send_next_iframe();  // Send any queued data
+                } else {
+                    // UA with F=0 — unexpected (spec says ignore)
+                    IRIS_LOG("AX25 UA with F=0 ignored (expected F=1)");
+                }
+                return true;
+            }
+
+            if (ut == Ax25UType::DM) {
+                IRIS_LOG("AX25 RX DM from %s (F=%d) [AWAITING_CONNECTION -> DISCONNECTED]",
+                         frame.src.to_string().c_str(), frame.poll_final() ? 1 : 0);
+                if (frame.poll_final()) {
+                    t1_ = 0;
+                    reset_session();
+                    set_state(Ax25SessionState::DISCONNECTED);
+                }
+                // DM with F=0 — ignore
+                return true;
+            }
+
+            if (ut == Ax25UType::SABM) {
+                // Both sides sent SABM simultaneously — accept (collision case)
+                IRIS_LOG("AX25 RX SABM from %s [simultaneous connect]",
+                         frame.src.to_string().c_str());
+                send_ua(frame.poll_final());
+                return true;
+            }
+
+            // Other U-frames ignored in AWAITING_CONNECTION
+            IRIS_LOG("AX25 RX U-frame 0x%02X ignored in AWAITING_CONNECTION",
+                     frame.control);
+            return true;
+        }
+
+        // I and S frames ignored in AWAITING_CONNECTION
+        return true;
+    }
+
+    // -----------------------------------------------------------------------
+    // STATE 5: AWAITING_RELEASE (sent DISC, waiting UA/DM)
+    // -----------------------------------------------------------------------
+    if (state_ == Ax25SessionState::AWAITING_RELEASE) {
+        if (ft == Ax25FrameType::U_FRAME) {
+            Ax25UType ut = frame.u_type();
+
+            if (ut == Ax25UType::UA) {
+                IRIS_LOG("AX25 RX UA from %s (F=%d) [AWAITING_RELEASE -> DISCONNECTED]",
+                         frame.src.to_string().c_str(), frame.poll_final() ? 1 : 0);
+                if (frame.poll_final()) {
+                    t1_ = 0;
+                    reset_session();
+                    set_state(Ax25SessionState::DISCONNECTED);
+                }
+                return true;
+            }
+
+            if (ut == Ax25UType::DM) {
+                IRIS_LOG("AX25 RX DM from %s (F=%d) [AWAITING_RELEASE -> DISCONNECTED]",
+                         frame.src.to_string().c_str(), frame.poll_final() ? 1 : 0);
+                if (frame.poll_final()) {
+                    t1_ = 0;
+                    reset_session();
+                    set_state(Ax25SessionState::DISCONNECTED);
+                }
+                return true;
+            }
+
+            if (ut == Ax25UType::SABM) {
+                // SABM while awaiting release — send DM (refuse new connection)
+                IRIS_LOG("AX25 RX SABM while AWAITING_RELEASE -> DM");
+                send_dm(frame.poll_final());
+                return true;
+            }
+
+            // Other U-frames ignored
+            return true;
+        }
+
+        // I and S frames: ignore but respond to polls
+        if (ft == Ax25FrameType::I_FRAME || ft == Ax25FrameType::S_FRAME) {
+            // Ignore content, but respond to P=1 with DM
+            if (frame.poll_final()) {
+                send_dm(true);
+            }
+            return true;
+        }
+
+        return true;
+    }
+
+    // -----------------------------------------------------------------------
+    // STATE 3 & 4: CONNECTED / TIMER_RECOVERY
+    // -----------------------------------------------------------------------
+    bool in_timer_recovery = (state_ == Ax25SessionState::TIMER_RECOVERY);
+
+    // --- U-frame handling ---
+    if (ft == Ax25FrameType::U_FRAME) {
+        Ax25UType ut = frame.u_type();
+
+        switch (ut) {
+        case Ax25UType::SABM: {
+            // Link reset (re-establish connection)
+            IRIS_LOG("AX25 RX SABM from %s (P=%d) [%s -> link reset]",
+                     frame.src.to_string().c_str(), frame.poll_final() ? 1 : 0,
+                     in_timer_recovery ? "TIMER_RECOVERY" : "CONNECTED");
+            send_ua(frame.poll_final());
+            clear_exception_conditions();
+            // Discard I-frame queue
+            while (!tx_queue_.empty()) tx_queue_.pop();
+            for (int i = 0; i < 8; i++) tx_window_[i] = TxIFrame{};
+            vs_ = vr_ = va_ = 0;
+            t1_ = 0;
+            t3_ = T3_TICKS;
+            set_state(Ax25SessionState::CONNECTED);
+            return true;
+        }
+
+        case Ax25UType::DISC:
+            IRIS_LOG("AX25 RX DISC from %s (P=%d) [%s -> DISCONNECTED]",
+                     frame.src.to_string().c_str(), frame.poll_final() ? 1 : 0,
+                     in_timer_recovery ? "TIMER_RECOVERY" : "CONNECTED");
+            send_ua(frame.poll_final());
+            t1_ = 0;
+            t3_ = 0;
+            reset_session();
+            set_state(Ax25SessionState::DISCONNECTED);
+            return true;
+
+        case Ax25UType::UA:
+            // Unsolicited UA — error (AX.25 2.2 Section 4.3.4.5)
+            IRIS_LOG("AX25 RX unsolicited UA in %s -> establish data link",
+                     in_timer_recovery ? "TIMER_RECOVERY" : "CONNECTED");
+            establish_data_link();
+            clear_exception_conditions();
+            set_state(Ax25SessionState::AWAITING_CONNECTION);
+            return true;
+
+        case Ax25UType::DM:
+            IRIS_LOG("AX25 RX DM in %s -> DISCONNECTED",
+                     in_timer_recovery ? "TIMER_RECOVERY" : "CONNECTED");
+            t1_ = 0;
+            t3_ = 0;
+            reset_session();
+            set_state(Ax25SessionState::DISCONNECTED);
+            return true;
+
+        case Ax25UType::FRMR:
+            // FRMR received — re-establish link (AX.25 2.2 Section 4.3.10)
+            IRIS_LOG("AX25 RX FRMR from %s -> re-establish link",
+                     frame.src.to_string().c_str());
+            establish_data_link();
+            clear_exception_conditions();
+            set_state(Ax25SessionState::AWAITING_CONNECTION);
+            return true;
+
+        case Ax25UType::UI:
+        case Ax25UType::XID:
+            // Pass through to higher layer
+            return false;
+
+        default:
+            // Unknown U-frame — send FRMR W bit
+            IRIS_LOG("AX25 RX unknown U-frame 0x%02X -> FRMR", frame.control);
+            send_frmr(frame.control, vs_, vr_, false, true, false, false, false);
+            return true;
+        }
+    }
+
+    // --- I-frame handling (State 3 and 4) ---
+    if (ft == Ax25FrameType::I_FRAME) {
+        uint8_t ns = frame.ns();
+        uint8_t nr = frame.nr();
+        bool pf = frame.poll_final();
+        IRIS_LOG("AX25 RX I N(S)=%d N(R)=%d P=%d (%zu bytes) [V(R)=%d V(A)=%d V(S)=%d %s]",
+                 ns, nr, pf ? 1 : 0, frame.info.size(),
+                 vr_, va_, vs_,
+                 in_timer_recovery ? "TIMER_RECOVERY" : "CONNECTED");
+
+        // Validate N(R) (AX.25 2.2 Section 4.3.3.3)
+        if (!nr_valid(nr)) {
+            IRIS_LOG("AX25 I-frame N(R)=%d invalid [V(A)=%d V(S)=%d]", nr, va_, vs_);
+            nr_error_recovery();
+            return true;
+        }
+
+        if (in_timer_recovery) {
+            // STATE 4: Timer Recovery
+            ack_frames(nr);
+
+            if (ns == vr_) {
+                // In-sequence
+                vr_ = (vr_ + 1) % 8;
+                reject_exception_ = false;
+
+                // Deliver data
+                if (!frame.info.empty() && data_received_)
+                    data_received_(frame.info.data(), frame.info.size());
+
+                if (pf) {
+                    // Response to our poll — leave timer recovery
+                    t1_ = 0;
+                    select_t1_value();
+                    enquiry_response(true);
+                    // If all acked, back to CONNECTED; else retransmit
+                    if (va_ == vs_) {
+                        set_state(Ax25SessionState::CONNECTED);
+                        t3_ = T3_TICKS;
+                    } else {
+                        invoke_retransmission();
+                        set_state(Ax25SessionState::CONNECTED);
+                    }
+                } else {
+                    acknowledge_pending_ = true;
+                    if (t2_ == 0) t2_ = T2_TICKS;
+                }
+            } else {
+                // Out-of-sequence
+                if (!reject_exception_) {
+                    reject_exception_ = true;
+                    send_rej(pf, false);  // Response
+                    acknowledge_pending_ = false;
+                } else {
+                    // REJ already sent — discard but respond to P=1
+                    if (pf) {
+                        send_rr(true, false);
+                    }
+                }
+            }
+            return true;
+        }
+
+        // STATE 3: Connected (normal information transfer)
+        ack_frames(nr);
+
+        if (ns == vr_) {
+            // In-sequence frame
+            vr_ = (vr_ + 1) % 8;
+            reject_exception_ = false;
+
+            // Deliver data to application
+            if (!frame.info.empty() && data_received_)
+                data_received_(frame.info.data(), frame.info.size());
+
+            if (pf) {
+                // Must respond with F=1
+                enquiry_response(true);
+            } else {
+                acknowledge_pending_ = true;
+                if (t2_ == 0) t2_ = T2_TICKS;
+            }
+
+            t3_ = T3_TICKS;  // Reset idle timer
+
+            // Try sending our own data (piggyback ack)
+            send_next_iframe();
+        } else if (in_window(ns)) {
+            // Out-of-sequence but within window — request retransmission
+            if (!reject_exception_) {
+                reject_exception_ = true;
+                send_rej(pf, pf ? false : true);  // Command if not responding to poll
+                acknowledge_pending_ = false;
+            } else {
+                // REJ already sent — respond to poll if needed
+                if (pf) {
+                    send_rr(true, false);
+                    acknowledge_pending_ = false;
+                }
+            }
+        } else {
+            IRIS_LOG("AX25 RX I N(S)=%d outside window [V(R)=%d K=%d]", ns, vr_, K);
+            // Discard — respond to poll if needed
+            if (pf) {
+                enquiry_response(true);
+            }
+        }
+        return true;
+    }
+
+    // --- S-frame handling (State 3 and 4) ---
+    if (ft == Ax25FrameType::S_FRAME) {
+        Ax25SType st = frame.s_type();
+        uint8_t nr = frame.nr();
+        bool pf = frame.poll_final();
+
+        // Validate N(R)
+        if (!nr_valid(nr)) {
+            IRIS_LOG("AX25 S-frame N(R)=%d invalid [V(A)=%d V(S)=%d]", nr, va_, vs_);
+            nr_error_recovery();
+            return true;
+        }
+
+        if (in_timer_recovery) {
+            // STATE 4: Timer Recovery — S-frame handling
+            switch (st) {
+            case Ax25SType::RR:
+                IRIS_LOG("AX25 RX RR N(R)=%d %s=%d [TIMER_RECOVERY]",
+                         nr, pf ? "F" : "P", pf ? 1 : 0);
+                peer_busy_ = false;
+                ack_frames(nr);
+                if (pf) {
+                    // This is the response to our poll
+                    t1_ = 0;
+                    select_t1_value();
+                    if (va_ == vs_) {
+                        // All acknowledged — back to CONNECTED
+                        t3_ = T3_TICKS;
+                        set_state(Ax25SessionState::CONNECTED);
+                    } else {
+                        // Outstanding frames — retransmit and return to CONNECTED
+                        invoke_retransmission();
+                        set_state(Ax25SessionState::CONNECTED);
+                    }
+                } else {
+                    // Not a response to our poll — stay in timer recovery
+                }
+                break;
+
+            case Ax25SType::RNR:
+                IRIS_LOG("AX25 RX RNR N(R)=%d %s=%d [TIMER_RECOVERY]",
+                         nr, pf ? "F" : "P", pf ? 1 : 0);
+                peer_busy_ = true;
+                ack_frames(nr);
+                if (pf) {
+                    t1_ = 0;
+                    select_t1_value();
+                    // Peer busy — go back to CONNECTED but don't retransmit
+                    t3_ = T3_TICKS;
+                    set_state(Ax25SessionState::CONNECTED);
+                }
+                break;
+
+            case Ax25SType::REJ:
+                IRIS_LOG("AX25 RX REJ N(R)=%d %s=%d [TIMER_RECOVERY]",
+                         nr, pf ? "F" : "P", pf ? 1 : 0);
+                peer_busy_ = false;
+                ack_frames(nr);
+                if (pf) {
+                    t1_ = 0;
+                    select_t1_value();
+                    invoke_retransmission();
+                    set_state(Ax25SessionState::CONNECTED);
+                } else {
+                    // Stay in timer recovery
+                }
+                break;
+
+            case Ax25SType::SREJ:
+                // Treat SREJ as REJ (simplified)
+                IRIS_LOG("AX25 RX SREJ N(R)=%d -> treating as REJ [TIMER_RECOVERY]", nr);
+                peer_busy_ = false;
+                ack_frames(nr);
+                if (pf) {
+                    t1_ = 0;
+                    invoke_retransmission();
+                    set_state(Ax25SessionState::CONNECTED);
+                }
+                break;
+            }
+            t3_ = T3_TICKS;
+            return true;
+        }
+
+        // STATE 3: Connected — S-frame handling
+        switch (st) {
+        case Ax25SType::RR:
+            IRIS_LOG("AX25 RX RR N(R)=%d %s=%d [CONNECTED]",
+                     nr, pf ? "P" : "F", pf ? 1 : 0);
+            peer_busy_ = false;
+            ack_frames(nr);
+            if (pf) {
+                // Poll — must respond
+                enquiry_response(true);
+            }
+            send_next_iframe();
+            break;
+
+        case Ax25SType::RNR:
+            IRIS_LOG("AX25 RX RNR N(R)=%d %s=%d [CONNECTED]",
+                     nr, pf ? "P" : "F", pf ? 1 : 0);
+            peer_busy_ = true;
+            ack_frames(nr);
+            if (pf) {
+                enquiry_response(true);
+            }
+            // Don't try to send I-frames while peer busy
+            break;
+
+        case Ax25SType::REJ:
+            IRIS_LOG("AX25 RX REJ N(R)=%d %s=%d [CONNECTED]",
+                     nr, pf ? "P" : "F", pf ? 1 : 0);
+            peer_busy_ = false;
+            ack_frames(nr);
+            if (pf) {
+                enquiry_response(true);
+            }
+            retransmit_from(nr);
+            break;
+
+        case Ax25SType::SREJ:
+            // Treat as REJ (simplified)
+            IRIS_LOG("AX25 RX SREJ N(R)=%d -> treating as REJ [CONNECTED]", nr);
+            peer_busy_ = false;
+            ack_frames(nr);
+            retransmit_from(nr);
+            break;
+        }
+        t3_ = T3_TICKS;
+        return true;
+    }
+
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// Timer management — AX.25 2.2 Section 6.7
+// ---------------------------------------------------------------------------
+
+void Ax25Session::tick() {
+    if (state_ == Ax25SessionState::DISCONNECTED) return;
+
+    // T2: response delay timer (triggers delayed ack)
+    if (t2_ > 0 && (state_ == Ax25SessionState::CONNECTED ||
+                     state_ == Ax25SessionState::TIMER_RECOVERY)) {
+        t2_--;
+        if (t2_ == 0 && acknowledge_pending_) {
+            acknowledge_pending_ = false;
+            if (own_busy_)
+                send_rnr(false, false);
+            else
+                send_rr(false, false);
+        }
+    }
+
+    // T1: acknowledgment timer
+    if (t1_ > 0) {
+        t1_--;
+        if (t1_ == 0) {
+            retry_count_++;
+            if (retry_count_ > N2) {
+                IRIS_LOG("AX25 T1 expired, max retries (%d) exceeded -> DISCONNECTED", N2);
+                reset_session();
+                set_state(Ax25SessionState::DISCONNECTED);
+                return;
+            }
+
+            if (state_ == Ax25SessionState::AWAITING_CONNECTION) {
+                IRIS_LOG("AX25 T1 retry SABM (%d/%d)", retry_count_, N2);
+                send_sabm();
+                t1_ = T1_TICKS;
+            } else if (state_ == Ax25SessionState::AWAITING_RELEASE) {
+                IRIS_LOG("AX25 T1 retry DISC (%d/%d)", retry_count_, N2);
+                send_disc();
+                t1_ = T1_TICKS;
+            } else if (state_ == Ax25SessionState::CONNECTED) {
+                // Enter Timer Recovery (State 4)
+                IRIS_LOG("AX25 T1 timeout -> TIMER_RECOVERY, poll (%d/%d)",
+                         retry_count_, N2);
+                send_rr(true, true);  // Command with P=1
+                t1_ = T1_TICKS;
+                set_state(Ax25SessionState::TIMER_RECOVERY);
+            } else if (state_ == Ax25SessionState::TIMER_RECOVERY) {
+                // Already in timer recovery — re-poll
+                IRIS_LOG("AX25 T1 re-poll in TIMER_RECOVERY (%d/%d)",
+                         retry_count_, N2);
+                send_rr(true, true);  // Command with P=1
+                t1_ = T1_TICKS;
+            }
+        }
+    }
+
+    // T3: idle supervision timer
+    if (t3_ > 0 && (state_ == Ax25SessionState::CONNECTED ||
+                     state_ == Ax25SessionState::TIMER_RECOVERY)) {
+        t3_--;
+        if (t3_ == 0) {
+            IRIS_LOG("AX25 T3 idle timeout, entering timer recovery");
+            retry_count_ = 0;
+            send_rr(true, true);  // Command with P=1
+            t1_ = T1_TICKS;
+            set_state(Ax25SessionState::TIMER_RECOVERY);
+        }
+    }
+}
+
+void Ax25Session::select_t1_value() {
+    // AX.25 2.2 Section 6.3.1: T1 should be adaptive based on RTT.
+    // For simplicity, we use a fixed value. A more sophisticated
+    // implementation could measure actual round-trip times.
+    // (Currently T1_TICKS is the fixed default.)
+}
+
+} // namespace iris
