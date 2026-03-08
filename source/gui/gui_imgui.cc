@@ -305,39 +305,77 @@ static void DrawConstellation(const std::vector<std::complex<float>>& points, fl
     ImGui::Dummy(ImVec2(width, height));
 }
 
-static void DrawSpectrum(const std::vector<float>& spectrum, float width, float height,
-                         float band_low_hz, float band_high_hz) {
+// Waterfall color map: dB value -> color (black -> blue -> cyan -> green -> yellow -> red -> white)
+static ImU32 waterfall_color(float db, float db_min = -80.0f, float db_max = 0.0f) {
+    float frac = (db - db_min) / (db_max - db_min);
+    if (frac < 0.0f) frac = 0.0f;
+    if (frac > 1.0f) frac = 1.0f;
+
+    uint8_t r, g, b;
+    if (frac < 0.2f) {
+        float t = frac / 0.2f;
+        r = 0; g = 0; b = (uint8_t)(t * 180);
+    } else if (frac < 0.4f) {
+        float t = (frac - 0.2f) / 0.2f;
+        r = 0; g = (uint8_t)(t * 200); b = (uint8_t)(180 + t * 75);
+    } else if (frac < 0.6f) {
+        float t = (frac - 0.4f) / 0.2f;
+        r = 0; g = (uint8_t)(200 + t * 55); b = (uint8_t)(255 * (1 - t));
+    } else if (frac < 0.8f) {
+        float t = (frac - 0.6f) / 0.2f;
+        r = (uint8_t)(t * 255); g = 255; b = 0;
+    } else {
+        float t = (frac - 0.8f) / 0.2f;
+        r = 255; g = (uint8_t)(255 * (1 - t * 0.5f)); b = (uint8_t)(t * 255);
+    }
+    return IM_COL32(r, g, b, 255);
+}
+
+static void DrawWaterfall(std::vector<std::vector<float>>& history,
+                          const std::vector<float>& current_spectrum,
+                          float width, float height,
+                          float band_low_hz, float band_high_hz,
+                          int max_history) {
     ImVec2 pos = ImGui::GetCursorScreenPos();
     ImDrawList* dl = ImGui::GetWindowDrawList();
 
-    dl->AddRectFilled(pos, ImVec2(pos.x + width, pos.y + height), IM_COL32(10, 10, 20, 255));
+    // Push current spectrum into history
+    if (!current_spectrum.empty()) {
+        history.push_back(current_spectrum);
+        while ((int)history.size() > max_history)
+            history.erase(history.begin());
+    }
 
-    int n_bins = (int)spectrum.size();
-    if (n_bins <= 0) { ImGui::Dummy(ImVec2(width, height)); return; }
-    float bin_w = width / n_bins;
-    float db_min = -80.0f, db_max = 0.0f;
+    // Draw background
+    dl->AddRectFilled(pos, ImVec2(pos.x + width, pos.y + height), IM_COL32(0, 0, 0, 255));
 
-    for (int i = 0; i < n_bins; i++) {
-        float frac = (spectrum[i] - db_min) / (db_max - db_min);
-        frac = frac < 0.0f ? 0.0f : frac > 1.0f ? 1.0f : frac;
+    if (history.empty()) {
+        ImGui::Dummy(ImVec2(width, height + 16));
+        return;
+    }
 
-        float x0 = pos.x + i * bin_w;
-        float y0 = pos.y + height * (1.0f - frac);
-        float x1 = x0 + bin_w;
-        float y1 = pos.y + height;
+    int n_rows = (int)history.size();
+    float row_h = height / max_history;
+    if (row_h < 1.0f) row_h = 1.0f;
 
-        uint8_t r, g, b;
-        if (frac < 0.33f) {
-            float t = frac / 0.33f;
-            r = 0; g = (uint8_t)(t * 200); b = (uint8_t)(100 + t * 155);
-        } else if (frac < 0.66f) {
-            float t = (frac - 0.33f) / 0.33f;
-            r = 0; g = (uint8_t)(200 + t * 55); b = (uint8_t)(255 * (1 - t));
-        } else {
-            float t = (frac - 0.66f) / 0.34f;
-            r = (uint8_t)(t * 255); g = 255; b = 0;
+    for (int row = 0; row < n_rows; row++) {
+        const auto& spec = history[row];
+        int n_bins = (int)spec.size();
+        if (n_bins <= 0) continue;
+        float bin_w = width / n_bins;
+
+        // Draw this row from bottom (newest at bottom)
+        float y0 = pos.y + height - (n_rows - row) * row_h;
+        float y1 = y0 + row_h;
+        if (y0 < pos.y) y0 = pos.y;
+        if (y1 > pos.y + height) y1 = pos.y + height;
+
+        for (int i = 0; i < n_bins; i++) {
+            float x0 = pos.x + i * bin_w;
+            float x1 = x0 + bin_w;
+            if (x1 > pos.x + width) x1 = pos.x + width;
+            dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), waterfall_color(spec[i]));
         }
-        dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), IM_COL32(r, g, b, 200));
     }
 
     dl->AddRect(pos, ImVec2(pos.x + width, pos.y + height), IM_COL32(80, 80, 80, 255));
@@ -359,16 +397,11 @@ static void DrawSpectrum(const std::vector<float>& spectrum, float width, float 
         if (tx < pos.x) tx = pos.x;
         if (tx + ts.x > pos.x + width) tx = pos.x + width - ts.x;
         dl->AddText(ImVec2(tx, label_y), IM_COL32(140, 140, 140, 200), lbl);
-        // Tick mark
         dl->AddLine(ImVec2(lx, pos.y + height - 3), ImVec2(lx, pos.y + height),
                      IM_COL32(100, 100, 100, 200));
     }
 
-    // dB axis label
-    dl->AddText(ImVec2(pos.x + 2, pos.y + 1), IM_COL32(100, 100, 100, 180), "0 dB");
-    dl->AddText(ImVec2(pos.x + 2, pos.y + height - 14), IM_COL32(100, 100, 100, 180), "-80");
-
-    ImGui::Dummy(ImVec2(width, height + 16));  // Extra space for labels
+    ImGui::Dummy(ImVec2(width, height + 16));
 }
 
 // ============================================================
@@ -600,6 +633,10 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
             }
             if (!connected) ImGui::EndDisabled();
 
+            ImGui::Checkbox("Native Hail", &config.native_hail);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Use native PHY (BPSK+LDPC) for hailing.\n~10 dB better sensitivity than AFSK.\nBoth sides must enable this.");
+
             if (ImGui::Button("Auto Cal", ImVec2(90, 28))) {
                 if (callbacks_.on_calibrate) callbacks_.on_calibrate();
             }
@@ -637,30 +674,20 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
     }
     ImGui::EndChild();
 
-    // ========== Spectrum ==========
-    if (!diag.spectrum.empty()) {
-        float spec_h = 80.0f;
-        ImGui::BeginChild("Spectrum", ImVec2(0, spec_h + 26), true,
-                           ImGuiWindowFlags_NoScrollbar);
-        DrawSpectrum(diag.spectrum, ImGui::GetContentRegionAvail().x, spec_h,
-                     config.band_low_hz, config.band_high_hz);
-        ImGui::EndChild();
-    }
-
-    // ========== Passband Probe Visualization ==========
-    if (diag.probe_has_results) {
-        ImGui::BeginChild("ProbeVis", ImVec2(0, 110), true, ImGuiWindowFlags_NoScrollbar);
-        {
+    // ========== Passband Probe Visualization (always visible) ==========
+    {
+        float probe_h = diag.probe_has_results ? 80.0f : 24.0f;
+        ImGui::BeginChild("ProbeVis", ImVec2(0, probe_h), true, ImGuiWindowFlags_NoScrollbar);
+        if (diag.probe_has_results) {
             ImVec2 avail = ImGui::GetContentRegionAvail();
             ImDrawList* dl = ImGui::GetWindowDrawList();
             float w = avail.x;
-            float row_h = 14.0f;  // Height per tone row
+            float row_h = 14.0f;
             float bar_h = row_h - 2.0f;
             float label_w = 70.0f;
             float tone_w = (w - label_w - 10.0f) / PassbandProbeConfig::N_TONES;
             if (tone_w < 2.0f) tone_w = 2.0f;
 
-            // Title + negotiated band info
             if (diag.probe_negotiated.valid) {
                 ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f),
                     "Passband: %.0f - %.0f Hz (%.0f Hz usable)",
@@ -670,81 +697,154 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
                 ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.2f, 1.0f), "Passband: probing...");
             }
 
-            // Row 1: Our TX → Their RX (what they heard from us)
+            // Row 1: Our TX -> Their RX
             ImVec2 r1 = ImGui::GetCursorScreenPos();
             dl->AddText(ImVec2(r1.x, r1.y + 1), IM_COL32(180, 180, 180, 255), "TX\xe2\x86\x92RX");
             for (int k = 0; k < PassbandProbeConfig::N_TONES; k++) {
                 float x0 = r1.x + label_w + k * tone_w;
-                float y0 = r1.y;
-                ImU32 col;
-                if (diag.probe_my_tx.tone_detected[k])
-                    col = IM_COL32(0, 200, 100, 220);  // Green = detected
-                else
-                    col = IM_COL32(60, 20, 20, 180);   // Dark red = missing
-                dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + tone_w - 1, y0 + bar_h), col);
+                ImU32 col = diag.probe_my_tx.tone_detected[k]
+                    ? IM_COL32(0, 200, 100, 220) : IM_COL32(60, 20, 20, 180);
+                dl->AddRectFilled(ImVec2(x0, r1.y), ImVec2(x0 + tone_w - 1, r1.y + bar_h), col);
             }
             ImGui::Dummy(ImVec2(w, row_h));
 
-            // Row 2: Their TX → Our RX (what we heard from them)
+            // Row 2: Their TX -> Our RX
             ImVec2 r2 = ImGui::GetCursorScreenPos();
             dl->AddText(ImVec2(r2.x, r2.y + 1), IM_COL32(180, 180, 180, 255), "RX\xe2\x86\x90TX");
             for (int k = 0; k < PassbandProbeConfig::N_TONES; k++) {
                 float x0 = r2.x + label_w + k * tone_w;
-                float y0 = r2.y;
-                ImU32 col;
-                if (diag.probe_their_tx.tone_detected[k])
-                    col = IM_COL32(100, 150, 255, 220);  // Blue = detected
-                else
-                    col = IM_COL32(20, 20, 60, 180);     // Dark blue = missing
-                dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + tone_w - 1, y0 + bar_h), col);
+                ImU32 col = diag.probe_their_tx.tone_detected[k]
+                    ? IM_COL32(100, 150, 255, 220) : IM_COL32(20, 20, 60, 180);
+                dl->AddRectFilled(ImVec2(x0, r2.y), ImVec2(x0 + tone_w - 1, r2.y + bar_h), col);
             }
             ImGui::Dummy(ImVec2(w, row_h));
 
-            // Row 3: Negotiated overlap (intersection)
+            // Row 3: Negotiated overlap
             ImVec2 r3 = ImGui::GetCursorScreenPos();
             dl->AddText(ImVec2(r3.x, r3.y + 1), IM_COL32(180, 180, 180, 255), "Usable");
             for (int k = 0; k < PassbandProbeConfig::N_TONES; k++) {
                 float x0 = r3.x + label_w + k * tone_w;
-                float y0 = r3.y;
                 bool both = diag.probe_my_tx.tone_detected[k] &&
                             diag.probe_their_tx.tone_detected[k];
                 ImU32 col;
                 if (both) {
-                    // Check if within negotiated band (with margin applied)
                     float freq = PassbandProbeConfig::TONE_LOW_HZ +
                                  k * PassbandProbeConfig::TONE_SPACING_HZ;
                     if (diag.probe_negotiated.valid &&
                         freq >= diag.probe_negotiated.low_hz &&
                         freq <= diag.probe_negotiated.high_hz)
-                        col = IM_COL32(255, 220, 50, 240);  // Gold = in-band
+                        col = IM_COL32(255, 220, 50, 240);
                     else
-                        col = IM_COL32(120, 100, 30, 180);  // Dim gold = overlap but outside margin
+                        col = IM_COL32(120, 100, 30, 180);
                 } else {
-                    col = IM_COL32(30, 30, 30, 150);  // Dark = no overlap
+                    col = IM_COL32(30, 30, 30, 150);
                 }
-                dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + tone_w - 1, y0 + bar_h), col);
+                dl->AddRectFilled(ImVec2(x0, r3.y), ImVec2(x0 + tone_w - 1, r3.y + bar_h), col);
             }
             ImGui::Dummy(ImVec2(w, row_h));
-
-            // Frequency labels under the tone bars
-            ImVec2 r4 = ImGui::GetCursorScreenPos();
-            int label_every = PassbandProbeConfig::N_TONES / 8;  // ~8 labels
-            if (label_every < 1) label_every = 1;
-            for (int k = 0; k < PassbandProbeConfig::N_TONES; k += label_every) {
-                float freq = PassbandProbeConfig::TONE_LOW_HZ +
-                             k * PassbandProbeConfig::TONE_SPACING_HZ;
-                float x0 = r4.x + label_w + k * tone_w;
-                char lbl[16];
-                if (freq >= 1000.0f)
-                    snprintf(lbl, sizeof(lbl), "%.1fk", freq / 1000.0f);
-                else
-                    snprintf(lbl, sizeof(lbl), "%.0f", freq);
-                ImVec2 ts = ImGui::CalcTextSize(lbl);
-                dl->AddText(ImVec2(x0 - ts.x * 0.3f, r4.y),
-                            IM_COL32(120, 120, 120, 200), lbl);
-            }
-            ImGui::Dummy(ImVec2(w, 14));
+        } else {
+            ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.4f, 1.0f),
+                "Passband: %.0f - %.0f Hz (config default)",
+                diag.band_low_hz, diag.band_high_hz);
         }
+        ImGui::EndChild();
+    }
+
+    // ========== Waterfall (fills remaining space above status bar) ==========
+    {
+        float status_bar_h = 27.0f;
+        float remaining = ImGui::GetContentRegionAvail().y - status_bar_h - 4.0f;
+        float wf_h = remaining > 60.0f ? remaining - 18.0f : 60.0f;
+        ImGui::BeginChild("Waterfall", ImVec2(0, remaining), true,
+                           ImGuiWindowFlags_NoScrollbar);
+        DrawWaterfall(wf_history_, diag.spectrum,
+                      ImGui::GetContentRegionAvail().x, wf_h,
+                      diag.band_low_hz, diag.band_high_hz, WF_HISTORY);
+        ImGui::EndChild();
+    }
+
+    // ========== Bottom Status Bar (pinned to bottom) ==========
+    {
+        ImGui::BeginChild("StatusBar", ImVec2(0, 0), true, ImGuiWindowFlags_NoScrollbar);
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImVec2 p = ImGui::GetCursorScreenPos();
+
+        // Status LED
+        ImU32 led_col;
+        const char* status_text;
+        if (diag.arq_state == ArqState::CONNECTED) {
+            led_col = IM_COL32(0, 220, 0, 255); status_text = "CONNECTED";
+        } else if (diag.arq_state == ArqState::CONNECTING) {
+            led_col = IM_COL32(220, 220, 0, 255); status_text = "CONNECTING";
+        } else if (diag.arq_state == ArqState::LISTENING) {
+            led_col = IM_COL32(80, 160, 220, 255); status_text = "LISTENING";
+        } else {
+            led_col = IM_COL32(80, 80, 80, 255); status_text = "IDLE";
+        }
+        dl->AddCircleFilled(ImVec2(p.x + 6, p.y + 8), 5, led_col);
+        ImGui::SetCursorScreenPos(ImVec2(p.x + 16, p.y));
+        ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.8f, 1.0f), "%s", status_text);
+
+        ImGui::SameLine(0, 6);
+        ImGui::TextColored(ImVec4(0.3f, 0.3f, 0.3f, 1.0f), "|");
+        ImGui::SameLine(0, 6);
+
+        // Mode + baud
+        if (diag.native_mode)
+            ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f), "Native %d baud", diag.baud_rate);
+        else
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "AX.25");
+
+        ImGui::SameLine(0, 6);
+        ImGui::TextColored(ImVec4(0.3f, 0.3f, 0.3f, 1.0f), "|");
+        ImGui::SameLine(0, 6);
+
+        // TX/RX indicator
+        bool is_tx = diag.ptt_active;
+        if (is_tx)
+            ImGui::TextColored(ImVec4(1.0f, 0.2f, 0.2f, 1.0f), "TX");
+        else
+            ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "RX");
+
+        ImGui::SameLine(0, 6);
+        ImGui::TextColored(ImVec4(0.3f, 0.3f, 0.3f, 1.0f), "|");
+        ImGui::SameLine(0, 6);
+
+        // PHY bitrate + app bitrate with efficiency
+        if (diag.compression_ratio > 1.0f)
+            ImGui::Text("%d/%d bps (%.1fx)", diag.app_bps, diag.phy_bps, diag.compression_ratio);
+        else if (diag.phy_bps >= 1000)
+            ImGui::Text("%.1f kbps", diag.phy_bps / 1000.0f);
+        else
+            ImGui::Text("%d bps", diag.phy_bps);
+
+        ImGui::SameLine(0, 6);
+        ImGui::TextColored(ImVec4(0.3f, 0.3f, 0.3f, 1.0f), "|");
+        ImGui::SameLine(0, 6);
+
+        // Bytes transferred
+        ImGui::Text("TX:%lluB RX:%lluB",
+                     (unsigned long long)diag.bytes_tx,
+                     (unsigned long long)diag.bytes_rx);
+
+        ImGui::SameLine(0, 6);
+        ImGui::TextColored(ImVec4(0.3f, 0.3f, 0.3f, 1.0f), "|");
+        ImGui::SameLine(0, 6);
+
+        // Encryption state
+        switch (diag.encryption_state) {
+            case 0: ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.4f, 1.0f), "No Encryption"); break;
+            case 1: ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.2f, 1.0f), "KEY EXCHANGE"); break;
+            case 2: ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "ENCRYPTED"); break;
+            case 3: ImGui::TextColored(ImVec4(1.0f, 0.2f, 0.2f, 1.0f), "PSK MISMATCH"); break;
+        }
+
+        // Level overflow indicator
+        ImGui::SameLine(0, 6);
+        if (diag.rx_peak > 0.95f) {
+            ImGui::TextColored(ImVec4(1.0f, 0.1f, 0.1f, 1.0f), "OVL");
+        }
+
         ImGui::EndChild();
     }
 
@@ -807,26 +907,49 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
             if (ImGui::BeginTabItem("Audio")) {
                 ImGui::Spacing();
                 if (!audio_devices.empty()) {
-                    std::vector<std::string> cap_names, play_names;
+                    // Build filtered lists with device IDs
+                    struct DevEntry { int id; std::string name; };
+                    std::vector<DevEntry> cap_devs, play_devs;
                     for (const auto& d : audio_devices) {
-                        if (d.max_input_channels > 0) cap_names.push_back(d.name);
-                        if (d.max_output_channels > 0) play_names.push_back(d.name);
+                        if (d.max_input_channels > 0) cap_devs.push_back({d.id, d.name});
+                        if (d.max_output_channels > 0) play_devs.push_back({d.id, d.name});
                     }
-                    if (!cap_names.empty()) {
-                        if (selected_capture_ >= (int)cap_names.size()) selected_capture_ = 0;
-                        if (ImGui::BeginCombo("Capture Device", cap_names[selected_capture_].c_str())) {
-                            for (int i = 0; i < (int)cap_names.size(); i++)
-                                if (ImGui::Selectable(cap_names[i].c_str(), i == selected_capture_))
+
+                    // Initialize selection from config (once)
+                    static bool audio_sel_init = false;
+                    if (!audio_sel_init) {
+                        // Find matching device, or default to first in list
+                        selected_capture_ = 0;
+                        for (int i = 0; i < (int)cap_devs.size(); i++)
+                            if (cap_devs[i].id == config.capture_device) { selected_capture_ = i; break; }
+                        selected_playback_ = 0;
+                        for (int i = 0; i < (int)play_devs.size(); i++)
+                            if (play_devs[i].id == config.playback_device) { selected_playback_ = i; break; }
+                        // Resolve -1 (default) to actual device ID so Save persists it
+                        if (!cap_devs.empty()) config.capture_device = cap_devs[selected_capture_].id;
+                        if (!play_devs.empty()) config.playback_device = play_devs[selected_playback_].id;
+                        audio_sel_init = true;
+                    }
+
+                    if (!cap_devs.empty()) {
+                        if (selected_capture_ >= (int)cap_devs.size()) selected_capture_ = 0;
+                        if (ImGui::BeginCombo("Capture Device", cap_devs[selected_capture_].name.c_str())) {
+                            for (int i = 0; i < (int)cap_devs.size(); i++)
+                                if (ImGui::Selectable(cap_devs[i].name.c_str(), i == selected_capture_)) {
                                     selected_capture_ = i;
+                                    config.capture_device = cap_devs[i].id;
+                                }
                             ImGui::EndCombo();
                         }
                     }
-                    if (!play_names.empty()) {
-                        if (selected_playback_ >= (int)play_names.size()) selected_playback_ = 0;
-                        if (ImGui::BeginCombo("Playback Device", play_names[selected_playback_].c_str())) {
-                            for (int i = 0; i < (int)play_names.size(); i++)
-                                if (ImGui::Selectable(play_names[i].c_str(), i == selected_playback_))
+                    if (!play_devs.empty()) {
+                        if (selected_playback_ >= (int)play_devs.size()) selected_playback_ = 0;
+                        if (ImGui::BeginCombo("Playback Device", play_devs[selected_playback_].name.c_str())) {
+                            for (int i = 0; i < (int)play_devs.size(); i++)
+                                if (ImGui::Selectable(play_devs[i].name.c_str(), i == selected_playback_)) {
                                     selected_playback_ = i;
+                                    config.playback_device = play_devs[i].id;
+                                }
                             ImGui::EndCombo();
                         }
                     }
@@ -856,14 +979,79 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
                 ImGui::Spacing();
 
                 if (pi == 1) {
-                    // Rig Control
-                    char hb[64];
-                    strncpy(hb, config.rigctl_host.c_str(), sizeof(hb) - 1);
-                    hb[sizeof(hb) - 1] = '\0';
-                    if (ImGui::InputText("rigctld Host", hb, sizeof(hb)))
-                        config.rigctl_host = hb;
-                    ImGui::InputInt("rigctld Port", &config.rigctl_port);
-                    ImGui::TextWrapped("Connect to Hamlib rigctld for PTT and frequency control.");
+                    // Rig Control — radio picker
+                    const auto& models = get_radio_models();
+
+                    // Find current selection index
+                    static int radio_sel = -1;
+                    static char radio_filter[64] = "";
+                    if (radio_sel < 0) {
+                        for (int j = 0; j < (int)models.size(); j++) {
+                            if (models[j].id == config.rigctld_model) { radio_sel = j; break; }
+                        }
+                        if (radio_sel < 0) radio_sel = 0;
+                    }
+
+                    const char* preview = (radio_sel >= 0 && radio_sel < (int)models.size())
+                        ? models[radio_sel].display.c_str() : "Select radio...";
+
+                    ImGui::Text("Radio:");
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+                    if (ImGui::BeginCombo("##RadioModel", preview)) {
+                        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+                        ImGui::InputTextWithHint("##filter", "Type to filter...",
+                                                  radio_filter, sizeof(radio_filter));
+                        ImGui::Separator();
+
+                        for (int j = 0; j < (int)models.size(); j++) {
+                            if (radio_filter[0] != '\0') {
+                                std::string dl = models[j].display;
+                                std::string fl = radio_filter;
+                                for (auto& c : dl) c = (char)tolower(c);
+                                for (auto& c : fl) c = (char)tolower(c);
+                                if (dl.find(fl) == std::string::npos) continue;
+                            }
+                            bool selected = (j == radio_sel);
+                            if (ImGui::Selectable(models[j].display.c_str(), selected)) {
+                                radio_sel = j;
+                                config.rigctld_model = models[j].id;
+                                radio_filter[0] = '\0';
+                            }
+                            if (selected) ImGui::SetItemDefaultFocus();
+                        }
+                        ImGui::EndCombo();
+                    }
+
+                    if (config.rigctld_model > 0) {
+                        // COM port dropdown for radio
+                        static auto rig_ports = enumerate_serial_ports();
+                        static bool rig_ports_init = false;
+                        if (!rig_ports_init) { rig_ports = enumerate_serial_ports(); rig_ports_init = true; }
+
+                        const char* cur_port = config.rigctld_device.empty()
+                            ? "(select port)" : config.rigctld_device.c_str();
+                        if (ImGui::BeginCombo("Radio Port", cur_port)) {
+                            for (const auto& p : rig_ports) {
+                                bool sel = (p == config.rigctld_device);
+                                if (ImGui::Selectable(p.c_str(), sel))
+                                    config.rigctld_device = p;
+                            }
+                            ImGui::EndCombo();
+                        }
+                        if (rig_ports.empty())
+                            ImGui::TextColored(ImVec4(1, 1, 0, 1), "No COM ports detected");
+                        ImGui::TextColored(ImVec4(0.5f, 0.7f, 1.0f, 1.0f),
+                            "Iris will auto-launch rigctld for this radio.");
+                    } else {
+                        char hb[64];
+                        strncpy(hb, config.rigctl_host.c_str(), sizeof(hb) - 1);
+                        hb[sizeof(hb) - 1] = '\0';
+                        if (ImGui::InputText("rigctld Host", hb, sizeof(hb)))
+                            config.rigctl_host = hb;
+                        ImGui::InputInt("rigctld Port", &config.rigctl_port);
+                        ImGui::TextWrapped("You manage rigctld externally.");
+                    }
                 }
 
                 if (pi == 3) {
@@ -879,46 +1067,30 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
                 }
 
                 if (pi == 4) {
-                    // Serial port
-                    char sp[64];
-                    strncpy(sp, config.serial_port.c_str(), sizeof(sp) - 1);
-                    sp[sizeof(sp) - 1] = '\0';
+                    // Serial port — use shared port enumeration
+                    static auto ser_ports = enumerate_serial_ports();
+                    static bool ser_ports_init = false;
+                    if (!ser_ports_init) { ser_ports = enumerate_serial_ports(); ser_ports_init = true; }
 
-                    // Auto-detect serial ports on Windows
-#ifdef _WIN32
-                    std::vector<std::string> com_ports;
-                    for (int c = 1; c <= 32; c++) {
-                        char pname[16];
-                        snprintf(pname, sizeof(pname), "COM%d", c);
-                        HANDLE h = CreateFileA(pname, GENERIC_READ | GENERIC_WRITE, 0,
-                                               nullptr, OPEN_EXISTING, 0, nullptr);
-                        if (h != INVALID_HANDLE_VALUE) {
-                            com_ports.push_back(pname);
-                            CloseHandle(h);
-                        }
-                    }
-                    if (!com_ports.empty()) {
-                        int sel = 0;
-                        for (int i = 0; i < (int)com_ports.size(); i++)
-                            if (com_ports[i] == config.serial_port) sel = i;
-                        if (ImGui::BeginCombo("Serial Port", com_ports.empty() ? "(none)" :
-                                              com_ports[sel].c_str())) {
-                            for (int i = 0; i < (int)com_ports.size(); i++)
-                                if (ImGui::Selectable(com_ports[i].c_str(), i == sel)) {
-                                    config.serial_port = com_ports[i];
-                                }
+                    if (!ser_ports.empty()) {
+                        const char* cur = config.serial_port.empty()
+                            ? "(select port)" : config.serial_port.c_str();
+                        if (ImGui::BeginCombo("Serial Port", cur)) {
+                            for (const auto& p : ser_ports) {
+                                bool sel = (p == config.serial_port);
+                                if (ImGui::Selectable(p.c_str(), sel))
+                                    config.serial_port = p;
+                            }
                             ImGui::EndCombo();
                         }
                     } else {
+                        char sp[64];
+                        strncpy(sp, config.serial_port.c_str(), sizeof(sp) - 1);
+                        sp[sizeof(sp) - 1] = '\0';
                         if (ImGui::InputText("Serial Port", sp, sizeof(sp)))
                             config.serial_port = sp;
-                        ImGui::TextColored(ImVec4(1, 1, 0, 1), "No COM ports detected");
+                        ImGui::TextColored(ImVec4(1, 1, 0, 1), "No serial ports detected");
                     }
-#else
-                    if (ImGui::InputText("Serial Port", sp, sizeof(sp)))
-                        config.serial_port = sp;
-                    ImGui::TextWrapped("e.g. /dev/ttyUSB0, /dev/ttyAMA0");
-#endif
 
                     const char* ptt_lines[] = {"RTS", "DTR"};
                     if (ImGui::Combo("PTT Line", &config.serial_ptt_line, ptt_lines, 2)) {}
@@ -939,18 +1111,12 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
                 ImGui::Separator();
                 ImGui::Spacing();
                 ImGui::Text("AX.25 Timing");
-                ImGui::SliderInt("TXDelay (ms)", &config.ptt_pre_delay_ms, 0, 1000);
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Delay after keying PTT before sending data");
-                ImGui::SliderInt("TXTail (ms)", &config.ptt_post_delay_ms, 0, 500);
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Extra TX time after data before releasing PTT");
-                ImGui::SliderInt("SlotTime (ms)", &config.slottime_ms, 10, 500);
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("CSMA channel access slot time");
-                ImGui::SliderInt("Persist", &config.persist, 0, 255);
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("p-persistence 0-255 (63 = 25%% chance per slot)");
+                ImGui::Text("TXDelay:  %d ms", config.ptt_pre_delay_ms);
+                ImGui::Text("TXTail:   %d ms", config.ptt_post_delay_ms);
+                ImGui::Text("SlotTime: %d ms", config.slottime_ms);
+                ImGui::Text("Persist:  %d", config.persist);
+                ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
+                    "These values are set by your KISS host (Winlink, etc).");
 
                 ImGui::EndTabItem();
             }
@@ -986,33 +1152,35 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
             // --- Advanced Tab ---
             if (ImGui::BeginTabItem("Advanced")) {
                 ImGui::Spacing();
+                ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x);
                 ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
                     "These are development settings. Changing them may cause "
                     "incompatibility with other modems. All stations in a "
                     "session must use identical settings.");
+                ImGui::PopTextWrapPos();
                 ImGui::Spacing();
                 ImGui::Separator();
                 ImGui::Spacing();
 
-                ImGui::Text("Frequency Configuration");
-                ImGui::SliderFloat("Low Edge (Hz)", &config.band_low_hz, 200.0f, 1000.0f, "%.0f Hz");
-                ImGui::SliderFloat("High Edge (Hz)", &config.band_high_hz, 2000.0f, 5000.0f, "%.0f Hz");
-
-                // Center frequency: show "Auto" when at 0
-                char center_label[32];
-                if (config.center_freq_hz < 1.0f)
-                    snprintf(center_label, sizeof(center_label), "Auto (%.0f Hz)",
-                             (config.band_low_hz + config.band_high_hz) / 2.0f);
-                else
-                    snprintf(center_label, sizeof(center_label), "%.0f Hz", config.center_freq_hz);
-                ImGui::SliderFloat("Center Freq", &config.center_freq_hz, 0.0f, 4000.0f, center_label);
-
+                // Band edges — auto-negotiated by probe, with manual override option
+                ImGui::Text("Frequency Band");
                 float bw = (config.band_high_hz - config.band_low_hz);
                 ImGui::TextColored(ImVec4(0.5f, 0.7f, 1.0f, 1.0f),
-                    "Bandwidth: %.0f Hz (%.0f - %.0f)", bw, config.band_low_hz, config.band_high_hz);
-                if (config.band_low_hz < 255.0f)
-                    ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
-                        "Warning: Low edge below CTCSS max (254 Hz)!");
+                    "Current: %.0f - %.0f Hz (%.0f Hz BW)",
+                    config.band_low_hz, config.band_high_hz, bw);
+
+                static bool manual_override = false;
+                ImGui::Checkbox("Manual band edge override", &manual_override);
+                if (manual_override) {
+                    ImGui::SliderFloat("Low Edge (Hz)", &config.band_low_hz, 200.0f, 1000.0f, "%.0f Hz");
+                    ImGui::SliderFloat("High Edge (Hz)", &config.band_high_hz, 2000.0f, 5000.0f, "%.0f Hz");
+                    if (config.band_low_hz < 255.0f)
+                        ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
+                            "Warning: Low edge below CTCSS max (254 Hz)!");
+                } else {
+                    ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
+                        "Auto-negotiated by passband probe during connection.");
+                }
 
                 ImGui::Spacing();
                 ImGui::Separator();
@@ -1030,14 +1198,46 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
 
         ImGui::Spacing();
         ImGui::Separator();
-        if (ImGui::Button("Save & Close", ImVec2(120, 0))) {
+        if (ImGui::Button("Save & Restart", ImVec2(130, 0))) {
             if (callbacks_.on_config_changed) callbacks_.on_config_changed(config);
+            config_dirty_ = false;
             show_config_ = false;
         }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Save settings and restart the modem");
         ImGui::SameLine();
         if (ImGui::Button("Cancel", ImVec2(80, 0))) {
             show_config_ = false;
         }
+
+        // Detect if user closed via X button (show_config_ was set false by ImGui)
+        if (!show_config_ && config_dirty_) {
+            // Re-open to show save prompt
+            show_config_ = true;
+            ImGui::OpenPopup("Unsaved Changes");
+        }
+        if (ImGui::BeginPopupModal("Unsaved Changes", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::Text("You have unsaved changes. Save before closing?");
+            ImGui::Spacing();
+            if (ImGui::Button("Save & Restart", ImVec2(130, 0))) {
+                if (callbacks_.on_config_changed) callbacks_.on_config_changed(config);
+                config_dirty_ = false;
+                show_config_ = false;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Discard", ImVec2(80, 0))) {
+                config_dirty_ = false;
+                show_config_ = false;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", ImVec2(80, 0))) {
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+
         ImGui::End();
     }
 }

@@ -55,6 +55,14 @@ public:
 
     // Blocking write (alternative to callback)
     virtual int write(const float* buffer, int frame_count) = 0;
+
+    // Mark the current point in the audio pipeline. All audio produced before
+    // this call must play out before is_drained() returns true.
+    virtual void mark_drain() {}
+
+    // Returns true when all audio produced before mark_drain() has been rendered.
+    // Default: always true (no pipeline tracking).
+    virtual bool is_drained() const { return true; }
 };
 
 // Platform-specific factory

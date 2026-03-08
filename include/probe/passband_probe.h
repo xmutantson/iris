@@ -8,19 +8,22 @@
 
 namespace iris {
 
-// Automatic passband discovery via multi-tone probe.
+// Automatic passband discovery via multi-tone probe (Mode A only).
 //
-// Sends 64 tones from 200-4500 Hz simultaneously. The receiver FFTs the
+// Sends 64 tones from 300-4500 Hz simultaneously. The receiver FFTs the
 // captured audio, detects which tones survived the radio's filters, and
 // reports back the usable frequency range. Both sides probe, both sides
 // report, then the intersection becomes the operating bandwidth.
+//
+// Mode A only: audio-coupled FM radios have passband within 300-4500 Hz.
+// Mode B (9600 baud) has minimal filtering; Mode C is not yet implemented.
 
 struct PassbandProbeConfig {
     static constexpr int N_TONES = 64;
-    static constexpr float TONE_LOW_HZ = 200.0f;
+    static constexpr float TONE_LOW_HZ = 300.0f;
     static constexpr float TONE_HIGH_HZ = 4500.0f;
     static constexpr float TONE_SPACING_HZ =
-        (TONE_HIGH_HZ - TONE_LOW_HZ) / (N_TONES - 1);  // ~68.25 Hz
+        (TONE_HIGH_HZ - TONE_LOW_HZ) / (N_TONES - 1);  // ~66.7 Hz
     static constexpr float PROBE_DURATION_S = 0.75f;     // 750ms probe burst
     static constexpr float DETECT_THRESHOLD_DB = 10.0f;  // Above noise floor
     static constexpr float EDGE_MARGIN_HZ = 50.0f;       // Safety margin
@@ -51,7 +54,7 @@ struct NegotiatedPassband {
     ProbeResult their_tx_my_rx;   // What we heard from them
 };
 
-// Generate a multi-tone probe signal (all 64 tones superimposed)
+// Generate a multi-tone probe signal (all tones superimposed)
 // Output: float samples at given sample rate
 // Returns number of samples written
 int probe_generate(float* out, int max_samples, int sample_rate,
@@ -69,8 +72,8 @@ NegotiatedPassband probe_negotiate(const ProbeResult& a_to_b,
                                     const ProbeResult& b_to_a);
 
 // Serialize/deserialize ProbeResult for AX.25 transport
-// Wire format: 1 byte magic (0xBB) + 4 bytes low_hz + 4 bytes high_hz
-//            + 1 byte n_tones + 64 bits (tone_detected bitmap) = 18 bytes
+// Wire format: 1 byte magic (0xBC) + 4 bytes low_hz + 4 bytes high_hz
+//            + 2 bytes n_tones + 8 bytes (64-bit tone bitmap) = 19 bytes
 std::vector<uint8_t> probe_result_encode(const ProbeResult& r);
 bool probe_result_decode(const uint8_t* data, size_t len, ProbeResult& r);
 

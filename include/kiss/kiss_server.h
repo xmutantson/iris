@@ -22,6 +22,10 @@ public:
     using TxCallback = std::function<void(const uint8_t* frame, size_t len)>;
     void set_tx_callback(TxCallback cb) { tx_callback_ = cb; }
 
+    // Called when a KISS parameter command arrives (TXDELAY, P, SLOT, TXTAIL, etc.)
+    using ParamCallback = std::function<void(uint8_t cmd, uint8_t value)>;
+    void set_param_callback(ParamCallback cb) { param_callback_ = cb; }
+
     // Start listening on the given port
     bool start(int port = 8001);
     void stop();
@@ -40,6 +44,7 @@ private:
     std::atomic<bool> running_{false};
     std::thread accept_thread_;
     TxCallback tx_callback_;
+    ParamCallback param_callback_;
 
     std::mutex clients_mutex_;
     std::vector<int> client_sockets_;

@@ -41,6 +41,7 @@ private:
     int sample_rate_;
     int samples_per_bit_;
     float clock_phase_;
+    float clock_freq_;   // 2nd-order PLL: frequency tracking
     float prev_sample_;
 };
 

@@ -13,9 +13,10 @@ PhyConfig mode_b_config() {
 }
 
 PhyConfig mode_c_config() {
-    // 19200 baud needs higher sample rate or fractional SPS
-    // At 48kHz, SPS=2.5 — we'll use SPS=5 with 96kHz or approximate at 48kHz
-    // For now, use 9600 baud with higher-order QAM for similar throughput
+    // v2 future work: Mode C targets full FM channel bandwidth via SDR.
+    // 19200 baud needs 96 kHz sample rate (SPS=5) — no practical VHF/UHF SDR
+    // transceivers exist yet. See Mode C-Linear in spec for near-term alternative.
+    // Placeholder: 9600 baud with higher-order QAM at 48 kHz.
     return {9600, SAMPLE_RATE / 9600, Modulation::QAM16, RRC_ALPHA};
 }
 

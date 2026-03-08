@@ -138,6 +138,22 @@ private:
         }
         if (FAILED(hr)) { printf("[Audio] Capture: device %d not found 0x%08lx\n", device_id_, hr); enumerator->Release(); running_ = false; return; }
 
+        // Log device friendly name
+        {
+            IPropertyStore* props = nullptr;
+            if (SUCCEEDED(device->OpenPropertyStore(STGM_READ, &props))) {
+                PROPVARIANT name;
+                PropVariantInit(&name);
+                if (SUCCEEDED(props->GetValue(PKEY_Device_FriendlyName, &name)) && name.vt == VT_LPWSTR) {
+                    char nbuf[256];
+                    WideCharToMultiByte(CP_UTF8, 0, name.pwszVal, -1, nbuf, sizeof(nbuf), nullptr, nullptr);
+                    printf("[Audio] Capture device name: %s\n", nbuf);
+                }
+                PropVariantClear(&name);
+                props->Release();
+            }
+        }
+
         hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
                               (void**)&client);
         if (FAILED(hr)) { printf("[Audio] Capture: Activate failed 0x%08lx\n", hr); device->Release(); enumerator->Release(); running_ = false; return; }
@@ -280,6 +296,15 @@ public:
         return 0;  // Use callback mode
     }
 
+    void mark_drain() override {
+        drain_mark_.store(frames_produced_.load());
+    }
+
+    bool is_drained() const override {
+        int64_t mark = drain_mark_.load();
+        return mark < 0 || frames_rendered_.load() >= mark;
+    }
+
 private:
     // Producer thread: generates TX samples via callback into FIFO
     void producer_thread_func() {
@@ -325,6 +350,7 @@ private:
                 std::lock_guard<std::mutex> lock(fifo_mutex_);
                 fifo_.insert(fifo_.end(), buf.begin(), buf.end());
             }
+            frames_produced_ += chunk_frames;
             fifo_cv_.notify_one();
         }
     }
@@ -354,6 +380,22 @@ private:
             hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
         }
         if (FAILED(hr)) { printf("[Audio] Playback: device %d not found 0x%08lx\n", device_id_, hr); enumerator->Release(); running_ = false; return; }
+
+        // Log device friendly name
+        {
+            IPropertyStore* props = nullptr;
+            if (SUCCEEDED(device->OpenPropertyStore(STGM_READ, &props))) {
+                PROPVARIANT name;
+                PropVariantInit(&name);
+                if (SUCCEEDED(props->GetValue(PKEY_Device_FriendlyName, &name)) && name.vt == VT_LPWSTR) {
+                    char nbuf[256];
+                    WideCharToMultiByte(CP_UTF8, 0, name.pwszVal, -1, nbuf, sizeof(nbuf), nullptr, nullptr);
+                    printf("[Audio] Playback device name: %s\n", nbuf);
+                }
+                PropVariantClear(&name);
+                props->Release();
+            }
+        }
 
         hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
                               (void**)&client);
@@ -428,6 +470,8 @@ private:
                     fifo_.erase(fifo_.begin(), fifo_.begin() + copied);
                 }
             }
+            if (copied > 0)
+                frames_rendered_ += (int64_t)(copied / channels);
             producer_cv_.notify_one();
 
             // Zero-fill any remainder (underrun)
@@ -460,10 +504,13 @@ private:
     AudioCallback callback_;
     std::thread render_thread_;
     std::thread producer_thread_;
-    std::mutex fifo_mutex_;
+    mutable std::mutex fifo_mutex_;
     std::condition_variable fifo_cv_;
     std::condition_variable producer_cv_;
     std::vector<float> fifo_;
+    std::atomic<int64_t> frames_produced_{0};
+    std::atomic<int64_t> frames_rendered_{0};
+    std::atomic<int64_t> drain_mark_{-1};  // -1 = no drain pending
 };
 
 // Device enumeration

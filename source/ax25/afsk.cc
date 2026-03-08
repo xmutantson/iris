@@ -83,7 +83,9 @@ std::vector<uint8_t> AfskDemodulator::demodulate(const float* samples, size_t co
         if (space_phase_ > 2.0f * M_PI) space_phase_ -= 2.0f * M_PI;
 
         // Leaky integrator with time constant = 1 bit period
-        float alpha = 2.0f / samples_per_bit_;
+        // alpha = 1/sps gives -3dB at f_baud (correct for bit-rate matched detection)
+        // alpha = 2/sps was too aggressive, causing inter-symbol bleed
+        float alpha = 1.0f / samples_per_bit_;
         mark_i_  += alpha * (mi - mark_i_);
         mark_q_  += alpha * (mq - mark_q_);
         space_i_ += alpha * (si - space_i_);

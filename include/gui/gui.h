@@ -62,6 +62,14 @@ private:
     bool show_config_ = false;
     bool show_log_ = false;
     int settings_tab_ = 0;
+
+    // Waterfall scrolling history (rows x bins)
+    static constexpr int WF_HISTORY = 100;  // rows of history
+    std::vector<std::vector<float>> wf_history_;
+
+    // Config snapshot for dirty detection
+    IrisConfig config_snapshot_;
+    bool config_dirty_ = false;
 };
 
 } // namespace iris

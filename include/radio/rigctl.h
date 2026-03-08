@@ -4,8 +4,14 @@
 #include <string>
 #include <cstdint>
 #include <memory>
+#include <vector>
+#include <functional>
 
 namespace iris {
+
+// Global log callback for rigctl messages (set by main to forward to GUI)
+void rigctl_set_log_callback(std::function<void(const std::string&)> cb);
+
 
 // PTT control via hamlib rigctld TCP protocol
 class RigCtl {
@@ -48,7 +54,8 @@ public:
 // rigctl-based PTT
 class RigctlPtt : public PttController {
 public:
-    RigctlPtt(const std::string& host, int port);
+    RigctlPtt(const std::string& host, int port, int model = 0,
+              const std::string& device = "");
     ~RigctlPtt() override;
     bool set_ptt(bool tx) override;
     bool get_ptt() const override;
@@ -105,12 +112,31 @@ private:
     bool state_ = false;
 };
 
+// Shutdown auto-launched rigctld (call at exit)
+void rigctld_shutdown();
+
+// Radio model entry from rigctld --list
+struct RadioModel {
+    int id;
+    std::string manufacturer;
+    std::string model;
+    std::string display;  // "Manufacturer Model"
+};
+
+// Query rigctld for supported radio models (cached after first call)
+const std::vector<RadioModel>& get_radio_models();
+
+// Enumerate available serial/COM ports on the system
+std::vector<std::string> enumerate_serial_ports();
+
 // Factory
 std::unique_ptr<PttController> create_ptt(const std::string& method,
                                            const std::string& host = "localhost",
                                            int port = 4532,
                                            const std::string& serial_port = "",
-                                           int serial_baud = 9600);
+                                           int serial_baud = 9600,
+                                           int rigctld_model = 0,
+                                           const std::string& rigctld_device = "");
 
 } // namespace iris
 

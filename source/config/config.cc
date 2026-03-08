@@ -131,6 +131,8 @@ IrisConfig load_config(const std::string& path) {
     cfg.ptt_method = ini.get("Radio", "PTTMethod", cfg.ptt_method);
     cfg.rigctl_host = ini.get("Radio", "RigctlHost", cfg.rigctl_host);
     cfg.rigctl_port = ini.get_int("Radio", "RigctlPort", cfg.rigctl_port);
+    cfg.rigctld_model = ini.get_int("Radio", "RigctldModel", cfg.rigctld_model);
+    cfg.rigctld_device = ini.get("Radio", "RigctldDevice", cfg.rigctld_device);
     cfg.serial_port = ini.get("Radio", "SerialPort", cfg.serial_port);
     cfg.serial_baud = ini.get_int("Radio", "SerialBaud", cfg.serial_baud);
     cfg.ptt_pre_delay_ms = ini.get_int("Radio", "TXDelay", cfg.ptt_pre_delay_ms);
@@ -149,6 +151,7 @@ IrisConfig load_config(const std::string& path) {
     cfg.center_freq_hz = ini.get_float("Modem", "CenterFreqHz", cfg.center_freq_hz);
 
     cfg.b2f_unroll = ini.get_bool("Modem", "B2FUnroll", cfg.b2f_unroll);
+    cfg.native_hail = ini.get_bool("Modem", "NativeHail", cfg.native_hail);
 
     cfg.calibrated_tx_level = ini.get_float("Calibration", "TxLevel", cfg.calibrated_tx_level);
 
@@ -180,6 +183,8 @@ bool save_config(const std::string& path, const IrisConfig& cfg) {
     ini.set("Radio", "PTTMethod", cfg.ptt_method);
     ini.set("Radio", "RigctlHost", cfg.rigctl_host);
     ini.set_int("Radio", "RigctlPort", cfg.rigctl_port);
+    ini.set_int("Radio", "RigctldModel", cfg.rigctld_model);
+    ini.set("Radio", "RigctldDevice", cfg.rigctld_device);
     ini.set("Radio", "SerialPort", cfg.serial_port);
     ini.set_int("Radio", "SerialBaud", cfg.serial_baud);
     ini.set_int("Radio", "TXDelay", cfg.ptt_pre_delay_ms);
@@ -198,6 +203,7 @@ bool save_config(const std::string& path, const IrisConfig& cfg) {
     ini.set_float("Modem", "CenterFreqHz", cfg.center_freq_hz);
 
     ini.set_bool("Modem", "B2FUnroll", cfg.b2f_unroll);
+    ini.set_bool("Modem", "NativeHail", cfg.native_hail);
 
     ini.set_float("Calibration", "TxLevel", cfg.calibrated_tx_level);
 

@@ -60,6 +60,7 @@ public:
     const std::string& remote_callsign() const { return remote_call_; }
     int pending_frames() const;
     bool is_active() const { return state_ != Ax25SessionState::DISCONNECTED; }
+    int retry_count() const { return retry_count_; }
 
 private:
     void set_state(Ax25SessionState s);

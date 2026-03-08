@@ -107,6 +107,8 @@ void KissServer::client_thread(int sock) {
         (void)port;
         if (cmd == KISS_CMD_DATA && tx_callback_) {
             tx_callback_(data, len);
+        } else if (cmd >= KISS_CMD_TXDELAY && cmd <= KISS_CMD_DUPLEX && len >= 1 && param_callback_) {
+            param_callback_(cmd, data[0]);
         }
     });
 

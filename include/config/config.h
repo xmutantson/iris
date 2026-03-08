@@ -37,6 +37,8 @@ struct IrisConfig {
     std::string ptt_method = "none";   // none, rigctl, vox, cm108, serial
     std::string rigctl_host = "localhost";
     int rigctl_port = 4532;
+    int rigctld_model = 0;          // Hamlib model number (0 = external rigctld, user manages it)
+    std::string rigctld_device;     // Serial port for rigctld to open (e.g., COM3)
     std::string serial_port;
     int serial_baud = 9600;
     int serial_ptt_line = 0;    // 0=RTS, 1=DTR
@@ -56,11 +58,20 @@ struct IrisConfig {
     int encryption_mode = 0;     // 0=off, 1=strict (hybrid KX before data), 2=fast (classical-first)
     std::string psk_hex;         // Pre-shared key in hex (up to 128 chars = 64 bytes)
 
+    // Native hail: use native PHY (BPSK+LDPC) for HAIL/CONNECT instead of AFSK
+    // ~10 dB better sensitivity than 1200 baud AFSK. Both sides must enable.
+    bool native_hail = false;
+
     // B2F
     bool b2f_unroll = true;      // Enable B2F LZHUF unroll/reroll for Winlink
 
     // Calibration
     float calibrated_tx_level = -1.0f;  // -1 = not calibrated
+
+    // Test: simulated radio bandpass filter (--bandpass low-high)
+    // When set, all TX audio is bandpass-filtered to simulate radio passband.
+    float sim_bandpass_low = 0.0f;   // 0 = disabled
+    float sim_bandpass_high = 0.0f;
 
     // Logging
     bool log_enabled = false;    // Auto-log to AppData/Iris/logs/

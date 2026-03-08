@@ -381,12 +381,15 @@ int Compressor::compress_block(const uint8_t* in, int in_len, uint8_t* out, int 
         memcpy(out + hdr_size, workspace_ + best_offset, best_comp_size);
 
     if (best_algo != COMPRESS_ALGO_RAW) {
+        last_ratio_ = (float)in_len / (float)best_comp_size;
         printf("[COMPRESS] %d -> %d bytes (%s%s, entropy=%.1f, ratio=%.1fx)\n",
                in_len, total,
                best_algo == COMPRESS_ALGO_PPMD ? "PPMd" : "zstd",
                (streaming_active_ && stream_batch_count_ > 0) ? "+stream" : "",
-               entropy, (float)in_len / (float)best_comp_size);
+               entropy, last_ratio_);
         fflush(stdout);
+    } else {
+        last_ratio_ = 0;
     }
 
     return total;

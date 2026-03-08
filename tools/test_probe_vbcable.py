@@ -7,6 +7,11 @@ TX mute prevents self-hearing. STA-A connects to STA-B via AGW,
 triggering XID handshake which auto-triggers the passband probe.
 Checks logs for probe completion.
 
+Usage:
+  python test_probe_vbcable.py                    # No filters (full bandwidth)
+  python test_probe_vbcable.py 300-3000 200-3500  # STA-A=300-3000, STA-B=200-3500
+  python test_probe_vbcable.py 300-3000           # STA-A=300-3000, STA-B=unfiltered
+
 Requires: VB-Cable virtual audio cable.
 """
 import subprocess, socket, struct, time, sys, os, re
@@ -54,6 +59,14 @@ def main():
         print(f"[ERROR] Not found: {iris}")
         return 1
 
+    # Parse optional bandpass filters from CLI args
+    bp_a = None  # "low-high" string for STA-A
+    bp_b = None  # "low-high" string for STA-B
+    if len(sys.argv) >= 2:
+        bp_a = sys.argv[1]
+    if len(sys.argv) >= 3:
+        bp_b = sys.argv[2]
+
     # Kill any existing iris
     os.system("taskkill /F /IM iris.exe 2>nul >nul")
     time.sleep(2)
@@ -69,6 +82,9 @@ def main():
     print("=" * 60)
     print("  Iris Passband Probe Test (VB-Cable)")
     print("=" * 60)
+    if bp_a or bp_b:
+        print(f"  STA-A bandpass: {bp_a or 'none'}")
+        print(f"  STA-B bandpass: {bp_b or 'none'}")
 
     # Start STA-B first (responder/listener)
     print("\n[1] Starting STA-B (responder)...")
@@ -82,6 +98,8 @@ def main():
         "--agw-port", str(STA_B_AGW),
         "--log", log_b,
     ]
+    if bp_b:
+        cmd_b.extend(["--bandpass", bp_b])
     fa_out = open(log_b + ".stdout", "w")
     proc_b = subprocess.Popen(cmd_b, stdout=fa_out, stderr=subprocess.STDOUT)
     time.sleep(5)
@@ -98,6 +116,8 @@ def main():
         "--agw-port", str(STA_A_AGW),
         "--log", log_a,
     ]
+    if bp_a:
+        cmd_a.extend(["--bandpass", bp_a])
     fb_out = open(log_a + ".stdout", "w")
     proc_a = subprocess.Popen(cmd_a, stdout=fb_out, stderr=subprocess.STDOUT)
     time.sleep(5)
@@ -176,7 +196,7 @@ def main():
             with open(log_path, encoding='utf-8', errors='replace') as f:
                 for l in f:
                     l = l.rstrip()
-                    if "[PROBE]" in l or "XID" in l or "native" in l.lower() or "probe" in l.lower():
+                    if "[PROBE]" in l or "XID" in l or "native" in l.lower() or "probe" in l.lower() or "bandpass" in l.lower() or "baud" in l.lower():
                         all_lines.append(l)
         if all_lines:
             for l in all_lines:

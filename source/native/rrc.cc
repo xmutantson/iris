@@ -32,11 +32,12 @@ std::vector<float> rrc_filter(float alpha, int span, int sps) {
         norm += h[i] * h[i];
     }
 
-    // Normalize to unit energy
-    norm = std::sqrt(norm);
-    if (norm > 0) {
+    // Normalize to unit energy: matched TX/RX pair gives peak = 1 at symbol center
+    // This is the correct normalization for pulse-shaping matched filters.
+    float energy = std::sqrt(norm);
+    if (energy > 0) {
         for (int i = 0; i < len; i++)
-            h[i] /= norm;
+            h[i] /= energy;
     }
 
     return h;

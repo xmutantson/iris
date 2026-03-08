@@ -53,6 +53,7 @@ public:
     bool is_streaming() const { return streaming_active_; }
     int get_header_size() const { return streaming_active_ ? COMPRESS_HEADER_SIZE : COMPRESS_HEADER_SIZE_LEGACY; }
     bool is_initialized() const { return initialized_; }
+    float last_ratio() const { return last_ratio_; }  // Last compression ratio (0 if no compression)
 
     // Shannon entropy (bits per byte)
     static float quick_entropy(const uint8_t* data, int len);
@@ -79,6 +80,7 @@ private:
     uint8_t* pending_raw_;
     int pending_raw_len_;
     int pending_raw_capacity_;
+    float last_ratio_ = 0;  // Last compression ratio (in_len / compressed_len)
 };
 
 // Legacy simple API (wraps Compressor for backward compatibility)

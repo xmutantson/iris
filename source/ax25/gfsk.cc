@@ -70,10 +70,12 @@ GfskDemodulator::GfskDemodulator(int sample_rate)
     : sample_rate_(sample_rate),
       samples_per_bit_(sample_rate / GFSK_BAUD),
       clock_phase_(0),
+      clock_freq_(1.0f / (sample_rate / GFSK_BAUD)),
       prev_sample_(0) {}
 
 void GfskDemodulator::reset() {
     clock_phase_ = 0;
+    clock_freq_ = 1.0f / samples_per_bit_;
     prev_sample_ = 0;
 }
 
@@ -83,13 +85,17 @@ std::vector<uint8_t> GfskDemodulator::demodulate(const float* samples, size_t co
     for (size_t i = 0; i < count; i++) {
         float s = samples[i];
 
-        // Clock recovery with zero-crossing PLL
-        clock_phase_ += 1.0f / samples_per_bit_;
+        // 2nd-order clock recovery PLL with damping
+        // Proportional (alpha) corrects phase, integral (beta) tracks frequency drift
+        constexpr float pll_alpha = 0.15f;   // Phase gain (damped from 0.3)
+        constexpr float pll_beta  = 0.005f;  // Frequency gain
+        clock_phase_ += clock_freq_;
 
         // Detect zero crossing for clock adjustment
         if ((prev_sample_ > 0 && s <= 0) || (prev_sample_ <= 0 && s > 0)) {
             float error = clock_phase_ - 0.5f;
-            clock_phase_ -= error * 0.3f;
+            clock_phase_ -= pll_alpha * error;
+            clock_freq_  -= pll_beta * error;
         }
 
         if (clock_phase_ >= 1.0f) {

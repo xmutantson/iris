@@ -19,22 +19,29 @@ int probe_generate(float* out, int max_samples, int sample_rate,
     int n_samples = (int)(PassbandProbeConfig::PROBE_DURATION_S * sample_rate);
     if (n_samples > max_samples) n_samples = max_samples;
 
-    // Per-tone amplitude (divide by sqrt(N) to keep total RMS reasonable)
-    float tone_amp = amplitude / std::sqrt((float)PassbandProbeConfig::N_TONES);
+    // 64 tones — sqrt(N) = 8 normalization keeps each tone clean and loud.
+    // No clipping needed: peak-to-RMS ratio of N equal tones is sqrt(N),
+    // so dividing by sqrt(N) keeps peaks at ±1.
+    float norm = std::sqrt((float)PassbandProbeConfig::N_TONES);
 
-    // Hann window for clean edges (no clicks)
-    auto hann = [&](int i) -> float {
-        return 0.5f * (1.0f - std::cos(2.0 * M_PI * i / (n_samples - 1)));
-    };
+    // Hann ramp for first/last 5% to avoid clicks
+    int ramp = n_samples / 20;
 
     for (int i = 0; i < n_samples; i++) {
         float t = (float)i / sample_rate;
         float sample = 0.0f;
         for (int k = 0; k < PassbandProbeConfig::N_TONES; k++) {
             float freq = probe_tone_freq(k);
-            sample += tone_amp * std::sin(2.0f * (float)M_PI * freq * t);
+            sample += std::sin(2.0f * (float)M_PI * freq * t);
         }
-        out[i] = sample * hann(i);
+        sample /= norm;
+
+        // Ramp edges
+        float env = 1.0f;
+        if (i < ramp) env = (float)i / ramp;
+        else if (i > n_samples - ramp) env = (float)(n_samples - i) / ramp;
+
+        out[i] = sample * amplitude * env;
     }
 
     return n_samples;
@@ -81,10 +88,11 @@ static void fft_inplace(float* re, float* im, int n) {
 ProbeResult probe_analyze(const float* samples, int n_samples, int sample_rate) {
     ProbeResult result;
 
-    // Use FFT size = next power of 2 >= n_samples (cap at 8192)
+    // Use FFT size = next power of 2 >= n_samples (cap at 32768)
+    // At 48kHz: 32768-pt FFT = 1.46 Hz bins, plenty for 67 Hz tone spacing
     int fft_n = 4096;
-    while (fft_n < n_samples && fft_n < 8192) fft_n <<= 1;
-    if (fft_n > 8192) fft_n = 8192;
+    while (fft_n < n_samples && fft_n < 32768) fft_n <<= 1;
+    if (fft_n > 32768) fft_n = 32768;
 
     std::vector<float> re(fft_n, 0.0f), im(fft_n, 0.0f);
 
@@ -103,7 +111,8 @@ ProbeResult probe_analyze(const float* samples, int n_samples, int sample_rate) 
     std::vector<float> power_db(n_pos);
     for (int i = 0; i < n_pos; i++) {
         float mag2 = re[i] * re[i] + im[i] * im[i];
-        power_db[i] = 10.0f * std::log10(mag2 / (fft_n * fft_n) + 1e-20f);
+        float norm2 = (float)fft_n * (float)fft_n;
+        power_db[i] = 10.0f * std::log10(mag2 / norm2 + 1e-20f);
     }
 
     // Estimate noise floor: median of all bins in our range
@@ -117,16 +126,20 @@ ProbeResult probe_analyze(const float* samples, int n_samples, int sample_rate) 
     float noise_floor = range_powers.empty() ? -80.0f :
                         range_powers[range_powers.size() / 4];  // 25th percentile
 
-    // Check each expected tone frequency
-    float threshold = noise_floor + PassbandProbeConfig::DETECT_THRESHOLD_DB;
+    // Two-pass detection:
+    // Pass 1: measure each tone's power and find the peak.
+    // Pass 2: detect tones within DETECT_THRESHOLD_DB of the peak.
+    // This relative approach works in both zero-noise (VB-Cable) and
+    // real-radio environments without needing absolute floor tuning.
     int first_detected = -1, last_detected = -1;
 
+    // Pass 1: measure per-tone power, find peak
+    float peak_tone_power = -100.0f;
     for (int k = 0; k < PassbandProbeConfig::N_TONES; k++) {
         float freq = probe_tone_freq(k);
         int bin = (int)(freq / bin_hz + 0.5f);
         if (bin < 0 || bin >= n_pos) {
-            result.tone_power_db[k] = -80.0f;
-            result.tone_detected[k] = false;
+            result.tone_power_db[k] = -100.0f;
             continue;
         }
 
@@ -136,8 +149,13 @@ ProbeResult probe_analyze(const float* samples, int n_samples, int sample_rate) 
         if (bin < n_pos - 1) peak = std::max(peak, power_db[bin + 1]);
 
         result.tone_power_db[k] = peak;
-        result.tone_detected[k] = (peak >= threshold);
+        if (peak > peak_tone_power) peak_tone_power = peak;
+    }
 
+    // Pass 2: detect tones within threshold of peak
+    float threshold = peak_tone_power - PassbandProbeConfig::DETECT_THRESHOLD_DB;
+    for (int k = 0; k < PassbandProbeConfig::N_TONES; k++) {
+        result.tone_detected[k] = (result.tone_power_db[k] >= threshold);
         if (result.tone_detected[k]) {
             if (first_detected < 0) first_detected = k;
             last_detected = k;
@@ -150,6 +168,7 @@ ProbeResult probe_analyze(const float* samples, int n_samples, int sample_rate) 
         result.high_hz = probe_tone_freq(last_detected);
         result.valid = (result.tones_detected >= 3);  // Need at least 3 tones
     }
+
 
     return result;
 }
@@ -207,15 +226,20 @@ static float get_f32(const uint8_t* p) {
 }
 
 std::vector<uint8_t> probe_result_encode(const ProbeResult& r) {
+    // Wire format: magic(1) + low_hz(4) + high_hz(4) + n_tones_le16(2) + bitmap(N_TONES/8)
+    constexpr int BITMAP_BYTES = (PassbandProbeConfig::N_TONES + 7) / 8;  // 8 for 64 tones
+    constexpr int TOTAL = 1 + 4 + 4 + 2 + BITMAP_BYTES;                  // 19 bytes
+
     std::vector<uint8_t> out;
-    out.reserve(18);
-    out.push_back(0xBB);              // Magic
+    out.reserve(TOTAL);
+    out.push_back(0xBC);              // Magic (0xBC = v2 with 16-bit tone count)
     put_f32(out, r.low_hz);           // 4 bytes
     put_f32(out, r.high_hz);          // 4 bytes
-    out.push_back((uint8_t)r.tones_detected);  // 1 byte
+    out.push_back((uint8_t)(r.tones_detected & 0xFF));        // low byte
+    out.push_back((uint8_t)((r.tones_detected >> 8) & 0xFF)); // high byte
 
-    // 64-bit bitmap of detected tones (8 bytes)
-    for (int byte = 0; byte < 8; byte++) {
+    // Bitmap of detected tones
+    for (int byte = 0; byte < BITMAP_BYTES; byte++) {
         uint8_t b = 0;
         for (int bit = 0; bit < 8; bit++) {
             int idx = byte * 8 + bit;
@@ -225,18 +249,20 @@ std::vector<uint8_t> probe_result_encode(const ProbeResult& r) {
         out.push_back(b);
     }
 
-    return out;  // 18 bytes total
+    return out;
 }
 
 bool probe_result_decode(const uint8_t* data, size_t len, ProbeResult& r) {
-    if (len < 18 || data[0] != 0xBB) return false;
+    constexpr int BITMAP_BYTES = (PassbandProbeConfig::N_TONES + 7) / 8;
+    constexpr int TOTAL = 1 + 4 + 4 + 2 + BITMAP_BYTES;
+    if (len < (size_t)TOTAL || data[0] != 0xBC) return false;
 
     r.low_hz = get_f32(data + 1);
     r.high_hz = get_f32(data + 5);
-    r.tones_detected = data[9];
+    r.tones_detected = (int)data[9] | ((int)data[10] << 8);
 
-    for (int byte = 0; byte < 8; byte++) {
-        uint8_t b = data[10 + byte];
+    for (int byte = 0; byte < BITMAP_BYTES; byte++) {
+        uint8_t b = data[11 + byte];
         for (int bit = 0; bit < 8; bit++) {
             int idx = byte * 8 + bit;
             if (idx < PassbandProbeConfig::N_TONES)
