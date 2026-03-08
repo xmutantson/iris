@@ -12,7 +12,7 @@ Test verifies:
 import subprocess, socket, struct, time, sys, os
 
 IRIS = os.path.join(os.path.dirname(__file__), "..", "build", "iris.exe")
-DIREWOLF = r"C:\tmp\dw-src\build\src\direwolf.exe"
+DIREWOLF = r"C:\tmp\dw-build\src\direwolf.exe"
 DIREWOLF_CONF = r"C:\tmp\direwolf_test.conf"
 
 KISS_FEND  = 0xC0
