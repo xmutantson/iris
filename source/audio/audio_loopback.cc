@@ -4,24 +4,32 @@
 #include <mutex>
 #include <vector>
 #include <cstring>
+#include <cmath>
+#include <random>
 
 namespace iris {
 
 // Shared loopback buffer: playback writes here, capture reads from here.
-// A delay is inserted so TX audio arrives at RX after TX finishes,
-// bypassing the half-duplex mute (process_rx discards audio during TX).
+// Zero-delay passthrough — process_rx already skips TX mute in loopback mode.
+// Real TX/RX turnaround delays come from ptt_pre_delay_ms / ptt_post_delay_ms.
 static std::mutex g_loop_mutex;
 static std::vector<float> g_loop_buffer;
 static size_t g_loop_read_pos = 0;
 static size_t g_loop_write_pos = 0;
 static constexpr size_t LOOP_BUF_SIZE = 48000 * 8;   // 8 seconds at 48kHz mono
-static constexpr size_t DELAY_SAMPLES = 48000 * 2;    // 2 second delay
+
+// AWGN noise injection: amplitude of white Gaussian noise added to loopback
+static std::atomic<float> g_noise_amplitude{0.0f};
 
 void loopback_reset() {
     std::lock_guard<std::mutex> lock(g_loop_mutex);
     g_loop_buffer.assign(LOOP_BUF_SIZE, 0.0f);
     g_loop_read_pos = 0;
-    g_loop_write_pos = DELAY_SAMPLES;  // Write ahead by delay amount
+    g_loop_write_pos = 0;
+}
+
+void loopback_set_noise(float amplitude) {
+    g_noise_amplitude.store(amplitude);
 }
 
 class LoopbackCapture : public AudioCapture {
@@ -51,7 +59,11 @@ public:
 private:
     void run() {
         std::vector<float> buf(buf_size_);
+        std::mt19937 rng(42);
+        std::normal_distribution<float> gauss(0.0f, 1.0f);
+
         while (running_) {
+            float noise_amp = g_noise_amplitude.load();
             {
                 std::lock_guard<std::mutex> lock(g_loop_mutex);
                 size_t avail = (g_loop_write_pos >= g_loop_read_pos)
@@ -65,6 +77,11 @@ private:
                 } else {
                     std::memset(buf.data(), 0, buf_size_ * sizeof(float));
                 }
+            }
+            // Inject AWGN if configured
+            if (noise_amp > 0.0f) {
+                for (int i = 0; i < buf_size_; i++)
+                    buf[i] += noise_amp * gauss(rng);
             }
             if (cb_) cb_(buf.data(), buf_size_, 1);
             // Sleep to match real-time rate (~10ms chunks)

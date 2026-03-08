@@ -47,8 +47,10 @@ Downconverter::Downconverter(float center_freq, int sample_rate)
     phase_inc_ = 2.0f * (float)M_PI * center_freq_ / (float)sample_rate_;
     // LPF cutoff: pass baseband signal, reject 2*fc image
     // For 2400 baud RRC alpha=0.2: half-BW = 2400*1.2/2 = 1440 Hz
-    // Use min(center*0.8, 1800) to handle various center frequencies safely
-    float cutoff = std::min(center_freq * 0.8f, 1800.0f);
+    // Need flat passband up to 1440 Hz for QAM64/256 constellation accuracy
+    // Image starts at 2*fc - BW = 2*1900 - 1440 = 2360 Hz from DC
+    // Use center*0.95 for generous passband with 63-tap filter
+    float cutoff = std::min(center_freq * 0.95f, 2200.0f);
     design_lpf(cutoff);
     std::memset(lpf_buf_i_, 0, sizeof(lpf_buf_i_));
     std::memset(lpf_buf_q_, 0, sizeof(lpf_buf_q_));
@@ -112,8 +114,8 @@ std::vector<float> Downconverter::audio_to_iq(const float* audio, size_t count) 
             i_filt += lpf_buf_i_[idx] * lpf_coeffs_[j];
             q_filt += lpf_buf_q_[idx] * lpf_coeffs_[j];
         }
-        iq[2 * i]     = i_filt;
-        iq[2 * i + 1] = q_filt;
+        iq[2 * i]     = i_filt * 2.0f;  // x2: mixer cos²/sin² averages to 1/2
+        iq[2 * i + 1] = q_filt * 2.0f;
 
         lpf_pos_ = (lpf_pos_ + 1) % LPF_TAPS;
 

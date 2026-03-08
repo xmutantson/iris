@@ -39,8 +39,8 @@ struct IrisConfig {
     int rigctl_port = 4532;
     std::string serial_port;
     int serial_baud = 9600;
-    int ptt_pre_delay_ms = 300;   // TXDelay: silence before frame (direwolf default 300ms)
-    int ptt_post_delay_ms = 100;  // TXTail: silence after frame (direwolf default 100ms)
+    int ptt_pre_delay_ms = 100;   // TXDelay: PTT key-up settle time (FT-60 ~100ms)
+    int ptt_post_delay_ms = 50;   // TXTail: PTT release tail (FT-60 ~50ms)
 
     // CSMA/CA channel access (AX.25 standard)
     int slottime_ms = 100;        // CSMA slot time (direwolf default 100ms)

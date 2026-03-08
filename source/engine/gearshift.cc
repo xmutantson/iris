@@ -8,6 +8,7 @@ Gearshift::Gearshift() { reset(); }
 void Gearshift::reset() {
     current_level_ = 0;
     max_level_ = NUM_SPEED_LEVELS - 1;
+    locked_ = false;
     snr_avg_ = 0;
     hold_count_ = 0;
     fail_count_ = 0;
@@ -25,7 +26,14 @@ void Gearshift::force_level(int level) {
     fail_count_ = 0;
 }
 
+void Gearshift::lock_level(int level) {
+    force_level(level);
+    locked_ = true;
+}
+
 int Gearshift::update(float snr_db) {
+    if (locked_) return current_level_;
+
     // Smooth SNR
     snr_avg_ = SNR_ALPHA * snr_db + (1.0f - SNR_ALPHA) * snr_avg_;
 

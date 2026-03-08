@@ -17,6 +17,11 @@ constexpr uint8_t AX25_PID_NONE  = 0xF0;  // No layer 3
 constexpr uint8_t IRIS_PID       = 0xBE;   // Reserved PID for Iris native
 constexpr int     AX25_MAX_FRAME = 330;    // Max AX.25 frame bytes
 constexpr int     AX25_ADDR_LEN  = 7;      // Callsign (6) + SSID (1)
+constexpr int     NATIVE_MAX_PAYLOAD = 4000;  // Max native frame payload bytes
+
+// Multi-payload frame: packs multiple KISS payloads into one over-the-air frame
+// Format: [0xBB magic][2-byte LE len][data]...[2-byte LE len][data]...
+constexpr uint8_t MULTI_PAYLOAD_MAGIC = 0xBB;
 
 // KISS constants
 constexpr uint8_t KISS_FEND  = 0xC0;

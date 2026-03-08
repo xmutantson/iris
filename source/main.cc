@@ -16,6 +16,7 @@
 #include <chrono>
 #include <memory>
 #ifdef _WIN32
+#include <winsock2.h>
 #include <shlobj.h>
 #include <direct.h>
 #else
@@ -58,6 +59,7 @@ static void print_usage() {
     printf("  --ax25-only        Disable native PHY upgrade\n");
     printf("  --ax25-baud <n>    AX.25 baud rate (1200 or 9600)\n");
     printf("  --max-mod <mod>    Max modulation (BPSK,QPSK,QAM16,QAM64,QAM256)\n");
+    printf("  --speed-level <n>  Force speed level 0-7 (default: auto)\n");
     printf("  --tx-level <f>     TX level 0.0-1.0 (default: 0.5)\n");
     printf("  --rx-gain <f>      RX gain multiplier (default: 1.0)\n");
     printf("  --band-low <Hz>    Band low edge (default: 300, must be >254 for CTCSS)\n");
@@ -66,6 +68,7 @@ static void print_usage() {
     printf("\nAudio:\n");
     printf("  --noaudio          Disable audio I/O (for testing)\n");
     printf("  --loopback         Internal audio loopback (TX->RX, no hardware)\n");
+    printf("  --noise <amp>      Add AWGN noise to loopback (amplitude, e.g. 0.01)\n");
     printf("  --list-audio       List audio devices and exit\n");
     printf("  --capture <id>     Capture device ID (-1 = default)\n");
     printf("  --playback <id>    Playback device ID (-1 = default)\n");
@@ -95,6 +98,11 @@ static void print_usage() {
 int main(int argc, char** argv) {
     // Force line-buffered stdout so redirected output is visible
     setvbuf(stdout, nullptr, _IOLBF, 0);
+
+#ifdef _WIN32
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
 
     std::string config_path = "iris.ini";
     bool run_test = false;
@@ -134,6 +142,8 @@ int main(int argc, char** argv) {
     float cli_band_low = -1.0f;
     float cli_band_high = -1.0f;
     float cli_center_freq = -1.0f;
+    int cli_speed_level = -1;
+    float cli_noise = 0.0f;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--test") == 0) {
@@ -208,6 +218,10 @@ int main(int argc, char** argv) {
             cli_encrypt = argv[++i];
         } else if (strcmp(argv[i], "--psk") == 0 && i + 1 < argc) {
             cli_psk = argv[++i];
+        } else if (strcmp(argv[i], "--speed-level") == 0 && i + 1 < argc) {
+            cli_speed_level = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--noise") == 0 && i + 1 < argc) {
+            cli_noise = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage();
             return 0;
@@ -327,6 +341,10 @@ int main(int argc, char** argv) {
 
     if (use_loopback)
         modem.set_loopback_mode(true);
+    if (cli_noise > 0.0f)
+        loopback_set_noise(cli_noise);
+    if (cli_speed_level >= 0)
+        modem.force_speed_level(cli_speed_level);
 
     // Start listening for incoming ARQ connections
     modem.arq_listen();

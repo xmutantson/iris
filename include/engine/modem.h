@@ -108,6 +108,7 @@ public:
     ModemState state() const { return state_; }
     const IrisConfig& config() const { return config_; }
     void set_loopback_mode(bool v) { loopback_mode_ = v; }
+    void force_speed_level(int level) { gearshift_.lock_level(level); }
 
     void set_rx_callback(std::function<void(const uint8_t*, size_t)> cb) {
         rx_callback_ = cb;
@@ -188,13 +189,22 @@ private:
     // TX queue
     std::mutex tx_mutex_;
     std::queue<std::vector<uint8_t>> tx_queue_;
+    std::queue<std::vector<uint8_t>> ax25_tx_queue_;  // forced AX.25 (XID replies)
     std::vector<float> tx_buffer_;
     size_t tx_pos_ = 0;
 
     // RX state
-    bool native_mode_ = false;
+    bool native_mode_ = false;      // RX can decode native frames
+    bool native_tx_ready_ = false;  // TX may use native PHY (delayed after XID)
+    int  native_tx_holdoff_ = 0;    // tick() countdown before native TX allowed
     bool xid_sent_ = false;
     XidCapability local_cap_;
+
+    // XID handshake timing
+    std::vector<uint8_t> pending_xid_reply_;    // Held XID reply (responder)
+    int xid_reply_delay_samples_ = 0;           // Countdown before XID reply TX
+    std::queue<std::vector<uint8_t>> deferred_tx_queue_;  // Data held during XID handshake
+    int xid_fallback_ticks_ = 0;                // Fallback timer if remote not Iris
 
     // Calibration
     CalState cal_state_ = CalState::IDLE;
@@ -213,7 +223,7 @@ private:
 
     // RX overlap buffer for native mode
     std::vector<float> rx_overlap_buf_;
-    static constexpr size_t RX_OVERLAP_MAX = 48000 * 12;  // 6 seconds of IQ (floats=IQ×2)
+    static constexpr size_t RX_OVERLAP_MAX = 48000 * 40;  // 20 seconds of IQ (floats=IQ×2)
     int pending_frame_start_ = -1;   // Cached frame start when waiting for more data
     size_t pending_need_floats_ = 0; // Min buffer size (floats) needed before retry
 

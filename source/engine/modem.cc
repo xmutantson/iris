@@ -1,5 +1,6 @@
 #include "engine/modem.h"
 #include "native/frame.h"
+#include "fec/ldpc.h"
 #include "common/logging.h"
 #include <cstring>
 #include <cmath>
@@ -14,7 +15,7 @@ namespace iris {
 static constexpr float CAL_TONE_FREQ = 1000.0f;
 static constexpr int   CAL_TONE_DURATION = 48000;
 static constexpr float CAL_TARGET_RMS = 0.3f;
-static constexpr int RX_MUTE_HOLDOFF_SAMPLES = 2400;  // 50ms at 48kHz
+static constexpr int RX_MUTE_HOLDOFF_SAMPLES = 9600;  // 200ms at 48kHz (covers VB-Cable/soundcard latency)
 
 Modem::Modem() = default;
 Modem::~Modem() { shutdown(); }
@@ -220,8 +221,25 @@ void Modem::process_rx(const float* rx_audio, int frame_count) {
         }
     }
 
+    // Count down XID reply delay (responder stays in RX to catch trailing data)
+    if (xid_reply_delay_samples_ > 0) {
+        xid_reply_delay_samples_ -= frame_count;
+        if (xid_reply_delay_samples_ <= 0) {
+            xid_reply_delay_samples_ = 0;
+            if (!pending_xid_reply_.empty()) {
+                std::lock_guard<std::mutex> lock(tx_mutex_);
+                ax25_tx_queue_.push(std::move(pending_xid_reply_));
+                pending_xid_reply_.clear();
+                IRIS_LOG("XID reply released to TX queue");
+            }
+        }
+    }
+
     std::vector<float> audio(rx_audio, rx_audio + frame_count);
-    agc_.process_block(audio.data(), frame_count);
+    // AGC for AX.25 mode only — native mode has preamble-based gain estimation
+    // AGC would distort QAM symbols within a frame (gain changes during preamble vs payload)
+    if (!native_mode_)
+        agc_.process_block(audio.data(), frame_count);
 
     float sum_sq = 0;
     for (int i = 0; i < frame_count; i++)
@@ -267,21 +285,70 @@ void Modem::process_rx_ax25(const float* audio, int count) {
             const auto& frame = hdlc_decoder_.frame();
             frames_rx_++;
 
+            bool is_xid = false;
             if (frame.size() >= 24 && frame[15] == IRIS_PID) {
+                // Extract source callsign from AX.25 header (bytes 7-12, shifted)
+                std::string src_call;
+                for (int ci = 7; ci < 13 && ci < (int)frame.size(); ci++) {
+                    char c = (char)(frame[ci] >> 1);
+                    if (c != ' ') src_call += c;
+                }
+                // All XID frames are internal protocol — never forward to KISS
+                is_xid = true;
+                // Ignore our own XID (self-hearing on shared channel)
+                bool is_self = (src_call == config_.callsign);
                 XidCapability remote_cap;
-                if (xid_decode(&frame[16], frame.size() - 16, remote_cap)) {
+                if (!is_self && xid_decode(&frame[16], frame.size() - 16, remote_cap)) {
+                    is_xid = true;
                     auto agreed = negotiate(local_cap_, remote_cap);
                     if (agreed.capabilities != 0) {
-                        native_mode_ = true;
                         int mod_level = std::min((int)agreed.max_modulation,
                                                 (int)config_.max_modulation);
                         phy_config_.modulation = (Modulation)mod_level;
+
+                        if (!xid_sent_ && !config_.ax25_only) {
+                            // We're the responder. Delay XID reply by ~500ms
+                            // so we stay in AX.25 RX mode and can decode any
+                            // trailing data frames from the initiator before
+                            // we start transmitting (which blocks RX).
+                            pending_xid_reply_ = build_xid_frame(
+                                config_.callsign.c_str(), "CQ    ", local_cap_);
+                            xid_reply_delay_samples_ = config_.sample_rate / 2;  // 500ms
+                            xid_sent_ = true;
+                            // Native mode switch after holdoff (in tick())
+                            native_tx_holdoff_ = 10;  // ~1s
+                            IRIS_LOG("XID received (responder): reply delayed 500ms, holdoff=%d", native_tx_holdoff_);
+                        } else {
+                            // We're the initiator — we already sent XID, remote
+                            // is replying. Both sides are Iris-aware, switch now.
+                            native_mode_ = true;
+                            native_tx_ready_ = true;
+                            // Flush deferred data to TX queue (now goes native)
+                            {
+                                std::lock_guard<std::mutex> lock(tx_mutex_);
+                                while (!deferred_tx_queue_.empty()) {
+                                    tx_queue_.push(std::move(deferred_tx_queue_.front()));
+                                    deferred_tx_queue_.pop();
+                                }
+                            }
+                            xid_fallback_ticks_ = 0;
+                            IRIS_LOG("XID handshake complete (initiator), native mode active, flushed deferred");
+                        }
                     }
                 }
             }
 
-            if (rx_callback_)
-                rx_callback_(frame.data(), frame.size());
+            // Don't forward XID or self-originated frames to KISS clients
+            if (!is_xid && rx_callback_ && frame.size() >= 14) {
+                // Check source callsign to filter self-hearing
+                std::string rx_src;
+                for (int ci = 7; ci < 13; ci++) {
+                    char c = (char)(frame[ci] >> 1);
+                    if (c != ' ') rx_src += c;
+                }
+                if (rx_src != config_.callsign)
+                    rx_callback_(frame.data(), frame.size());
+            }
 
             hdlc_decoder_.reset();
         }
@@ -317,8 +384,11 @@ void Modem::process_rx_native(const float* audio, int count) {
 
     // If we have a pending frame waiting for more data, skip detection
     if (pending_frame_start_ >= 0) {
-        if (rx_overlap_buf_.size() < pending_need_floats_)
+        if (rx_overlap_buf_.size() < pending_need_floats_) {
             return;  // Still not enough data, skip expensive work
+        }
+        IRIS_LOG("RX pending retry: buf=%zu floats, need=%zu, start=%d",
+                 rx_overlap_buf_.size(), pending_need_floats_, pending_frame_start_);
     }
 
     int start;
@@ -335,12 +405,14 @@ void Modem::process_rx_native(const float* audio, int count) {
     }
 
     if (start >= 0) {
-        // Trim pre-frame silence to maximize buffer space for payload
-        if (start > 100) {
-            size_t trim = (size_t)(start - 10) * 2;  // Keep 10 IQ pairs margin
+        // Trim pre-frame silence to maximize buffer space for payload.
+        // Keep enough margin for RRC filter priming (RRC_SPAN * SPS samples).
+        int rrc_margin = RRC_SPAN * phy_config_.samples_per_symbol + 10;
+        if (start > rrc_margin + 50) {
+            size_t trim = (size_t)(start - rrc_margin) * 2;
             rx_overlap_buf_.erase(rx_overlap_buf_.begin(),
                                    rx_overlap_buf_.begin() + trim);
-            start = 10;
+            start = rrc_margin;
         }
 
         std::vector<uint8_t> payload;
@@ -375,31 +447,64 @@ void Modem::process_rx_native(const float* audio, int count) {
                     last_constellation_ = native_demod_->symbols();
             }
 
-            // Route through ARQ in any active session state
-            auto arq_st = arq_.state();
-            if (!loopback_mode_ &&
-                (arq_st == ArqState::CONNECTED ||
-                 arq_st == ArqState::CONNECTING ||
-                 arq_st == ArqState::LISTENING ||
-                 arq_st == ArqState::HAILING ||
-                 arq_st == ArqState::DISCONNECTING)) {
-                arq_.on_frame_received(payload.data(), payload.size());
+            // Deliver payload(s) — split multi-payload frames
+            auto deliver = [&](const uint8_t* data, size_t len) {
+                auto arq_st = arq_.state();
+                if (!loopback_mode_ &&
+                    (arq_st == ArqState::CONNECTED ||
+                     arq_st == ArqState::CONNECTING ||
+                     arq_st == ArqState::LISTENING ||
+                     arq_st == ArqState::HAILING ||
+                     arq_st == ArqState::DISCONNECTING)) {
+                    if (!arq_.on_frame_received(data, len)) {
+                        // Not an ARQ frame — pass through to KISS/AGW
+                        if (rx_callback_)
+                            rx_callback_(data, len);
+                    }
+                } else {
+                    if (rx_callback_)
+                        rx_callback_(data, len);
+                }
+            };
+
+            if (payload.size() >= 3 && payload[0] == MULTI_PAYLOAD_MAGIC) {
+                // Multi-payload frame: [magic][2-byte LE len][data]...
+                size_t pos = 1;
+                int sub_count = 0;
+                while (pos + 2 <= payload.size()) {
+                    uint16_t sub_len = payload[pos] | ((uint16_t)payload[pos + 1] << 8);
+                    pos += 2;
+                    if (sub_len == 0 || pos + sub_len > payload.size())
+                        break;
+                    deliver(&payload[pos], sub_len);
+                    pos += sub_len;
+                    sub_count++;
+                }
+                IRIS_LOG("RX multi-payload: %d sub-frames", sub_count);
             } else {
-                if (rx_callback_)
-                    rx_callback_(payload.data(), payload.size());
+                deliver(payload.data(), payload.size());
             }
 
-            // start is in IQ pairs; buffer stores interleaved floats (×2)
-            size_t consumed = (size_t)(start + phy_config_.samples_per_symbol * 128) * 2;
+            // Drain consumed IQ pairs from overlap buffer
+            size_t consumed_iq = decode_consumed_iq();
+            if (consumed_iq == 0)
+                consumed_iq = (size_t)(start + phy_config_.samples_per_symbol * 128);
+            size_t consumed = consumed_iq * 2;  // IQ pairs → interleaved floats
             if (consumed > rx_overlap_buf_.size())
                 consumed = rx_overlap_buf_.size();
             rx_overlap_buf_.erase(rx_overlap_buf_.begin(),
                                    rx_overlap_buf_.begin() + consumed);
         } else if (decode_was_overflow()) {
-            // Cache frame start, wait until buffer doubles from current size
-            // (overestimate is fine — better than retrying every 0.5s)
+            // Use exact need from decoder (it knows where overflow happened)
+            size_t need_iq = decode_consumed_iq();
+            if (need_iq == 0) {
+                // Fallback: need at least enough for header
+                need_iq = (size_t)(start + (IRIS_PREAMBLE_LEN + IRIS_SYNC_LEN +
+                    IRIS_HEADER_LEN + 64) * phy_config_.samples_per_symbol +
+                    RRC_SPAN * phy_config_.samples_per_symbol);
+            }
             pending_frame_start_ = start;
-            pending_need_floats_ = rx_overlap_buf_.size() * 2;
+            pending_need_floats_ = need_iq * 2;
             if (pending_need_floats_ > RX_OVERLAP_MAX)
                 pending_need_floats_ = RX_OVERLAP_MAX;
             IRIS_LOG("RX decode: need more data at offset %d (buf=%zu IQ, need ~%zu)",
@@ -408,8 +513,17 @@ void Modem::process_rx_native(const float* audio, int count) {
             crc_errors_++;
             IRIS_LOG("RX decode FAIL at offset %d corr=%.3f (crc_errors=%d)",
                      start, det_corr, (int)crc_errors_);
-            // start is in IQ pairs; buffer stores interleaved floats (×2)
-            size_t skip = (size_t)(start + phy_config_.samples_per_symbol * 16) * 2;
+            // Skip past the estimated frame to avoid re-detecting its remnants.
+            // Use the consumed_iq from the decoder if available, else estimate.
+            size_t consumed_iq = decode_consumed_iq();
+            size_t skip;
+            if (consumed_iq > 0) {
+                skip = consumed_iq * 2;
+            } else {
+                // Estimate: skip past preamble + sync + header + minimum payload
+                skip = (size_t)(start + (IRIS_PREAMBLE_LEN + IRIS_SYNC_LEN +
+                    IRIS_HEADER_LEN + 64) * phy_config_.samples_per_symbol) * 2;
+            }
             if (skip > rx_overlap_buf_.size()) skip = rx_overlap_buf_.size();
             rx_overlap_buf_.erase(rx_overlap_buf_.begin(),
                                    rx_overlap_buf_.begin() + skip);
@@ -434,6 +548,10 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
             tx_buffer_.clear();
             tx_pos_ = 0;
             ptt_off();
+            // Always set RX holdoff after TX to prevent self-hearing
+            // (VB-Cable and soundcard loopback buffer our own TX)
+            rx_muted_ = true;
+            rx_mute_holdoff_ = RX_MUTE_HOLDOFF_SAMPLES;
             state_ = ModemState::IDLE;
         }
         return;
@@ -446,15 +564,75 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
 
     {
         std::lock_guard<std::mutex> lock(tx_mutex_);
-        if (!tx_queue_.empty()) {
-            auto frame_data = std::move(tx_queue_.front());
-            tx_queue_.pop();
 
-            IRIS_LOG("TX frame %zu bytes (native=%d)", frame_data.size(), native_mode_ ? 1 : 0);
-
-            if (native_mode_) {
-                state_ = ModemState::TX_NATIVE;
+        // Drain forced-AX.25 queue first (XID replies must go via AFSK),
+        // then regular tx_queue_ (native or AX.25 depending on mode)
+        bool have_frame = false;
+        if (!ax25_tx_queue_.empty()) {
+            auto frame_data = std::move(ax25_tx_queue_.front());
+            ax25_tx_queue_.pop();
+            IRIS_LOG("TX frame %zu bytes (forced AX.25)", frame_data.size());
+            state_ = ModemState::TX_AX25;
+            auto bits = hdlc_encode(frame_data.data(), frame_data.size(), 8, 4);
+            if (config_.ax25_baud == 9600)
+                tx_buffer_ = gfsk_mod_.modulate(bits);
+            else
+                tx_buffer_ = afsk_mod_.modulate(bits);
+            have_frame = true;
+        } else if (!tx_queue_.empty()) {
+            if (native_mode_ && native_tx_ready_) {
+                // Batch multiple queued frames into one multi-payload frame.
+                // Limit total payload based on speed level to cap air time at ~3s.
                 int level = gearshift_.current_level();
+                int bps_sym = bits_per_symbol(SPEED_LEVELS[level].modulation);
+                // Max payload bytes ≈ target_air_symbols × bps / 8 × FEC_rate - CRC
+                // Simpler: use a lookup. Higher modes = more payload per second of air.
+                // At 2400 baud, 3s = 7200 symbols - 111 overhead = 7089 payload symbols
+                // BPSK r1/2: 7089 sym → 7089 bits → 7089/16*800 = ~355 data bits → ~44 bytes (too small!)
+                // Actually compute from target air time:
+                int fec_n = SPEED_LEVELS[level].fec_rate_num;
+                int fec_d = SPEED_LEVELS[level].fec_rate_den;
+                // PHY bps already accounts for modulation and FEC
+                int phy_bps = net_throughput(level, phy_config_.baud_rate);
+                // 3 seconds of payload at PHY rate, minus overhead
+                size_t max_batch = std::min((size_t)NATIVE_MAX_PAYLOAD,
+                                             (size_t)(phy_bps * 3 / 8));
+                if (max_batch < 200) max_batch = 200;  // at least one frame
+
+                std::vector<std::vector<uint8_t>> batch;
+                size_t total_bytes = 0;
+                while (!tx_queue_.empty()) {
+                    auto& front = tx_queue_.front();
+                    // 3 bytes overhead per sub-frame (2 len + data), plus magic byte
+                    size_t overhead = batch.empty() ? 3 : 2;
+                    if (total_bytes + overhead + front.size() > max_batch)
+                        break;
+                    total_bytes += overhead + front.size();
+                    batch.push_back(std::move(front));
+                    tx_queue_.pop();
+                }
+
+                // Build payload: single frame or multi-payload
+                std::vector<uint8_t> frame_data;
+                if (batch.size() == 1 && batch[0].size() > 0 && batch[0][0] != MULTI_PAYLOAD_MAGIC) {
+                    // Single frame, no wrapping needed (avoid overhead)
+                    frame_data = std::move(batch[0]);
+                } else {
+                    // Multi-payload: [magic][2-byte LE len][data]...
+                    frame_data.reserve(total_bytes);
+                    frame_data.push_back(MULTI_PAYLOAD_MAGIC);
+                    for (auto& sub : batch) {
+                        uint16_t len = (uint16_t)sub.size();
+                        frame_data.push_back(len & 0xFF);
+                        frame_data.push_back((len >> 8) & 0xFF);
+                        frame_data.insert(frame_data.end(), sub.begin(), sub.end());
+                    }
+                }
+
+                IRIS_LOG("TX frame %zu bytes (%zu sub-frames, native=1)",
+                         frame_data.size(), batch.size());
+
+                state_ = ModemState::TX_NATIVE;
                 PhyConfig tx_config = phy_config_;
                 tx_config.modulation = SPEED_LEVELS[level].modulation;
                 LdpcRate fec = fec_to_ldpc_rate(SPEED_LEVELS[level].fec_rate_num,
@@ -469,6 +647,9 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                         tx_buffer_[i] = iq[2 * i];
                 }
             } else {
+                auto frame_data = std::move(tx_queue_.front());
+                tx_queue_.pop();
+                IRIS_LOG("TX frame %zu bytes (native=0)", frame_data.size());
                 state_ = ModemState::TX_AX25;
                 auto bits = hdlc_encode(frame_data.data(), frame_data.size(), 8, 4);
                 if (config_.ax25_baud == 9600)
@@ -476,7 +657,10 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                 else
                     tx_buffer_ = afsk_mod_.modulate(bits);
             }
+            have_frame = true;
+        }
 
+        if (have_frame) {
             IRIS_LOG("TX buffer %zu samples", tx_buffer_.size());
 
             for (auto& s : tx_buffer_)
@@ -507,7 +691,7 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
 }
 
 void Modem::queue_tx_frame(const uint8_t* frame, size_t len) {
-    if (native_mode_ && arq_.state() == ArqState::CONNECTED) {
+    if (native_mode_ && native_tx_ready_ && arq_.state() == ArqState::CONNECTED) {
         const uint8_t* cur = frame;
         size_t cur_len = len;
 
@@ -559,6 +743,20 @@ void Modem::queue_tx_frame(const uint8_t* frame, size_t len) {
                                            local_cap_);
         tx_queue_.push(std::move(xid_frame));
         xid_sent_ = true;
+        // Defer the data frame — don't send it alongside XID.
+        // It will be flushed when XID handshake completes (native mode),
+        // or after fallback timeout (remote not Iris-aware).
+        deferred_tx_queue_.push(std::vector<uint8_t>(frame, frame + len));
+        xid_fallback_ticks_ = 40;  // ~3-4 seconds (tick may run faster than 100ms)
+        IRIS_LOG("XID sent, data deferred (%zu bytes), fallback=%d ticks", len, xid_fallback_ticks_);
+        return;
+    }
+
+    // If XID handshake is in progress (sent but not yet complete), defer data
+    if (xid_sent_ && !native_mode_ && !config_.ax25_only) {
+        deferred_tx_queue_.push(std::vector<uint8_t>(frame, frame + len));
+        IRIS_LOG("Data deferred during XID handshake (%zu bytes)", len);
+        return;
     }
 
     tx_queue_.push(std::vector<uint8_t>(frame, frame + len));
@@ -566,7 +764,7 @@ void Modem::queue_tx_frame(const uint8_t* frame, size_t len) {
 
 void Modem::arq_connect(const std::string& remote_callsign) {
     IRIS_LOG("ARQ connect to %s", remote_callsign.c_str());
-    native_mode_ = true;
+    // Start in AX.25 — upgrade to native after XID negotiation
     arq_.connect(remote_callsign);
 }
 
@@ -576,17 +774,51 @@ void Modem::arq_disconnect() {
 }
 
 void Modem::arq_listen() {
-    // Enable native mode based on configured PHY mode (A/B/C use native PHY).
-    // AX.25-only mode stays in AX.25 for Winlink backward compatibility.
-    // XID negotiation can also upgrade AX.25 → native mid-session.
-    if (!config_.ax25_only)
-        native_mode_ = true;
-    IRIS_LOG("ARQ listen (native_mode=%d)", native_mode_ ? 1 : 0);
+    // Always start in AX.25 mode. Native upgrade happens via XID negotiation
+    // when the remote station proves it supports Iris native PHY.
+    // --ax25-only suppresses XID entirely.
+    IRIS_LOG("ARQ listen (native_mode=0, ax25_only=%d)", config_.ax25_only ? 1 : 0);
     arq_.listen();
 }
 
 void Modem::tick() {
     arq_.tick();
+
+    // Count down native mode holdoff (set after queuing XID reply)
+    // During holdoff, stay in AX.25 mode to decode any remaining AX.25 frames.
+    // When holdoff expires, switch both RX and TX to native.
+    if (native_tx_holdoff_ > 0) {
+        native_tx_holdoff_--;
+        if (native_tx_holdoff_ == 0) {
+            native_mode_ = true;
+            native_tx_ready_ = true;
+            // Flush deferred data (now goes via native PHY)
+            {
+                std::lock_guard<std::mutex> lock(tx_mutex_);
+                while (!deferred_tx_queue_.empty()) {
+                    tx_queue_.push(std::move(deferred_tx_queue_.front()));
+                    deferred_tx_queue_.pop();
+                }
+            }
+            IRIS_LOG("Native holdoff expired, native mode active (RX+TX)");
+        }
+    }
+
+    // XID fallback: if remote didn't reply, flush deferred data as AX.25
+    if (xid_fallback_ticks_ > 0) {
+        xid_fallback_ticks_--;
+        if (xid_fallback_ticks_ == 0 && !native_mode_) {
+            std::lock_guard<std::mutex> lock(tx_mutex_);
+            int count = 0;
+            while (!deferred_tx_queue_.empty()) {
+                tx_queue_.push(std::move(deferred_tx_queue_.front()));
+                deferred_tx_queue_.pop();
+                count++;
+            }
+            if (count > 0)
+                IRIS_LOG("XID fallback: flushed %d deferred frames as AX.25", count);
+        }
+    }
 }
 
 ModemDiag Modem::get_diagnostics() const {

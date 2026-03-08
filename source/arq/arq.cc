@@ -18,6 +18,19 @@ std::vector<uint8_t> ArqFrame::serialize() const {
 
 bool ArqFrame::deserialize(const uint8_t* data, size_t len, ArqFrame& out) {
     if (len < 3) return false;
+    // Validate type byte is a known ARQ frame type
+    switch ((ArqType)data[0]) {
+        case ArqType::HAIL: case ArqType::HAIL_ACK:
+        case ArqType::CONNECT: case ArqType::CONNECT_ACK:
+        case ArqType::DATA: case ArqType::ACK: case ArqType::NACK:
+        case ArqType::SET_SPEED: case ArqType::SPEED_ACK:
+        case ArqType::SET_CONFIG: case ArqType::CONFIG_ACK:
+        case ArqType::SWITCH_ROLE: case ArqType::BREAK:
+        case ArqType::DISCONNECT: case ArqType::DISCONNECT_ACK:
+            break;
+        default:
+            return false;  // Unknown type — not an ARQ frame
+    }
     out.type = (ArqType)data[0];
     out.seq = data[1];
     out.flags = data[2];
@@ -286,18 +299,18 @@ void ArqSession::send_next_data() {
 
 // --- Frame dispatch ---
 
-void ArqSession::on_frame_received(const uint8_t* data, size_t len) {
+bool ArqSession::on_frame_received(const uint8_t* data, size_t len) {
     // RX mute guard: discard frames during mute window
     if (rx_mute_) {
         if (Clock::now() >= rx_mute_until_)
             rx_mute_ = false;
         else
-            return;
+            return true;  // Muted, consider handled
     }
 
     ArqFrame frame;
     if (!ArqFrame::deserialize(data, len, frame))
-        return;
+        return false;  // Not an ARQ frame
 
     switch (frame.type) {
         case ArqType::HAIL:         handle_hail(frame); break;
@@ -321,6 +334,7 @@ void ArqSession::on_frame_received(const uint8_t* data, size_t len) {
             }
             break;
     }
+    return true;
 }
 
 // --- Connection handlers with capability exchange ---

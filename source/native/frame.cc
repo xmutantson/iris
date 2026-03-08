@@ -1,7 +1,12 @@
 #include "native/frame.h"
 #include "common/logging.h"
+#include <algorithm>
 #include <cmath>
 #include <cstring>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 namespace iris {
 
@@ -33,6 +38,29 @@ static uint8_t crc8(const uint8_t* data, size_t len) {
         }
     }
     return crc;
+}
+
+// Scramble/descramble bits using LFSR PRBS (x^15 + x^14 + 1)
+// Self-inverse: applying twice returns original bits
+static void scramble_bits(std::vector<uint8_t>& bits) {
+    uint16_t lfsr = 0x6959;  // fixed seed (non-zero)
+    for (size_t i = 0; i < bits.size(); i++) {
+        int fb = ((lfsr >> 14) ^ (lfsr >> 13)) & 1;
+        bits[i] ^= (lfsr & 1);
+        lfsr = (lfsr >> 1) | ((uint16_t)fb << 14);
+    }
+}
+
+// Soft descramble: flip LLR sign where LFSR bit is 1
+// XOR with 1 flips a hard bit; negating the LLR flips soft decision
+static void scramble_soft(std::vector<float>& llrs) {
+    uint16_t lfsr = 0x6959;
+    for (size_t i = 0; i < llrs.size(); i++) {
+        int fb = ((lfsr >> 14) ^ (lfsr >> 13)) & 1;
+        if (lfsr & 1)
+            llrs[i] = -llrs[i];
+        lfsr = (lfsr >> 1) | ((uint16_t)fb << 14);
+    }
 }
 
 // Generate 63-symbol m-sequence using LFSR (x^6 + x + 1)
@@ -176,6 +204,10 @@ std::vector<float> build_native_frame(const uint8_t* payload, size_t len,
     while (payload_bits.size() % bps != 0)
         payload_bits.push_back(0);
 
+    // Scramble encoded bits to ensure uniform QAM symbol distribution
+    // (LDPC zero-padding maps to high-power corner symbols without scrambling)
+    scramble_bits(payload_bits);
+
     auto payload_symbols = map_bits(payload_bits, config.modulation);
 
     // Concatenate all symbols
@@ -201,6 +233,9 @@ float detect_best_corr() { return g_last_best_corr; }
 static bool g_decode_overflow = false;
 bool decode_was_overflow() { return g_decode_overflow; }
 
+static size_t g_decode_consumed_iq = 0;
+size_t decode_consumed_iq() { return g_decode_consumed_iq; }
+
 int detect_frame_start(const float* iq_samples, size_t count, int sps) {
     auto preamble = generate_preamble();
     auto sync = generate_sync_word();
@@ -212,19 +247,22 @@ int detect_frame_start(const float* iq_samples, size_t count, int sps) {
     size_t ref_len = ref.size();
     size_t n_samples = count / 2;
 
-    // Don't limit search range here — the buffer may need to accumulate
-    // more data before decode succeeds. Let decode_native_frame handle
-    // overflow gracefully (it checks bounds per-symbol).
-    // Only require enough buffer for the preamble+sync correlation itself.
-    size_t min_corr_iq = ref_len * sps;
-    if (n_samples < min_corr_iq + (size_t)sps) { g_last_best_corr = -1; return -1; }
+    // Require enough buffer for preamble+sync+header decode.
+    // This ensures that any detected preamble has enough data to at least
+    // decode the header and determine exact frame size, avoiding speculative
+    // overflow/retry cycles. Inspired by Direwolf's approach: never attempt
+    // decode without sufficient data.
+    size_t min_frame_iq = (IRIS_PREAMBLE_LEN + IRIS_SYNC_LEN + IRIS_HEADER_LEN) * sps
+                         + 2 * RRC_SPAN * sps + 2 * sps;  // header + RRC tail + fine timing margin
+    if (n_samples < min_frame_iq + (size_t)sps) { g_last_best_corr = -1; return -1; }
 
     float best_corr = 0;
     int best_offset = -1;
 
-    // Search the full buffer; if we detect a frame near the end,
-    // the caller will retry after accumulating more data.
-    size_t search_end = n_samples - min_corr_iq;
+    // Only search where there's enough data for header decode.
+    // Preambles found near the buffer end will be re-detected once
+    // more audio accumulates (Direwolf-style streaming approach).
+    size_t search_end = n_samples - min_frame_iq;
 
     for (size_t offset = 0; offset < search_end; offset += sps / 2) {
         float corr_re = 0, corr_im = 0;
@@ -261,6 +299,7 @@ bool decode_native_frame(const float* iq_samples, size_t count,
                           int frame_start, const PhyConfig& default_config,
                           std::vector<uint8_t>& payload) {
     g_decode_overflow = false;
+    g_decode_consumed_iq = 0;
     int sps = default_config.samples_per_symbol;
     size_t n_samples = count / 2;
 
@@ -276,22 +315,158 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     size_t filt_len = std::min(i_filt.size(), q_filt.size());
 
     int rx_delay = RRC_SPAN * sps;
-    int rx_frame_start = frame_start + rx_delay;
+
+    // Fine timing search: try offsets around coarse frame_start,
+    // pick the timing that maximizes preamble+sync correlation energy
+    auto sync_ref = generate_sync_word();
+    auto preamble_ref = generate_preamble();
+
+    // Build combined preamble+sync reference for timing search
+    std::vector<std::complex<float>> timing_ref;
+    for (auto& s : preamble_ref) timing_ref.push_back(s);
+    for (auto& s : sync_ref) timing_ref.push_back(s);
+    int timing_ref_len = (int)timing_ref.size();
+
+    int best_timing = frame_start;
+    float best_mag = 0;
+    int search_range = sps;
+
+    // Store correlation magnitudes for parabolic interpolation
+    std::vector<float> corr_mags(2 * search_range + 1, 0);
+
+    for (int dt = -search_range; dt <= search_range; dt++) {
+        int trial_start = frame_start + dt;
+        if (trial_start < 0) continue;
+        int trial_rx = trial_start + rx_delay;
+
+        size_t last_idx = trial_rx + (timing_ref_len - 1) * sps;
+        if (last_idx >= filt_len) continue;
+
+        float cr = 0, ci = 0;
+        for (int i = 0; i < timing_ref_len; i++) {
+            size_t idx = trial_rx + i * sps;
+            cr += i_filt[idx] * timing_ref[i].real();
+            ci += q_filt[idx] * timing_ref[i].real();
+        }
+        float mag = cr * cr + ci * ci;
+        corr_mags[dt + search_range] = mag;
+        if (mag > best_mag) {
+            best_mag = mag;
+            best_timing = trial_start;
+        }
+    }
+
+    // Sub-sample timing refinement: parabolic interpolation around the peak
+    float timing_frac = 0.0f;  // fractional sample offset from best_timing
+    int peak_idx = best_timing - frame_start + search_range;
+    if (peak_idx > 0 && peak_idx < (int)corr_mags.size() - 1) {
+        float yl = corr_mags[peak_idx - 1];
+        float yc = corr_mags[peak_idx];
+        float yr = corr_mags[peak_idx + 1];
+        float denom = 2.0f * (2.0f * yc - yl - yr);
+        if (std::abs(denom) > 1e-10f)
+            timing_frac = (yl - yr) / denom;
+        timing_frac = std::max(-0.5f, std::min(0.5f, timing_frac));
+    }
+
+    int rx_frame_start = best_timing + rx_delay;
+
+    // Estimate carrier phase + frequency offset from preamble (2 halves)
+    // Phase at preamble first half midpoint and second half midpoint
+    int preamble_start = rx_frame_start;
+    int half1_start = 0;
+    int half1_end = IRIS_PREAMBLE_LEN / 2;
+    int half2_start = half1_end;
+    int half2_end = IRIS_PREAMBLE_LEN;
+
+    // Linear interpolation helper for sub-sample timing
+    auto interp = [](const std::vector<float>& buf, float pos) -> float {
+        int idx = (int)pos;
+        float frac = pos - idx;
+        if (idx < 0 || idx + 1 >= (int)buf.size()) return (idx >= 0 && idx < (int)buf.size()) ? buf[idx] : 0.0f;
+        return buf[idx] + frac * (buf[idx + 1] - buf[idx]);
+    };
+
+    float cr1 = 0, ci1 = 0, cr2 = 0, ci2 = 0;
+    // Need: preamble end + header + minimum 1 LDPC block for any modulation
+    size_t need_for_header = (size_t)(preamble_start +
+        (IRIS_PREAMBLE_LEN + IRIS_SYNC_LEN + IRIS_HEADER_LEN) * sps + sps + 2);
+
+    for (int i = half1_start; i < half1_end; i++) {
+        float pos = preamble_start + i * sps + timing_frac;
+        if (pos + 1 >= filt_len) { g_decode_overflow = true; g_decode_consumed_iq = need_for_header; return false; }
+        float iv = interp(i_filt, pos);
+        float qv = interp(q_filt, pos);
+        cr1 += iv * preamble_ref[i].real();
+        ci1 += qv * preamble_ref[i].real();
+    }
+    for (int i = half2_start; i < half2_end; i++) {
+        float pos = preamble_start + i * sps + timing_frac;
+        if (pos + 1 >= filt_len) { g_decode_overflow = true; g_decode_consumed_iq = need_for_header; return false; }
+        float iv = interp(i_filt, pos);
+        float qv = interp(q_filt, pos);
+        cr2 += iv * preamble_ref[i].real();
+        ci2 += qv * preamble_ref[i].real();
+    }
+
+    float phase1 = std::atan2(ci1, cr1);
+    float phase2 = std::atan2(ci2, cr2);
+
+    // Unwrap phase difference
+    float dphase = phase2 - phase1;
+    while (dphase > (float)M_PI) dphase -= 2.0f * (float)M_PI;
+    while (dphase < -(float)M_PI) dphase += 2.0f * (float)M_PI;
+
+    // Phase rate: dphase per symbol, measured over half-preamble spacing
+    int half_spacing = (half2_start + half2_end) / 2 - (half1_start + half1_end) / 2;
+    float phase_per_symbol = (half_spacing > 0) ? dphase / half_spacing : 0;
+
+    // Reference point: phase at preamble midpoint
+    float phase_ref = (phase1 + phase2) / 2;
+    int ref_symbol = IRIS_PREAMBLE_LEN / 2;  // symbol index of reference point
+
+    // Channel gain: |correlation| / num_symbols (ref symbols are unit magnitude)
+    float mag1 = std::sqrt(cr1 * cr1 + ci1 * ci1);
+    float mag2 = std::sqrt(cr2 * cr2 + ci2 * ci2);
+    float channel_gain = (mag1 / (half1_end - half1_start) + mag2 / (half2_end - half2_start)) / 2;
+    if (channel_gain < 1e-6f) channel_gain = 1.0f;
+
+    float freq_offset_hz = phase_per_symbol * default_config.baud_rate / (2.0f * (float)M_PI);
+    IRIS_LOG("[DECODE] phase=%.1f deg freq=%.1f Hz gain=%.3f timing_adj=%d frac=%.3f",
+             phase_ref * 180.0f / (float)M_PI, freq_offset_hz, channel_gain,
+             best_timing - frame_start, timing_frac);
 
     int header_start = rx_frame_start + (IRIS_PREAMBLE_LEN + IRIS_SYNC_LEN) * sps;
 
-    // Decode header (32 BPSK symbols)
+    // Decode header (32 BPSK symbols) with linear phase correction
+    // Decision-directed PLL: track phase variations within the frame.
+    // VB-Cable and real channels can have phase drift beyond the linear model.
+    float pll_phase = phase_ref;  // Start from preamble-estimated phase
+    float pll_alpha = 0.15f;      // PLL bandwidth (higher = tracks faster)
+
     std::vector<uint8_t> header_bits;
     for (int i = 0; i < IRIS_HEADER_LEN; i++) {
-        size_t idx = header_start + i * sps;
-        if (idx >= filt_len) {
+        float pos = header_start + i * sps + timing_frac;
+        if (pos + 1 >= filt_len) {
             g_decode_overflow = true;
+            g_decode_consumed_iq = need_for_header;
             return false;
         }
-        float re = i_filt[idx];
+        float iv = interp(i_filt, pos);
+        float qv = interp(q_filt, pos);
+        int sym_idx = IRIS_PREAMBLE_LEN + IRIS_SYNC_LEN + i;
+        float phase_corr = -(pll_phase + phase_per_symbol * (sym_idx - ref_symbol));
+        float cc = std::cos(phase_corr) / channel_gain;
+        float ss = std::sin(phase_corr) / channel_gain;
+        float re = iv * cc - qv * ss;
+        float im = iv * ss + qv * cc;
         header_bits.push_back(re < 0 ? 1 : 0);
-    }
 
+        // PLL update: BPSK decision-directed (header is always BPSK)
+        float decided_re = re > 0 ? 1.0f : -1.0f;
+        float phase_err = std::atan2(im * decided_re, re * decided_re);
+        pll_phase += pll_alpha * phase_err;
+    }
     Modulation mod;
     uint16_t payload_len;
     LdpcRate fec;
@@ -302,8 +477,8 @@ bool decode_native_frame(const float* iq_samples, size_t count,
 
     // Header decoded: mod, payload_len, fec known. Continue to payload decode.
 
-    if (payload_len > AX25_MAX_FRAME * 4) {
-        IRIS_LOG("[DECODE] payload_len %d too large", payload_len);
+    if (payload_len > NATIVE_MAX_PAYLOAD) {
+        IRIS_LOG("[DECODE] payload_len %d too large (max %d)", payload_len, NATIVE_MAX_PAYLOAD);
         return false;
     }
 
@@ -327,27 +502,181 @@ bool decode_native_frame(const float* iq_samples, size_t count,
         padded_bits += bps - (padded_bits % bps);
     int payload_symbols = padded_bits / bps;
 
-    std::vector<std::complex<float>> symbols;
-    for (int k2 = 0; k2 < payload_symbols; k2++) {
-        size_t idx = payload_start + k2 * sps;
-        if (idx >= filt_len) {
+    // Pre-check: verify buffer has enough data for ALL payload symbols
+    // BEFORE extracting any. This avoids mid-decode overflow and ensures
+    // we only process frames when the complete signal has arrived.
+    {
+        float last_pos = payload_start + (payload_symbols - 1) * sps + timing_frac;
+        if (last_pos + 2 >= filt_len) {
             g_decode_overflow = true;
+            // Exact IQ requirement: payload end + RRC filter tail (no artificial margin)
+            g_decode_consumed_iq = (size_t)(payload_start + payload_symbols * sps +
+                                            RRC_SPAN * sps);
+            IRIS_LOG("[DECODE] need more data: have %zu IQ, need ~%zu (payload_syms=%d, mod=%d, fec=%d)",
+                     n_samples, g_decode_consumed_iq, payload_symbols, (int)mod, (int)fec);
             return false;
         }
-        symbols.push_back({i_filt[idx], q_filt[idx]});
     }
 
-    auto bits = demap_bits(symbols, mod);
+    // Diagnostic: scan raw IQ energy every 2000 samples to find signal extent
+    {
+        char ebuf[1024]; int ep = 0;
+        ep += snprintf(ebuf+ep, sizeof(ebuf)-ep, "[DECODE] energy scan (n=%zu): ", n_samples);
+        for (int pos = 0; pos < (int)n_samples; pos += 2000) {
+            float e = 0;
+            int cnt = std::min(100, (int)n_samples - pos);
+            for (int j = pos; j < pos + cnt; j++)
+                e += i_in[j] * i_in[j] + q_in[j] * q_in[j];
+            e /= cnt;
+            ep += snprintf(ebuf+ep, sizeof(ebuf)-ep, "%d:%.4f ", pos, e);
+            if (ep > 900) break;
+        }
+        IRIS_LOG("%s", ebuf);
+    }
 
-    // LDPC decode
+    std::vector<std::complex<float>> symbols;
+    std::vector<float> sym_reliability;  // per-symbol magnitude for LLR weighting
+    // Diagnostic: track raw IQ phase at sampled points
+    char raw_diag[1024]; int rdp = 0;
+    rdp += snprintf(raw_diag+rdp, sizeof(raw_diag)-rdp, "[DECODE] raw_phase: ");
+    for (int k2 = 0; k2 < payload_symbols; k2++) {
+        float pos = payload_start + k2 * sps + timing_frac;
+        float iv = interp(i_filt, pos);
+        float qv = interp(q_filt, pos);
+
+        // Track pre-equalization magnitude for reliability weighting
+        float raw_mag = std::sqrt(iv * iv + qv * qv);
+
+        // Log raw IQ phase at sampled positions
+        if (k2 < 10 || (k2 % 500 == 0) || k2 == payload_symbols - 1) {
+            float raw_phase_deg = std::atan2(qv, iv) * 180.0f / (float)M_PI;
+            if (rdp < 900)
+                rdp += snprintf(raw_diag+rdp, sizeof(raw_diag)-rdp,
+                    "%d:(%.3f,%.3f,%.1f°) ", k2, iv, qv, raw_phase_deg);
+        }
+
+        int sym_idx = IRIS_PREAMBLE_LEN + IRIS_SYNC_LEN + IRIS_HEADER_LEN + k2;
+        float phase_corr = -(pll_phase + phase_per_symbol * (sym_idx - ref_symbol));
+        float cc = std::cos(phase_corr) / channel_gain;
+        float ss = std::sin(phase_corr) / channel_gain;
+        float re = iv * cc - qv * ss;
+        float im = iv * ss + qv * cc;
+        symbols.push_back({re, im});
+        sym_reliability.push_back(raw_mag);
+
+        // Decision-directed PLL: demap to nearest constellation point, compute phase error
+        uint8_t dec_bits[8];
+        demap_symbol({re, im}, dec_bits, mod);
+        auto decided = map_symbol(dec_bits, mod);
+        // Phase error = angle between received and decided
+        float phase_err = std::atan2(
+            im * decided.real() - re * decided.imag(),
+            re * decided.real() + im * decided.imag());
+        pll_phase += pll_alpha * phase_err;
+    }
+    IRIS_LOG("%s", raw_diag);
+
+    // Dump first and last equalized symbols for diagnostics
+    {
+        char buf[512]; int bp = 0;
+        bp += snprintf(buf+bp, sizeof(buf)-bp, "sym[0..4]: ");
+        for (int di = 0; di < 5 && di < (int)symbols.size(); di++)
+            bp += snprintf(buf+bp, sizeof(buf)-bp, "(%.2f,%.2f) ",
+                           symbols[di].real(), symbols[di].imag());
+        int last = (int)symbols.size();
+        int lo = std::max(0, last - 5);
+        bp += snprintf(buf+bp, sizeof(buf)-bp, "sym[%d..%d]: ", lo, last-1);
+        for (int di = lo; di < last && bp < 450; di++)
+            bp += snprintf(buf+bp, sizeof(buf)-bp, "(%.2f,%.2f) ",
+                           symbols[di].real(), symbols[di].imag());
+        IRIS_LOG("[DECODE] %s", buf);
+    }
+
+    std::vector<uint8_t> bits;
+
     if (fec != LdpcRate::NONE) {
-        if ((int)bits.size() > encoded_bits)
-            bits.resize(encoded_bits);
-        bits = LdpcCodec::decode(bits, fec);
+        // Soft-decision path: LLR values give LDPC much more information
+        auto llrs = demap_soft(symbols, mod);
+
+        // Reliability weighting: scale each symbol's LLRs by its received magnitude.
+        // Symbols with low magnitude (attenuated by VB-Cable, radio echo, fading)
+        // get LLRs pushed toward zero = erasure, telling LDPC "I don't know" instead
+        // of "I'm confident and wrong". This is critical for VB-Cable and radio paths.
+        {
+            // Compute median magnitude as reference for "normal" signal level
+            std::vector<float> sorted_mags(sym_reliability);
+            std::sort(sorted_mags.begin(), sorted_mags.end());
+            float median_mag = sorted_mags.size() > 0 ?
+                sorted_mags[sorted_mags.size() / 2] : 1.0f;
+            if (median_mag < 0.01f) median_mag = 0.01f;
+
+            int n_attenuated = 0;
+            for (int si = 0; si < (int)symbols.size(); si++) {
+                float weight = std::min(1.0f, sym_reliability[si] / median_mag);
+                // Square the weight to more aggressively erase weak symbols
+                weight *= weight;
+                if (weight < 0.1f) n_attenuated++;
+                for (int bi = 0; bi < bps; bi++) {
+                    int llr_idx = si * bps + bi;
+                    if (llr_idx < (int)llrs.size())
+                        llrs[llr_idx] *= weight;
+                }
+            }
+            if (n_attenuated > 0)
+                IRIS_LOG("[DECODE] reliability: %d/%d symbols attenuated (median_mag=%.3f)",
+                         n_attenuated, (int)symbols.size(), median_mag);
+        }
+
+        scramble_soft(llrs);
+        if ((int)llrs.size() > encoded_bits)
+            llrs.resize(encoded_bits);
+        // Clamp LLRs and enforce minimum magnitude for min-sum decoder
+        for (auto& l : llrs) {
+            l = std::max(-10.0f, std::min(10.0f, l));
+            if (std::abs(l) < 0.05f)
+                l = l >= 0 ? 0.05f : -0.05f;
+        }
+
+        // Pre-LDPC channel quality: count bit errors vs hard decision
+        {
+            int n_hard_errors = 0;
+            std::vector<uint8_t> hard(llrs.size());
+            for (size_t di = 0; di < llrs.size(); di++)
+                hard[di] = llrs[di] < 0 ? 1 : 0;
+            // Check how many LDPC parity equations are satisfied by hard decisions
+            int k_fec = LdpcCodec::block_size(fec);
+            int n_fec = LdpcCodec::codeword_size(fec);
+            int n_unsatisfied = 0;
+            for (size_t blk = 0; blk + n_fec <= hard.size(); blk += n_fec) {
+                // Quick syndrome check via the same H matrix logic
+                for (int j = 0; j < n_fec - k_fec; j++) {
+                    int parity = 0;
+                    // Pivot: parity bit at k_fec + j
+                    parity ^= hard[blk + k_fec + j];
+                    // Data columns (approximate: just check data bits near this check)
+                    // Use same structure as H matrix: wc=3 layers
+                    int p = n_fec - k_fec;
+                    for (int layer = 0; layer < 3; layer++) {
+                        int col = (j + layer * (k_fec / 3)) % k_fec;
+                        parity ^= hard[blk + col];
+                    }
+                    if (parity) n_unsatisfied++;
+                }
+            }
+            int n_checks = (n_fec - k_fec) * ((int)hard.size() / n_fec);
+            IRIS_LOG("[DECODE] pre-LDPC: %d/%d checks unsatisfied (%.1f%%)",
+                     n_unsatisfied, n_checks, n_checks > 0 ? 100.0f * n_unsatisfied / n_checks : 0.0f);
+        }
+
+        bits = LdpcCodec::decode_soft(llrs, fec);
         if (bits.empty()) {
-            IRIS_LOG("[DECODE] LDPC decode failed");
+            IRIS_LOG("[DECODE] LDPC decode failed (did not converge)");
             return false;
         }
+    } else {
+        // No FEC: hard decision is fine
+        bits = demap_bits(symbols, mod);
+        scramble_bits(bits);
     }
 
     int total_bytes = payload_len + 4;
@@ -371,11 +700,14 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     uint32_t calc_crc = crc32(decoded_bytes.data(), payload_len);
     if (rx_crc != calc_crc) {
         IRIS_LOG("[DECODE] CRC mismatch: rx=0x%08x calc=0x%08x (len=%d)", rx_crc, calc_crc, payload_len);
-    }
-    if (rx_crc != calc_crc)
         return false;
+    }
 
     payload.assign(decoded_bytes.begin(), decoded_bytes.begin() + payload_len);
+
+    // Record how many IQ pairs this frame consumed (for buffer drain)
+    int last_symbol_pos = payload_start + payload_symbols * sps;
+    g_decode_consumed_iq = (size_t)(last_symbol_pos + RRC_SPAN * sps);
     return true;
 }
 

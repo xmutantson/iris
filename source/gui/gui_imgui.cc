@@ -639,10 +639,10 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
             if (ImGui::InputText("Callsign", cs_buf, sizeof(cs_buf)))
                 config.callsign = cs_buf;
 
-            const char* modes[] = {"A (Audio)", "B (9600 port)", "C (SDR)"};
-            int mi = config.mode == "B" ? 1 : config.mode == "C" ? 2 : 0;
-            if (ImGui::Combo("Channel Mode", &mi, modes, 3))
-                config.mode = mi == 0 ? "A" : mi == 1 ? "B" : "C";
+            const char* modes[] = {"A (Standard FM)", "B (9600 baud FM)"};
+            int mi = config.mode == "B" ? 1 : 0;
+            if (ImGui::Combo("Channel Mode", &mi, modes, 2))
+                config.mode = mi == 0 ? "A" : "B";
 
             const char* bauds[] = {"1200", "9600"};
             int bi = config.ax25_baud == 9600 ? 1 : 0;

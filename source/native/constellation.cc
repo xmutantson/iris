@@ -144,4 +144,80 @@ std::vector<uint8_t> demap_bits(const std::vector<std::complex<float>>& symbols,
     return bits;
 }
 
+// Soft demap: produce LLR values (positive = likely 0, negative = likely 1)
+// Approximate LLR for each bit based on distance from decision boundary
+std::vector<float> demap_soft(const std::vector<std::complex<float>>& symbols, Modulation mod) {
+    int bps = bits_per_symbol(mod);
+    std::vector<float> llrs;
+    llrs.reserve(symbols.size() * bps);
+
+    for (const auto& sym : symbols) {
+        switch (mod) {
+            case Modulation::BPSK:
+                // bit 0: +1 = 0, -1 = 1. LLR = 2*re (scaled)
+                llrs.push_back(2.0f * sym.real());
+                break;
+
+            case Modulation::QPSK: {
+                // bit 0 from I: +norm=0, -norm=1. LLR proportional to re
+                // bit 1 from Q: +norm=0, -norm=1. LLR proportional to im
+                float scale = 2.0f * std::sqrt(2.0f);  // 2/sigma normalized
+                llrs.push_back(scale * sym.real());
+                llrs.push_back(scale * sym.imag());
+                break;
+            }
+
+            case Modulation::QAM16:
+            case Modulation::QAM64:
+            case Modulation::QAM256: {
+                int order = 1 << bps;
+                int side = (int)std::sqrt((float)order);
+                int nbits_axis = bps / 2;
+
+                // Compute normalization
+                float norm = 0;
+                for (int k = 0; k < side; k++) {
+                    float v = 2.0f * k - (side - 1);
+                    norm += v * v;
+                }
+                norm = std::sqrt(2.0f * norm / side);
+
+                // Denormalize to integer grid spacing
+                float i_val = sym.real() * norm;
+                float q_val = sym.imag() * norm;
+
+                // For each axis, compute approximate LLR for each Gray-coded bit
+                // by finding min distance to constellation points with bit=0 vs bit=1
+                // Q-axis first (low bits), then I-axis (high bits)
+                // to match bit packing: val = i_gray << nbits_axis | q_gray
+                float axes[2] = {q_val, i_val};
+                for (int ax = 0; ax < 2; ax++) {
+                    float v = axes[ax];
+                    for (int b = 0; b < nbits_axis; b++) {
+                        float min_d0 = 1e9f, min_d1 = 1e9f;
+                        for (int idx = 0; idx < side; idx++) {
+                            float point = 2.0f * idx - (side - 1);
+                            float dist_sq = (v - point) * (v - point);
+                            int gray = gray_encode(idx);
+                            if ((gray >> b) & 1)
+                                min_d1 = std::min(min_d1, dist_sq);
+                            else
+                                min_d0 = std::min(min_d0, dist_sq);
+                        }
+                        // LLR = (min_d1 - min_d0) — positive means closer to 0
+                        float llr = (min_d1 - min_d0) / (norm * norm / (float)order);
+                        // Bits are packed: I-axis bits first (high), then Q-axis bits (low)
+                        // map_symbol packs as: val = i_gray << nbits_axis | q_gray
+                        // bits[i] = (val >> i) & 1, so bit 0 is LSB of q_gray
+                        llrs.push_back(llr);
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    return llrs;
+}
+
 } // namespace iris

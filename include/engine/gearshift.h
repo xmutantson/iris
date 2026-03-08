@@ -19,6 +19,9 @@ public:
     // Force a specific level (e.g., after negotiation)
     void force_level(int level);
 
+    // Lock level — force_level + disable gearshift updates
+    void lock_level(int level);
+
     // Get current level
     int current_level() const { return current_level_; }
 
@@ -30,6 +33,7 @@ public:
 private:
     int current_level_;
     int max_level_;
+    bool locked_ = false;
     float snr_avg_;
     int hold_count_;       // Frames to hold at current level before shifting
     int fail_count_;       // Consecutive CRC failures

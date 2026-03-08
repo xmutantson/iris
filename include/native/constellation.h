@@ -30,6 +30,9 @@ std::vector<std::complex<float>> map_bits(const std::vector<uint8_t>& bits, Modu
 // Demap symbols to bits
 std::vector<uint8_t> demap_bits(const std::vector<std::complex<float>>& symbols, Modulation mod);
 
+// Soft demap: produce LLR values (positive = likely 0, negative = likely 1)
+std::vector<float> demap_soft(const std::vector<std::complex<float>>& symbols, Modulation mod);
+
 } // namespace iris
 
 #endif

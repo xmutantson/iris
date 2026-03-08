@@ -133,7 +133,8 @@ public:
     void listen();
 
     // Process a received ARQ frame (called by modem when frame arrives)
-    void on_frame_received(const uint8_t* data, size_t len);
+    // Returns true if frame was handled as ARQ, false if not an ARQ frame
+    bool on_frame_received(const uint8_t* data, size_t len);
 
     // Timer tick — call periodically (~100ms) for retransmit/timeout logic
     void tick();

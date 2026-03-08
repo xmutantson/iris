@@ -54,6 +54,9 @@ bool decode_native_frame(const float* iq_samples, size_t count,
 // (not enough IQ data), as opposed to a real CRC/decode error.
 bool decode_was_overflow();
 
+// Returns IQ pairs consumed by last successful decode (for buffer drain)
+size_t decode_consumed_iq();
+
 } // namespace iris
 
 #endif

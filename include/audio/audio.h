@@ -64,6 +64,7 @@ std::unique_ptr<AudioPlayback> create_playback();
 
 // Internal loopback (TX output -> RX input, no audio hardware)
 void loopback_reset();
+void loopback_set_noise(float amplitude);  // AWGN noise amplitude (0 = off)
 std::unique_ptr<AudioCapture> create_loopback_capture();
 std::unique_ptr<AudioPlayback> create_loopback_playback();
 
