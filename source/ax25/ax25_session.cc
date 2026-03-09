@@ -31,6 +31,10 @@ void Ax25Session::reset_session() {
     reject_exception_ = false;
     acknowledge_pending_ = false;
     last_received_ctrl_ = 0;
+    kiss_managed_ = false;
+    kiss_ns_offset_ = 0;
+    kiss_inject_ns_ = 0;
+    kiss_inject_acked_ = false;
     while (!tx_queue_.empty()) tx_queue_.pop();
     for (int i = 0; i < 8; i++) tx_window_[i] = TxIFrame{};
 }
@@ -58,6 +62,54 @@ void Ax25Session::establish_data_link() {
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+void Ax25Session::notify_outgoing(const uint8_t* frame, size_t len) {
+    // Parse outgoing KISS frame to track session state.
+    // The KISS client (e.g., Winlink) manages the connection — we just
+    // shadow its state so we don't interfere (e.g., sending DM to a valid UA).
+    Ax25Frame f;
+    if (!ax25_parse(frame, len, f))
+        return;
+
+    // Only care about frames FROM our callsign
+    if (!f.src.matches(local_call_))
+        return;
+
+    if (f.type() == Ax25FrameType::U_FRAME) {
+        Ax25UType ut = f.u_type();
+        if (ut == Ax25UType::SABM &&
+                   (state_ == Ax25SessionState::DISCONNECTED ||
+                    state_ == Ax25SessionState::AWAITING_CONNECTION)) {
+            // KISS client initiating connection — track it
+            reset_session();
+            remote_call_ = f.dst.to_string();
+            local_addr_ = ax25_make_addr(local_call_);
+            remote_addr_ = f.dst;
+            retry_count_ = 0;
+            kiss_managed_ = true;
+            kiss_passthrough_ = true;  // KISS client active — forward incoming connections
+            t1_ = T1_TICKS;
+            t3_ = 0;
+            set_state(Ax25SessionState::AWAITING_CONNECTION);
+            IRIS_LOG("AX25 KISS SABM to %s — tracking session", remote_call_.c_str());
+        } else if (ut == Ax25UType::DISC &&
+                   (state_ == Ax25SessionState::CONNECTED ||
+                    state_ == Ax25SessionState::TIMER_RECOVERY)) {
+            t1_ = T1_TICKS;
+            t3_ = 0;
+            set_state(Ax25SessionState::AWAITING_RELEASE);
+            IRIS_LOG("AX25 KISS DISC — tracking disconnect");
+        }
+    }
+
+    // Shadow V(S): track outgoing I-frames from KISS client
+    if (f.type() == Ax25FrameType::I_FRAME && kiss_managed_) {
+        // The KISS client's N(S) doesn't include our injected frames,
+        // so the actual OTA N(S) = KISS N(S) + kiss_ns_offset_
+        uint8_t ns = f.ns();
+        vs_ = ((ns + kiss_ns_offset_) + 1) % 8;
+    }
+}
 
 void Ax25Session::connect(const std::string& remote_call) {
     reset_session();
@@ -307,10 +359,80 @@ bool Ax25Session::on_frame_received(const Ax25Frame& frame) {
 
     Ax25FrameType ft = frame.type();
 
+    // KISS-managed sessions: the KISS client handles the full AX.25 session.
+    // We only track state transitions (UA→CONNECTED, DISC→DISCONNECTED) and
+    // never generate frames or consume I/S frames.
+    if (kiss_managed_) {
+        if (state_ == Ax25SessionState::AWAITING_CONNECTION) {
+            if (ft == Ax25FrameType::U_FRAME) {
+                Ax25UType ut = frame.u_type();
+                if (ut == Ax25UType::UA) {
+                    IRIS_LOG("AX25 KISS RX UA from %s -> CONNECTED", frame.src.to_string().c_str());
+                    t1_ = 0;
+                    t3_ = T3_TICKS;
+                    vs_ = vr_ = va_ = 0;
+                    set_state(Ax25SessionState::CONNECTED);
+                } else if (ut == Ax25UType::DM) {
+                    IRIS_LOG("AX25 KISS RX DM from %s -> DISCONNECTED", frame.src.to_string().c_str());
+                    reset_session();
+                    set_state(Ax25SessionState::DISCONNECTED);
+                }
+            }
+        } else if (state_ == Ax25SessionState::CONNECTED ||
+                   state_ == Ax25SessionState::TIMER_RECOVERY) {
+            if (ft == Ax25FrameType::U_FRAME) {
+                Ax25UType ut = frame.u_type();
+                if (ut == Ax25UType::DISC) {
+                    IRIS_LOG("AX25 KISS RX DISC from %s -> DISCONNECTED", frame.src.to_string().c_str());
+                    reset_session();
+                    set_state(Ax25SessionState::DISCONNECTED);
+                } else if (ut == Ax25UType::DM) {
+                    IRIS_LOG("AX25 KISS RX DM from %s -> DISCONNECTED", frame.src.to_string().c_str());
+                    reset_session();
+                    set_state(Ax25SessionState::DISCONNECTED);
+                }
+            }
+            // Shadow V(R): track incoming I-frames so we can inject our own
+            if (ft == Ax25FrameType::I_FRAME) {
+                uint8_t ns = frame.ns();
+                if (ns == vr_)
+                    vr_ = (vr_ + 1) % 8;
+                // Check for connection header (but don't deliver normal data —
+                // KISS gets the raw frame via dispatch_rx_frame/rx_callback)
+                if (!frame.info.empty() && data_received_ &&
+                    frame.info.size() >= 5 &&
+                    frame.info[0] == 'I' && frame.info[1] == 'R' &&
+                    frame.info[2] == 'I' && frame.info[3] == 'S' &&
+                    frame.info[4] == '/') {
+                    data_received_(frame.info.data(), frame.info.size());
+                }
+            }
+            // Reset idle timer on any received frame
+            t3_ = T3_TICKS;
+        } else if (state_ == Ax25SessionState::AWAITING_RELEASE) {
+            if (ft == Ax25FrameType::U_FRAME) {
+                Ax25UType ut = frame.u_type();
+                if (ut == Ax25UType::UA || ut == Ax25UType::DM) {
+                    IRIS_LOG("AX25 KISS RX %s -> DISCONNECTED",
+                             ut == Ax25UType::UA ? "UA" : "DM");
+                    reset_session();
+                    set_state(Ax25SessionState::DISCONNECTED);
+                }
+            }
+        }
+        return false;  // Never consume — let frames pass through to KISS
+    }
+
     // -----------------------------------------------------------------------
     // STATE 1: DISCONNECTED
     // -----------------------------------------------------------------------
     if (state_ == Ax25SessionState::DISCONNECTED) {
+        // KISS passthrough: KISS client handles incoming connections — don't accept
+        if (kiss_passthrough_) {
+            IRIS_LOG("AX25 RX frame while DISCONNECTED (KISS passthrough) — forwarding to KISS");
+            return false;
+        }
+
         if (ft == Ax25FrameType::U_FRAME) {
             Ax25UType ut = frame.u_type();
 
@@ -812,10 +934,12 @@ void Ax25Session::tick() {
         t2_--;
         if (t2_ == 0 && acknowledge_pending_) {
             acknowledge_pending_ = false;
-            if (own_busy_)
-                send_rnr(false, false);
-            else
-                send_rr(false, false);
+            if (!kiss_managed_) {
+                if (own_busy_)
+                    send_rnr(false, false);
+                else
+                    send_rr(false, false);
+            }
         }
     }
 
@@ -832,26 +956,50 @@ void Ax25Session::tick() {
             }
 
             if (state_ == Ax25SessionState::AWAITING_CONNECTION) {
-                IRIS_LOG("AX25 T1 retry SABM (%d/%d)", retry_count_, N2);
-                send_sabm();
-                t1_ = T1_TICKS;
+                if (kiss_managed_) {
+                    // KISS client handles SABM retries — just reset T1 and wait.
+                    // The KISS client will re-send SABM if needed; each one
+                    // resets our retry_count via notify_outgoing().
+                    t1_ = T1_TICKS;
+                    IRIS_LOG("AX25 T1 (KISS-managed) — waiting for KISS client retry (%d/%d)", retry_count_, N2);
+                } else {
+                    IRIS_LOG("AX25 T1 retry SABM (%d/%d)", retry_count_, N2);
+                    send_sabm();
+                    t1_ = T1_TICKS;
+                }
             } else if (state_ == Ax25SessionState::AWAITING_RELEASE) {
-                IRIS_LOG("AX25 T1 retry DISC (%d/%d)", retry_count_, N2);
-                send_disc();
-                t1_ = T1_TICKS;
+                if (kiss_managed_) {
+                    t1_ = T1_TICKS;
+                    IRIS_LOG("AX25 T1 (KISS-managed) — waiting for KISS client DISC retry (%d/%d)", retry_count_, N2);
+                } else {
+                    IRIS_LOG("AX25 T1 retry DISC (%d/%d)", retry_count_, N2);
+                    send_disc();
+                    t1_ = T1_TICKS;
+                }
             } else if (state_ == Ax25SessionState::CONNECTED) {
-                // Enter Timer Recovery (State 4)
-                IRIS_LOG("AX25 T1 timeout -> TIMER_RECOVERY, poll (%d/%d)",
-                         retry_count_, N2);
-                send_rr(true, true);  // Command with P=1
-                t1_ = T1_TICKS;
-                set_state(Ax25SessionState::TIMER_RECOVERY);
+                if (kiss_managed_) {
+                    // KISS client handles its own polling — don't send RR
+                    t1_ = T1_TICKS;
+                    IRIS_LOG("AX25 T1 (KISS-managed) — skipping poll in CONNECTED (%d/%d)", retry_count_, N2);
+                } else {
+                    // Enter Timer Recovery (State 4)
+                    IRIS_LOG("AX25 T1 timeout -> TIMER_RECOVERY, poll (%d/%d)",
+                             retry_count_, N2);
+                    send_rr(true, true);  // Command with P=1
+                    t1_ = T1_TICKS;
+                    set_state(Ax25SessionState::TIMER_RECOVERY);
+                }
             } else if (state_ == Ax25SessionState::TIMER_RECOVERY) {
-                // Already in timer recovery — re-poll
-                IRIS_LOG("AX25 T1 re-poll in TIMER_RECOVERY (%d/%d)",
-                         retry_count_, N2);
-                send_rr(true, true);  // Command with P=1
-                t1_ = T1_TICKS;
+                if (kiss_managed_) {
+                    t1_ = T1_TICKS;
+                    IRIS_LOG("AX25 T1 (KISS-managed) — skipping re-poll in TIMER_RECOVERY (%d/%d)", retry_count_, N2);
+                } else {
+                    // Already in timer recovery — re-poll
+                    IRIS_LOG("AX25 T1 re-poll in TIMER_RECOVERY (%d/%d)",
+                             retry_count_, N2);
+                    send_rr(true, true);  // Command with P=1
+                    t1_ = T1_TICKS;
+                }
             }
         }
     }
@@ -861,11 +1009,16 @@ void Ax25Session::tick() {
                      state_ == Ax25SessionState::TIMER_RECOVERY)) {
         t3_--;
         if (t3_ == 0) {
-            IRIS_LOG("AX25 T3 idle timeout, entering timer recovery");
-            retry_count_ = 0;
-            send_rr(true, true);  // Command with P=1
-            t1_ = T1_TICKS;
-            set_state(Ax25SessionState::TIMER_RECOVERY);
+            if (kiss_managed_) {
+                t3_ = T3_TICKS;  // Restart, don't send — KISS client handles idle polling
+                IRIS_LOG("AX25 T3 (KISS-managed) — skipping idle poll");
+            } else {
+                IRIS_LOG("AX25 T3 idle timeout, entering timer recovery");
+                retry_count_ = 0;
+                send_rr(true, true);  // Command with P=1
+                t1_ = T1_TICKS;
+                set_state(Ax25SessionState::TIMER_RECOVERY);
+            }
         }
     }
 }
@@ -875,6 +1028,77 @@ void Ax25Session::select_t1_value() {
     // For simplicity, we use a fixed value. A more sophisticated
     // implementation could measure actual round-trip times.
     // (Currently T1_TICKS is the fixed default.)
+}
+
+// ---------------------------------------------------------------------------
+// KISS injection helpers
+// ---------------------------------------------------------------------------
+
+// Find control byte offset in raw AX.25 frame (after address field)
+static int find_ctrl_offset(const uint8_t* frame, size_t len) {
+    if (len < 15) return -1;
+    if (frame[13] & 0x01) return 14;  // No digipeaters
+    size_t pos = 14;
+    while (pos + 6 < len) {
+        if (frame[pos + 6] & 0x01) return (int)(pos + 7);
+        pos += 7;
+    }
+    return -1;
+}
+
+std::vector<uint8_t> Ax25Session::kiss_inject_iframe(const uint8_t* data, size_t len) {
+    // Build I-frame with current shadowed vs_/vr_
+    auto frame = ax25_build_i(remote_addr_, local_addr_,
+                              vs_, vr_, false, AX25_PID_NONE,
+                              data, len);
+    IRIS_LOG("AX25 KISS inject I N(S)=%d N(R)=%d (%zu bytes)", vs_, vr_, len);
+    kiss_inject_ns_ = vs_;
+    kiss_inject_acked_ = false;
+    vs_ = (vs_ + 1) % 8;
+    kiss_ns_offset_++;
+    return frame;
+}
+
+void Ax25Session::kiss_rewrite_outgoing(uint8_t* frame, size_t len) {
+    if (kiss_ns_offset_ == 0) return;
+    int co = find_ctrl_offset(frame, len);
+    if (co < 0) return;
+    uint8_t ctrl = frame[co];
+    if (ctrl & 0x01) return;  // Not an I-frame (bit0=0 for I-frames)
+    uint8_t ns = (ctrl >> 1) & 0x07;
+    uint8_t new_ns = (ns + kiss_ns_offset_) % 8;
+    frame[co] = (ctrl & 0xF1) | ((new_ns & 0x07) << 1);
+}
+
+void Ax25Session::kiss_rewrite_incoming(uint8_t* frame, size_t len) {
+    if (kiss_ns_offset_ == 0) return;
+    int co = find_ctrl_offset(frame, len);
+    if (co < 0) return;
+    uint8_t ctrl = frame[co];
+    // I-frames and S-frames both have N(R) in bits 7:5
+    // I-frame: bit0=0. S-frame: bit0=1, bit1=0 (0bXXXXXX01)
+    bool is_i = (ctrl & 0x01) == 0;
+    bool is_s = (ctrl & 0x03) == 0x01;
+    if (!is_i && !is_s) return;
+    uint8_t nr = (ctrl >> 5) & 0x07;
+
+    // Only adjust N(R) once the remote has acked past our injected frame.
+    // Before that, N(R) refers only to KISS client frames — no adjustment needed.
+    if (!kiss_inject_acked_) {
+        // N(R) acks all frames up to N(R)-1.  Our injection was at kiss_inject_ns_.
+        // Check if kiss_inject_ns_ is in the acked range: delta in [1,4] means
+        // nr is past our injection point (forward half of mod-8 circle).
+        int delta = (nr - kiss_inject_ns_ + 8) % 8;
+        if (delta >= 1 && delta <= 4) {
+            kiss_inject_acked_ = true;
+            IRIS_LOG("AX25 KISS inject acked (N(R)=%d, inject_ns=%d)", nr, kiss_inject_ns_);
+        }
+    }
+
+    if (kiss_inject_acked_) {
+        uint8_t new_nr = (nr - kiss_ns_offset_ + 8) % 8;
+        frame[co] = (ctrl & 0x1F) | ((new_nr & 0x07) << 5);
+    }
 }
 
 } // namespace iris

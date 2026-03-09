@@ -7,6 +7,7 @@
 #include <functional>
 #include <string>
 #include <vector>
+#include <mutex>
 
 namespace iris {
 
@@ -49,6 +50,12 @@ public:
     // Log a message to the GUI log panel
     void log(const std::string& msg);
 
+    // Log a packet to the packet log panel
+    // direction: true=TX (red), false=RX (white)
+    // protocol: e.g. "AX.25", "FX.25", "Iris-A3"
+    void log_packet(bool is_tx, const std::string& protocol,
+                    const std::string& description);
+
 private:
     bool open_ = false;
     GuiCallbacks callbacks_;
@@ -61,7 +68,18 @@ private:
     int selected_mode_ = 0;  // 0=A, 1=B, 2=C
     bool show_config_ = false;
     bool show_log_ = false;
+    bool show_packet_log_ = false;
     int settings_tab_ = 0;
+
+    // Packet log entries
+    struct PacketLogEntry {
+        bool is_tx;              // true=TX (red), false=RX (white)
+        std::string timestamp;   // HH:MM:SS
+        std::string protocol;    // AX.25, FX.25-16, Iris-A3, etc.
+        std::string description; // Frame description
+    };
+    std::vector<PacketLogEntry> packet_log_;
+    std::mutex packet_log_mutex_;
 
     // Waterfall scrolling history (rows x bins)
     static constexpr int WF_HISTORY = 100;  // rows of history

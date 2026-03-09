@@ -36,6 +36,20 @@ std::vector<uint8_t> build_xid_frame(const char* src, const char* dst,
 // Returns the intersection of capabilities and minimum max_modulation
 XidCapability negotiate(const XidCapability& local, const XidCapability& remote);
 
+// --- Connection header (replaces XID U-frame) ---
+// Sent as I-frame payload: "IRIS/1 caps=XXXX mod=N\r"
+// Non-Iris stations display it as harmless text.
+// Iris peers parse it and negotiate native mode upgrade.
+
+constexpr const char* CONN_HEADER_PREFIX = "IRIS/";
+
+// Encode capability into a plaintext connection header string
+std::vector<uint8_t> conn_header_encode(const XidCapability& cap);
+
+// Try to decode a connection header from I-frame data.
+// Returns true if the data starts with "IRIS/" and was successfully parsed.
+bool conn_header_decode(const uint8_t* data, size_t len, XidCapability& cap);
+
 } // namespace iris
 
 #endif

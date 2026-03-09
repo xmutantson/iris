@@ -28,30 +28,30 @@ static void emit_stuffed(std::vector<uint8_t>& bits, uint8_t byte, int& ones) {
     }
 }
 
-std::vector<uint8_t> hdlc_encode(const uint8_t* frame, size_t len,
-                                  int preamble_flags, int postamble_flags) {
-    std::vector<uint8_t> bits;
-    bits.reserve(len * 10 + (preamble_flags + postamble_flags) * 8 + 32);
+// Encode HDLC frame to raw bits (pre-NRZI). Caller must NRZI-encode.
+void hdlc_encode_raw(std::vector<uint8_t>& bits, const uint8_t* frame, size_t len,
+                     int preamble_flags, int postamble_flags) {
+    bits.reserve(bits.size() + len * 10 + (preamble_flags + postamble_flags) * 8 + 32);
 
-    // Preamble flags (no bit stuffing)
     for (int i = 0; i < preamble_flags; i++)
         emit_byte_bits(bits, AX25_FLAG);
 
-    // Frame data with bit stuffing
     int ones = 0;
     for (size_t i = 0; i < len; i++)
         emit_stuffed(bits, frame[i], ones);
 
-    // CRC-16 (computed over frame data, sent LSB first with bit stuffing)
     uint16_t crc = crc16_ccitt(frame, len);
     emit_stuffed(bits, crc & 0xFF, ones);
     emit_stuffed(bits, (crc >> 8) & 0xFF, ones);
 
-    // Postamble flags
     for (int i = 0; i < postamble_flags; i++)
         emit_byte_bits(bits, AX25_FLAG);
+}
 
-    // Apply NRZI encoding
+std::vector<uint8_t> hdlc_encode(const uint8_t* frame, size_t len,
+                                  int preamble_flags, int postamble_flags) {
+    std::vector<uint8_t> bits;
+    hdlc_encode_raw(bits, frame, len, preamble_flags, postamble_flags);
     return nrzi_encode(bits);
 }
 

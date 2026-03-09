@@ -49,6 +49,10 @@ public:
     // Handle received parsed AX.25 frame. Returns true if consumed.
     bool on_frame_received(const Ax25Frame& frame);
 
+    // Notify session of an outgoing frame from KISS (track state without
+    // generating our own frames — the KISS client already has the frame queued).
+    void notify_outgoing(const uint8_t* frame, size_t len);
+
     // Timer tick — call every ~100ms
     void tick();
 
@@ -60,7 +64,23 @@ public:
     const std::string& remote_callsign() const { return remote_call_; }
     int pending_frames() const;
     bool is_active() const { return state_ != Ax25SessionState::DISCONNECTED; }
+    bool is_kiss_managed() const { return kiss_managed_; }
+    void set_kiss_passthrough(bool v) { kiss_passthrough_ = v; }
+    bool is_kiss_passthrough() const { return kiss_passthrough_; }
     int retry_count() const { return retry_count_; }
+
+    // KISS injection: build and queue an I-frame using shadowed sequence numbers.
+    // Bumps kiss_ns_offset_ so subsequent KISS frames get rewritten.
+    // Returns the built frame (caller queues it for TX).
+    std::vector<uint8_t> kiss_inject_iframe(const uint8_t* data, size_t len);
+
+    // Rewrite outgoing KISS I-frame N(S) += kiss_ns_offset_.
+    // Call before transmitting. Also updates shadowed vs_.
+    void kiss_rewrite_outgoing(uint8_t* frame, size_t len);
+
+    // Rewrite incoming I-frame/S-frame N(R) -= kiss_ns_offset_ before
+    // forwarding to KISS client. Returns adjusted frame.
+    void kiss_rewrite_incoming(uint8_t* frame, size_t len);
 
 private:
     void set_state(Ax25SessionState s);
@@ -97,7 +117,7 @@ private:
     // AX.25 2.2 system parameters (Section 6)
     static constexpr int K = 7;             // Window size (max outstanding I-frames)
     static constexpr int N2 = 10;           // Max retries
-    static constexpr int T1_TICKS = 30;     // 3.0s ack timeout (at 100ms tick rate)
+    static constexpr int T1_TICKS = 50;     // 5.0s ack timeout (at 100ms tick rate)
     static constexpr int T2_TICKS = 3;      // 0.3s response delay timer
     static constexpr int T3_TICKS = 300;    // 30s idle supervision
     static constexpr int MAX_INFO = 256;    // Max I-frame info field bytes (N1)
@@ -132,6 +152,11 @@ private:
     bool acknowledge_pending_ = false;  // Need to send acknowledgment (T2 driven)
     bool srej_enabled_ = false;         // SREJ supported (negotiated via XID)
     uint8_t last_received_ctrl_ = 0;    // For FRMR info field
+    bool kiss_managed_ = false;          // Session initiated by KISS client (don't generate SABM/DISC retries)
+    bool kiss_passthrough_ = false;      // KISS client active — don't accept incoming connections
+    int kiss_ns_offset_ = 0;             // Sequence offset for injected frames (mod 8)
+    uint8_t kiss_inject_ns_ = 0;         // N(S) used for injected frame
+    bool kiss_inject_acked_ = false;     // Remote has acked past our injection point
 
     // Addresses (built once per connection)
     Ax25Address local_addr_;

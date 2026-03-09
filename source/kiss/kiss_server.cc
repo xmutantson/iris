@@ -80,6 +80,14 @@ void KissServer::stop() {
 
 void KissServer::accept_thread() {
     while (running_) {
+        // Use select() with timeout so we can check running_ periodically
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET((socket_t)listen_sock_, &fds);
+        struct timeval tv = {1, 0};  // 1 second timeout
+        int sel = select((int)listen_sock_ + 1, &fds, nullptr, nullptr, &tv);
+        if (sel <= 0) continue;  // timeout or error — recheck running_
+
         struct sockaddr_in client_addr = {};
         int addr_len = sizeof(client_addr);
 
@@ -90,10 +98,13 @@ void KissServer::accept_thread() {
 
         printf("[KISS] Client connected\n");
 
+        int count;
         {
             std::lock_guard<std::mutex> lock(clients_mutex_);
             client_sockets_.push_back((int)cs);
+            count = (int)client_sockets_.size();
         }
+        if (client_callback_) client_callback_(count);
 
         // Spawn client handler thread (detached)
         std::thread(&KissServer::client_thread, this, (int)cs).detach();
@@ -120,15 +131,18 @@ void KissServer::client_thread(int sock) {
     }
 
     // Remove from client list
+    int count;
     {
         std::lock_guard<std::mutex> lock(clients_mutex_);
         client_sockets_.erase(
             std::remove(client_sockets_.begin(), client_sockets_.end(), sock),
             client_sockets_.end());
+        count = (int)client_sockets_.size();
     }
 
     CLOSE_SOCKET((socket_t)sock);
     printf("[KISS] Client disconnected\n");
+    if (client_callback_) client_callback_(count);
 }
 
 void KissServer::send_to_clients(const uint8_t* frame, size_t len) {

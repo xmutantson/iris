@@ -59,6 +59,7 @@ static void print_usage() {
     printf("  --mode <A|B|C>     Set channel mode\n");
     printf("  --ax25-only        Disable native PHY upgrade\n");
     printf("  --native-hail      Use native PHY for hailing (both sides must enable)\n");
+    printf("  --fx25 [16|32|64]  Enable FX.25 FEC for AX.25 TX (default: 16 check bytes)\n");
     printf("  --ax25-baud <n>    AX.25 baud rate (1200 or 9600)\n");
     printf("  --max-mod <mod>    Max modulation (BPSK,QPSK,QAM16,QAM64,QAM256)\n");
     printf("  --speed-level <n>  Force speed level 0-7 (default: auto)\n");
@@ -122,6 +123,7 @@ int main(int argc, char** argv) {
     int cli_ssid = -1;
     bool cli_ax25_only = false;
     bool cli_native_hail = false;
+    int cli_fx25_mode = -1;  // -1 = not set
     int cli_ax25_baud = -1;
     std::string cli_max_mod;
     float cli_tx_level = -1.0f;
@@ -172,6 +174,17 @@ int main(int argc, char** argv) {
             cli_ax25_only = true;
         } else if (strcmp(argv[i], "--native-hail") == 0) {
             cli_native_hail = true;
+        } else if (strcmp(argv[i], "--fx25") == 0) {
+            // Optional argument: 16, 32, or 64. Default to 16 if none given.
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                cli_fx25_mode = atoi(argv[++i]);
+                if (cli_fx25_mode != 16 && cli_fx25_mode != 32 && cli_fx25_mode != 64) {
+                    printf("Error: --fx25 must be 16, 32, or 64\n");
+                    return 1;
+                }
+            } else {
+                cli_fx25_mode = 16;
+            }
         } else if (strcmp(argv[i], "--ax25-baud") == 0 && i + 1 < argc) {
             cli_ax25_baud = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--max-mod") == 0 && i + 1 < argc) {
@@ -266,6 +279,7 @@ int main(int argc, char** argv) {
     if (!cli_mode.empty()) config.mode = cli_mode;
     if (cli_ax25_only) config.ax25_only = true;
     if (cli_native_hail) config.native_hail = true;
+    if (cli_fx25_mode >= 0) config.fx25_mode = cli_fx25_mode;
     if (cli_ax25_baud > 0) config.ax25_baud = cli_ax25_baud;
     if (!cli_max_mod.empty()) config.max_modulation = parse_modulation(cli_max_mod.c_str());
     if (cli_tx_level >= 0.0f) config.tx_level = cli_tx_level;
@@ -373,6 +387,9 @@ int main(int argc, char** argv) {
     KissServer kiss;
     kiss.set_tx_callback([&modem](const uint8_t* frame, size_t len) {
         modem.queue_tx_frame(frame, len);
+    });
+    kiss.set_client_callback([&modem](int count) {
+        modem.set_kiss_passthrough(count > 0);
     });
     kiss.set_param_callback([&config](uint8_t cmd, uint8_t value) {
         switch (cmd) {
@@ -574,6 +591,11 @@ int main(int argc, char** argv) {
         gui.log(msg);
     });
 
+    // Modem packet log → GUI packet log
+    modem.set_packet_log([&gui](bool is_tx, const std::string& proto, const std::string& desc) {
+        gui.log_packet(is_tx, proto, desc);
+    });
+
     // Initialize PTT (after GUI so log messages appear in event log)
     auto ptt = create_ptt(config.ptt_method, config.rigctl_host, config.rigctl_port,
                           config.serial_port, config.serial_baud,
@@ -610,9 +632,10 @@ int main(int argc, char** argv) {
             else if (diag.arq_state == ArqState::CONNECTING) arq_str = "CONNECTING";
             else if (diag.arq_state == ArqState::CONNECTED) arq_str = "CONNECTED";
             else if (diag.arq_state == ArqState::DISCONNECTING) arq_str = "DISCONNECTING";
-            printf("[Status] KISS: %d, AGW: %d, RX: %d, TX: %d, CRC: %d, SNR: %.1f dB, Level: %s, ARQ: %s\n",
+            printf("[Status] KISS: %d, AGW: %d, RX: %d, TX: %d, CRC: %d, SNR: %.1f dB, Level: %s, ARQ: %s, DCD: %s (RMS=%.4f, thr=%.3f)\n",
                    kiss.client_count(), agw.client_count(), diag.frames_rx, diag.frames_tx,
-                   diag.crc_errors, diag.snr_db, SPEED_LEVELS[diag.speed_level].name, arq_str);
+                   diag.crc_errors, diag.snr_db, SPEED_LEVELS[diag.speed_level].name, arq_str,
+                   diag.dcd_busy ? "BUSY" : "clear", diag.rx_raw_rms, config.dcd_threshold);
             last_status = now;
         }
 

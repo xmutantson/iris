@@ -1,5 +1,6 @@
 #include "native/xid.h"
 #include <cstring>
+#include <cstdio>
 #include <algorithm>
 
 namespace iris {
@@ -71,6 +72,35 @@ XidCapability negotiate(const XidCapability& local, const XidCapability& remote)
     result.capabilities = local.capabilities & remote.capabilities;
     result.max_modulation = std::min(local.max_modulation, remote.max_modulation);
     return result;
+}
+
+// --- Connection header ---
+
+std::vector<uint8_t> conn_header_encode(const XidCapability& cap) {
+    // Format: "IRIS/1 caps=XXXX mod=N\r"
+    // caps is 4-digit hex, mod is single digit (0-6)
+    char buf[64];
+    int n = snprintf(buf, sizeof(buf), "IRIS/%u caps=%04X mod=%u\r",
+                     cap.version, cap.capabilities, (unsigned)cap.max_modulation);
+    return std::vector<uint8_t>(buf, buf + n);
+}
+
+bool conn_header_decode(const uint8_t* data, size_t len, XidCapability& cap) {
+    if (len < 5) return false;
+
+    // Must start with "IRIS/"
+    if (memcmp(data, CONN_HEADER_PREFIX, 5) != 0) return false;
+
+    // Parse: "IRIS/<version> caps=<hex> mod=<digit>\r"
+    unsigned ver = 0, caps = 0, mod = 0;
+    int matched = sscanf((const char*)data, "IRIS/%u caps=%X mod=%u", &ver, &caps, &mod);
+    if (matched < 3) return false;
+    if (mod > (unsigned)Modulation::QAM256) return false;
+
+    cap.version = (uint8_t)ver;
+    cap.capabilities = (uint16_t)caps;
+    cap.max_modulation = (Modulation)mod;
+    return true;
 }
 
 } // namespace iris

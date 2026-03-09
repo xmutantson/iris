@@ -18,22 +18,29 @@ bool Ax25Address::matches(const std::string& call) const {
     // Parse "CALL" or "CALL-N" format
     std::string base = call;
     uint8_t s = 0;
+    bool has_ssid = false;
     auto pos = call.find('-');
     if (pos != std::string::npos) {
         std::string ssid_str = call.substr(pos + 1);
         if (!ssid_str.empty() && ssid_str.find_first_not_of("0123456789") == std::string::npos) {
             base = call.substr(0, pos);
             s = (uint8_t)std::stoi(ssid_str);
+            has_ssid = true;
         }
         // else: not a numeric SSID, use full string as callsign
     }
 
-    // Compare (padded to 6 with spaces)
+    // Compare callsign (padded to 6 with spaces)
     for (int i = 0; i < 6; i++) {
         char expected = (i < (int)base.size()) ? base[i] : ' ';
         if (callsign[i] != expected) return false;
     }
-    return ssid == s;
+    // If caller specified an explicit SSID (e.g. "KG7VSN-15"), require exact match.
+    // If no SSID specified (e.g. "KG7VSN"), accept any SSID — allows responding
+    // to frames addressed to any SSID of our callsign (important for Winlink).
+    if (has_ssid)
+        return ssid == s;
+    return true;
 }
 
 // Encode a 7-byte AX.25 address into frame bytes

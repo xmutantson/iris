@@ -15,6 +15,7 @@
 #include "crypto/crypto.h"
 #include "b2f/b2f_handler.h"
 #include "ax25/hdlc.h"
+#include "ax25/fx25.h"
 #include "ax25/afsk.h"
 #include "ax25/gfsk.h"
 #include "kiss/kiss_server.h"
@@ -41,12 +42,15 @@ enum class ModemState {
 };
 
 // Calibration state machine
+// Initiator: SEND_CMD → TX_TONE → WAIT_REPORT → DONE
+// Responder (auto): RX_TONE → SEND_REPORT → IDLE
 enum class CalState {
     IDLE,
+    SEND_CMD,       // Queue CAL:START UI frame, wait for TX drain
     TX_TONE,        // Transmitting test tone
     WAIT_REPORT,    // Waiting for partner's level report
-    RX_TONE,        // Receiving partner's test tone
-    TX_REPORT,      // Sending level report to partner
+    RX_TONE,        // Measuring partner's test tone RMS
+    SEND_REPORT,    // Queue CAL:RMS report, wait for TX drain
     DONE,
 };
 
@@ -69,6 +73,7 @@ struct ModemDiag {
     float cal_measured_rms;
     ArqState arq_state;
     ArqRole arq_role;
+    Ax25SessionState ax25_state = Ax25SessionState::DISCONNECTED;
     std::vector<std::complex<float>> constellation;  // Last received symbols
     std::vector<float> spectrum;   // Power spectrum for waterfall
 
@@ -87,6 +92,10 @@ struct ModemDiag {
     int app_bps = 0;               // Application-level bitrate
     float compression_ratio = 0;   // 0 = off, >1 = active
     int encryption_state = 0;      // 0=off, 1=kx, 2=encrypted, 3=psk_mismatch
+
+    // DCD (carrier detect)
+    bool dcd_busy = false;
+    float rx_raw_rms = 0;          // Pre-AGC RMS for DCD tuning
 
     // Negotiated band info (from probe or config)
     float band_low_hz = 300.0f;
@@ -130,6 +139,7 @@ public:
     Ax25SessionState ax25_state() const { return ax25_session_.state(); }
     int ax25_pending_frames() const { return ax25_session_.pending_frames(); }
     const std::string& ax25_remote_callsign() const { return ax25_session_.remote_callsign(); }
+    void set_kiss_passthrough(bool v) { ax25_session_.set_kiss_passthrough(v); }
 
     // Periodic tick for ARQ timeouts (call from main loop ~100ms)
     void tick();
@@ -153,6 +163,11 @@ public:
     // GUI event log callback (frame events, not debug noise)
     void set_gui_log(std::function<void(const std::string&)> cb) { gui_log_ = cb; }
 
+    // Packet log callback (is_tx, protocol, description)
+    void set_packet_log(std::function<void(bool, const std::string&, const std::string&)> cb) {
+        packet_log_ = cb;
+    }
+
 
     // Callback when ARQ state changes (for AGW notifications)
     void set_state_callback(std::function<void(ArqState, const std::string&)> cb) {
@@ -171,8 +186,12 @@ public:
 private:
     void process_rx_ax25(const float* audio, int count);
     void process_rx_native(const float* audio, int count);
+    void dispatch_rx_frame(const std::vector<uint8_t>& frame, bool from_fx25 = false);
     void process_calibration_rx(const float* audio, int count);
     void generate_cal_tone(float* audio, int count);
+    void send_cal_ui(const char* payload);
+    void send_conn_header_ui(const std::string& dest_call);
+    void handle_cal_frame(const uint8_t* info, size_t len);
 
     void ptt_on();
     void ptt_off();
@@ -190,7 +209,10 @@ private:
     GfskModulator gfsk_mod_;
     GfskDemodulator gfsk_demod_;
     HdlcDecoder hdlc_decoder_;
+    Fx25Decoder fx25_decoder_;    // FX.25 decoder (runs in parallel with HDLC)
     NrziDecoder nrzi_decoder_;
+    std::vector<uint8_t> last_rx_frame_;  // Dedup: last dispatched frame content
+    int dedup_cooldown_ = 0;              // Samples remaining for dedup window
 
     // Native PHY
     PhyConfig phy_config_;
@@ -252,6 +274,13 @@ private:
     std::atomic<bool> rx_muted_{false};
     int rx_mute_holdoff_ = 0;  // Samples to remain muted after TX ends
 
+    // DCD (Data Carrier Detect) — defer TX while channel is busy
+    static constexpr int DCD_HOLDOFF_TICKS = 5;  // ~50-100ms quiet after carrier drops
+    int dcd_holdoff_ = 0;
+
+    // CSMA guard: defer TX after last frame decode to avoid stepping on response
+    int csma_holdoff_ = 0;  // process_tx ticks remaining
+
     // TX queue
     std::mutex tx_mutex_;
     std::queue<std::vector<uint8_t>> tx_queue_;
@@ -270,10 +299,9 @@ private:
     bool xid_sent_ = false;
     XidCapability local_cap_;
 
-    // XID handshake timing
-    std::vector<uint8_t> pending_xid_reply_;    // Held XID reply (responder)
-    int xid_reply_delay_samples_ = 0;           // Countdown before XID reply TX
-    std::queue<std::vector<uint8_t>> deferred_tx_queue_;  // Data held during XID handshake
+    // Connection header handshake timing
+    int xid_delay_ticks_ = 0;                   // Delay before sending header after CONNECTED
+    std::string xid_peer_call_;                  // Peer callsign for delayed header
     int xid_fallback_ticks_ = 0;                // Fallback timer if remote not Iris
 
     // Calibration
@@ -292,6 +320,7 @@ private:
     std::atomic<uint64_t> bytes_tx_{0};
     int crypto_state_ = 0;  // 0=off, 1=kx, 2=encrypted, 3=psk_mismatch
     float rx_rms_ = 0;
+    float rx_raw_rms_ = 0;  // Pre-AGC RMS for DCD
     float rx_peak_ = 0;  // Peak sample value (decays over time)
     int rx_diag_counter_ = 0;  // Periodic RX diagnostic counter
 
@@ -318,6 +347,9 @@ private:
 
     // GUI event log
     std::function<void(const std::string&)> gui_log_;
+
+    // Packet log callback (is_tx, protocol, description)
+    std::function<void(bool, const std::string&, const std::string&)> packet_log_;
 };
 
 } // namespace iris

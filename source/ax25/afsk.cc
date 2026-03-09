@@ -38,26 +38,36 @@ std::vector<float> AfskModulator::modulate(const std::vector<uint8_t>& bits) {
 }
 
 // --- Demodulator ---
+// Sliding-window correlation: compute I/Q products with mark and space
+// reference tones, sum over exactly one bit period using circular buffers.
+// This is a matched filter / DFT bin at each tone frequency.
 
 AfskDemodulator::AfskDemodulator(int sample_rate)
     : sample_rate_(sample_rate),
       samples_per_bit_(sample_rate / AFSK_BAUD),
-      mark_i_(0), mark_q_(0), space_i_(0), space_q_(0),
       mark_phase_(0), space_phase_(0),
-      clock_phase_(0), prev_sample_(0), prev_decision_(0) {
-    // Allocate correlation buffer
-    corr_buf_.resize(samples_per_bit_, 0.0f);
-    corr_idx_ = 0;
+      mark_i_sum_(0), mark_q_sum_(0),
+      space_i_sum_(0), space_q_sum_(0),
+      buf_idx_(0),
+      clock_phase_(0), prev_decision_(0) {
+    mark_i_buf_.resize(samples_per_bit_, 0.0f);
+    mark_q_buf_.resize(samples_per_bit_, 0.0f);
+    space_i_buf_.resize(samples_per_bit_, 0.0f);
+    space_q_buf_.resize(samples_per_bit_, 0.0f);
 }
 
 void AfskDemodulator::reset() {
-    mark_i_ = mark_q_ = space_i_ = space_q_ = 0;
     mark_phase_ = space_phase_ = 0;
+    mark_i_sum_ = mark_q_sum_ = 0;
+    space_i_sum_ = space_q_sum_ = 0;
+    buf_idx_ = 0;
     clock_phase_ = 0;
-    prev_sample_ = 0;
     prev_decision_ = 0;
-    std::fill(corr_buf_.begin(), corr_buf_.end(), 0.0f);
-    corr_idx_ = 0;
+    preemph_prev_ = 0;
+    std::fill(mark_i_buf_.begin(), mark_i_buf_.end(), 0.0f);
+    std::fill(mark_q_buf_.begin(), mark_q_buf_.end(), 0.0f);
+    std::fill(space_i_buf_.begin(), space_i_buf_.end(), 0.0f);
+    std::fill(space_q_buf_.begin(), space_q_buf_.end(), 0.0f);
 }
 
 std::vector<uint8_t> AfskDemodulator::demodulate(const float* samples, size_t count) {
@@ -67,13 +77,19 @@ std::vector<uint8_t> AfskDemodulator::demodulate(const float* samples, size_t co
     float space_inc = 2.0f * M_PI * AFSK_SPACE_FREQ / sample_rate_;
 
     for (size_t i = 0; i < count; i++) {
-        float s = samples[i];
+        // Optional pre-emphasis filter to compensate FM de-emphasis
+        float raw = samples[i];
+        float s;
+        if (preemph_alpha_ > 0.0f) {
+            s = raw - preemph_alpha_ * preemph_prev_;
+            preemph_prev_ = raw;
+        } else {
+            s = raw;
+        }
 
-        // Sliding window correlation over exactly one bit period
-        // Mark correlator
+        // Compute I/Q correlation products for this sample
         float mi = s * std::cos(mark_phase_);
         float mq = s * std::sin(mark_phase_);
-        // Space correlator
         float si = s * std::cos(space_phase_);
         float sq = s * std::sin(space_phase_);
 
@@ -82,26 +98,32 @@ std::vector<uint8_t> AfskDemodulator::demodulate(const float* samples, size_t co
         if (mark_phase_  > 2.0f * M_PI) mark_phase_  -= 2.0f * M_PI;
         if (space_phase_ > 2.0f * M_PI) space_phase_ -= 2.0f * M_PI;
 
-        // Leaky integrator with time constant = 1 bit period
-        // alpha = 1/sps gives -3dB at f_baud (correct for bit-rate matched detection)
-        // alpha = 2/sps was too aggressive, causing inter-symbol bleed
-        float alpha = 1.0f / samples_per_bit_;
-        mark_i_  += alpha * (mi - mark_i_);
-        mark_q_  += alpha * (mq - mark_q_);
-        space_i_ += alpha * (si - space_i_);
-        space_q_ += alpha * (sq - space_q_);
+        // Sliding window: subtract oldest sample, add new sample, advance index
+        mark_i_sum_  += mi - mark_i_buf_[buf_idx_];
+        mark_q_sum_  += mq - mark_q_buf_[buf_idx_];
+        space_i_sum_ += si - space_i_buf_[buf_idx_];
+        space_q_sum_ += sq - space_q_buf_[buf_idx_];
 
-        float mark_energy  = mark_i_ * mark_i_ + mark_q_ * mark_q_;
-        float space_energy = space_i_ * space_i_ + space_q_ * space_q_;
+        mark_i_buf_[buf_idx_]  = mi;
+        mark_q_buf_[buf_idx_]  = mq;
+        space_i_buf_[buf_idx_] = si;
+        space_q_buf_[buf_idx_] = sq;
+
+        buf_idx_++;
+        if (buf_idx_ >= samples_per_bit_) buf_idx_ = 0;
+
+        // Energy = |correlation|^2 for each tone
+        float mark_energy  = mark_i_sum_ * mark_i_sum_ + mark_q_sum_ * mark_q_sum_;
+        float space_energy = space_i_sum_ * space_i_sum_ + space_q_sum_ * space_q_sum_;
 
         float decision = mark_energy - space_energy;
 
         // Clock recovery: detect zero crossings in decision signal
         clock_phase_ += 1.0f / samples_per_bit_;
 
-        // Zero crossing — adjust clock phase
         if ((prev_decision_ > 0 && decision <= 0) ||
             (prev_decision_ <= 0 && decision > 0)) {
+            // Zero crossing should ideally occur at clock_phase_ = 0.5
             float error = clock_phase_ - 0.5f;
             clock_phase_ -= error * 0.2f;
         }

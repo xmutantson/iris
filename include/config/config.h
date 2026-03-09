@@ -27,10 +27,11 @@ struct IrisConfig {
     float tx_level = 0.5f;     // 0.0-1.0, controls FM deviation
     float rx_gain = 1.0f;
 
-    // Band plan (Hz) — configurable for different radio passband characteristics
-    // Default: 300-3500 Hz (typical FM audio passband, above CTCSS max 254 Hz)
-    float band_low_hz = 300.0f;    // Low edge (must be > 254 Hz to avoid CTCSS)
-    float band_high_hz = 3500.0f;  // High edge
+    // Band plan (Hz) — initial native PHY band edges before probe discovery.
+    // Default: 1200-2200 Hz (AFSK mark/space width, guaranteed to work if AX.25 does).
+    // The comb probe discovers the full usable passband and auto-widens.
+    float band_low_hz = 1200.0f;   // Low edge (AFSK mark tone)
+    float band_high_hz = 2200.0f;  // High edge (AFSK space tone)
     float center_freq_hz = 0.0f;   // 0 = auto (midpoint of band_low/band_high)
 
     // Radio / PTT
@@ -62,6 +63,16 @@ struct IrisConfig {
     // ~10 dB better sensitivity than 1200 baud AFSK. Both sides must enable.
     bool native_hail = false;
 
+    // FX.25 Forward Error Correction for AX.25
+    // 0 = off (plain AX.25), 16/32/64 = number of RS check bytes
+    // RX always decodes FX.25 regardless of this setting (backwards compatible)
+    int fx25_mode = 0;
+
+    // AFSK pre-emphasis compensation (for FM de-emphasis)
+    // 0.95 = standard FM (compensate ~6dB/octave de-emphasis)
+    // 0.0 = flat (no compensation, use for discriminator taps or flat audio)
+    float preemph_alpha = 0.95f;
+
     // B2F
     bool b2f_unroll = true;      // Enable B2F LZHUF unroll/reroll for Winlink
 
@@ -73,6 +84,10 @@ struct IrisConfig {
     float sim_bandpass_low = 0.0f;   // 0 = disabled
     float sim_bandpass_high = 0.0f;
 
+    // DCD (Data Carrier Detect) — defer TX when channel is busy
+    // 0 = disabled, typical values: 0.05-0.20 (adjustable in GUI)
+    float dcd_threshold = 0.05f;
+
     // Logging
     bool log_enabled = false;    // Auto-log to AppData/Iris/logs/
 
@@ -81,10 +96,30 @@ struct IrisConfig {
     bool show_waterfall = true;
 };
 
+// Per-parameter version: when a default changes in code, bump the version here.
+// On load, if the INI's stored version for a param is older than the code version,
+// the new default overwrites the stale INI value. User-set values on current
+// version are preserved.
+struct ParamVersion {
+    const char* section;
+    const char* key;
+    int version;  // bump this when the default changes
+};
+
+// Current parameter versions (bump when defaults change)
+inline const ParamVersion PARAM_VERSIONS[] = {
+    {"Modem", "BandLowHz",     2},  // v1: 300, v2: 1200 (AFSK mark)
+    {"Modem", "BandHighHz",    2},  // v1: 3500, v2: 2200 (AFSK space)
+    {"Modem", "DcdThreshold",  1},  // v1: 0.05
+    {"Modem", "FX25Mode",      1},  // v1: 0
+};
+inline constexpr int NUM_PARAM_VERSIONS = sizeof(PARAM_VERSIONS) / sizeof(PARAM_VERSIONS[0]);
+
 // Load config from INI file. Missing keys get defaults.
+// Stale parameters (version < code version) are reset to new defaults.
 IrisConfig load_config(const std::string& path);
 
-// Save config to INI file
+// Save config to INI file (includes parameter version stamps)
 bool save_config(const std::string& path, const IrisConfig& cfg);
 
 // Simple INI parser

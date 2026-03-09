@@ -15,6 +15,11 @@ namespace iris {
 std::vector<uint8_t> hdlc_encode(const uint8_t* frame, size_t len,
                                   int preamble_flags = 4, int postamble_flags = 2);
 
+// Encode HDLC frame to raw bits (pre-NRZI). Append to existing bits vector.
+// Use with nrzi_encode() for batching multiple frames into one continuous stream.
+void hdlc_encode_raw(std::vector<uint8_t>& bits, const uint8_t* frame, size_t len,
+                     int preamble_flags = 4, int postamble_flags = 2);
+
 // HDLC frame receiver — processes one bit at a time (already NRZI-decoded)
 class HdlcDecoder {
 public:

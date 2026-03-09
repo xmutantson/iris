@@ -109,6 +109,8 @@ bool Modem::init(const IrisConfig& config) {
     native_mod_ = std::make_unique<NativeModulator>(phy_config_, config_.sample_rate);
     native_demod_ = std::make_unique<NativeDemodulator>(phy_config_, config_.sample_rate);
 
+    afsk_demod_.set_preemph_alpha(config_.preemph_alpha);
+
     local_cap_.version = XID_VERSION;
     local_cap_.capabilities = CAP_MODE_A | CAP_COMPRESSION | CAP_STREAMING;
     if (config_.mode == "B" || config_.mode == "b")
@@ -330,14 +332,74 @@ bool Modem::init(const IrisConfig& config) {
         ax25_tx_queue_.push(std::vector<uint8_t>(data, data + len));
     });
     ax25_session_.set_data_callback([this](const uint8_t* data, size_t len) {
-        // Received I-frame data — deliver to KISS/AGW
+        // Check for Iris connection header in I-frame data
+        XidCapability remote_cap;
+        if (!config_.ax25_only && conn_header_decode(data, len, remote_cap)) {
+            IRIS_LOG("Connection header from peer: v%u caps=%04X mod=%u",
+                     remote_cap.version, remote_cap.capabilities, (unsigned)remote_cap.max_modulation);
+            auto agreed = negotiate(local_cap_, remote_cap);
+            if (agreed.capabilities != 0) {
+                int mod_level = std::min((int)agreed.max_modulation,
+                                        (int)config_.max_modulation);
+                phy_config_.modulation = (Modulation)mod_level;
+
+                if (!xid_sent_) {
+                    // Responder: reply with UI frame (no sequence numbers)
+                    std::string dest = ax25_session_.remote_callsign().empty()
+                        ? xid_peer_call_ : ax25_session_.remote_callsign();
+                    send_conn_header_ui(dest);
+                    xid_sent_ = true;
+                    IRIS_LOG("Connection header reply sent (responder, UI) to %s", dest.c_str());
+                } else {
+                    IRIS_LOG("Connection header I-frame handshake complete (initiator)");
+                }
+                // Only escalate to native if Iris owns the session
+                if (!ax25_session_.is_kiss_managed() &&
+                    !ax25_session_.is_kiss_passthrough()) {
+                    xid_fallback_ticks_ = 0;
+                    native_tx_holdoff_ = 10;
+                    if (xid_sent_ && (config_.mode == "A" || config_.mode == "a")) {
+                        probe_.start_initiator(config_.sample_rate);
+                        IRIS_LOG("Starting passband probe (Iris-managed session)");
+                    }
+                } else {
+                    IRIS_LOG("KISS session — staying in AX.25 (peer is Iris)");
+                }
+            }
+            return;  // Don't forward header to KISS/AGW
+        }
+
+        // Normal I-frame data — deliver to KISS/AGW
         if (rx_callback_) rx_callback_(data, len);
     });
     ax25_session_.set_state_callback([this](Ax25SessionState state, const std::string& remote) {
         IRIS_LOG("AX25 state -> %d (remote=%s)", (int)state, remote.c_str());
+
+        // Connection header: once AX.25 is CONNECTED, delay header by a few
+        // seconds so the initial I-frame/RR exchange can settle first.
+        if (state == Ax25SessionState::CONNECTED &&
+            !config_.ax25_only && !native_mode_ && !xid_sent_) {
+            xid_delay_ticks_ = 30;  // ~3 seconds delay
+            xid_peer_call_ = remote;
+            IRIS_LOG("Connection header to %s scheduled (3s delay for session settle)", remote.c_str());
+        }
+
+        // Reset XID state on disconnect so next connection can re-negotiate
+        if (state == Ax25SessionState::DISCONNECTED) {
+            xid_sent_ = false;
+            xid_fallback_ticks_ = 0;
+            xid_delay_ticks_ = 0;
+        }
+
         if (ax25_state_callback_)
             ax25_state_callback_(state, remote);
     });
+
+    // Initialize FX.25 RS codecs (needed for both TX and RX)
+    fx25_init();
+    if (config_.fx25_mode > 0) {
+        IRIS_LOG("FX.25 enabled: %d RS check bytes per frame", config_.fx25_mode);
+    }
 
     state_ = ModemState::IDLE;
     return true;
@@ -364,6 +426,8 @@ void Modem::ptt_off() {
         ptt_->set_ptt(false);
         ptt_active_ = false;
         rx_mute_holdoff_ = RX_MUTE_HOLDOFF_SAMPLES;
+        rx_raw_rms_ = 0;   // Clear stale DCD reading from our own TX
+        dcd_holdoff_ = 0;
     }
 }
 
@@ -373,6 +437,16 @@ void Modem::process_rx(const float* rx_audio, int frame_count) {
     if (relisten_pending_) {
         relisten_pending_ = false;
         arq_listen();
+    }
+
+    // Compute raw (pre-AGC) RMS for DCD — must be BEFORE early returns
+    // so DCD always has fresh data. Skip during TX/mute: our own signal
+    // would falsely trigger DCD.
+    if (!ptt_active_ && !rx_muted_) {
+        float raw_sq = 0;
+        for (int i = 0; i < frame_count; i++)
+            raw_sq += rx_audio[i] * rx_audio[i];
+        rx_raw_rms_ = std::sqrt(raw_sq / std::max(frame_count, 1));
     }
 
     // In loopback mode, skip TX mute — the delay buffer handles timing
@@ -392,19 +466,7 @@ void Modem::process_rx(const float* rx_audio, int frame_count) {
         }
     }
 
-    // Count down XID reply delay (responder stays in RX to catch trailing data)
-    if (xid_reply_delay_samples_ > 0) {
-        xid_reply_delay_samples_ -= frame_count;
-        if (xid_reply_delay_samples_ <= 0) {
-            xid_reply_delay_samples_ = 0;
-            if (!pending_xid_reply_.empty()) {
-                std::lock_guard<std::mutex> lock(tx_mutex_);
-                ax25_tx_queue_.push(std::move(pending_xid_reply_));
-                pending_xid_reply_.clear();
-                IRIS_LOG("XID reply released to TX queue");
-            }
-        }
-    }
+    // (Connection header replies go through ax25_session_.send_data — no delay needed)
 
     std::vector<float> audio(rx_audio, rx_audio + frame_count);
     // AGC for AX.25 mode only — native mode has preamble-based gain estimation
@@ -457,8 +519,208 @@ void Modem::process_rx(const float* rx_audio, int frame_count) {
     }
 }
 
+// Dispatch a decoded AX.25 frame (shared by HDLC and FX.25 decoders)
+void Modem::dispatch_rx_frame(const std::vector<uint8_t>& frame, bool from_fx25) {
+    // Dedup: HDLC and FX.25 decoders run in parallel on the same bit stream,
+    // so every FX.25 frame also decodes as plain HDLC.  Without dedup the KISS
+    // client sees every frame twice, causing AX.25 protocol errors (duplicate
+    // UA → reset, duplicate I-frame → REJ).
+    if (dedup_cooldown_ > 0 && frame == last_rx_frame_) {
+        // Same frame within the dedup window — log it but don't dispatch
+        if (packet_log_ && frame.size() >= 14) {
+            std::string proto = from_fx25
+                ? "FX.25 (" + std::to_string(fx25_decoder_.last_rs_errors()) + " RS corr)"
+                : (config_.ax25_baud == 9600 ? "AX.25-9600" : "AX.25-1200");
+            packet_log_(false, proto + " [dup]", describe_ax25(frame.data(), frame.size()));
+        }
+        return;
+    }
+    last_rx_frame_ = frame;
+    dedup_cooldown_ = config_.sample_rate / 2;  // 500ms dedup window (FX.25 fires ~270ms after HDLC)
+
+    // CSMA: brief holdoff after frame decode to avoid stepping on a burst.
+    // Only set once per burst — don't stack on every frame in a batch.
+    if (csma_holdoff_ <= 0)
+        csma_holdoff_ = 25;  // ~250ms at 10ms tick rate
+
+    frames_rx_++;
+
+    // Log to packet viewer
+    if (packet_log_ && frame.size() >= 14) {
+        std::string proto;
+        if (from_fx25) {
+            int errs = fx25_decoder_.last_rs_errors();
+            proto = "FX.25 (" + std::to_string(errs) + " RS corr)";
+        } else {
+            proto = config_.ax25_baud == 9600 ? "AX.25-9600" : "AX.25-1200";
+        }
+        packet_log_(false, proto, describe_ax25(frame.data(), frame.size()));
+    }
+
+    // Try ARQ session first
+    {
+        ArqState arq_st = arq_.state();
+        if (arq_st != ArqState::IDLE) {
+            if (arq_.on_frame_received(frame.data(), frame.size()))
+                return;
+        }
+    }
+
+    // Try AX.25 connected mode session
+    {
+        bool native_active = (arq_.state() != ArqState::IDLE &&
+                              arq_.state() != ArqState::LISTENING);
+        if (!native_active || ax25_session_.is_active()) {
+            Ax25Frame ax_frame;
+            if (ax25_parse(frame.data(), frame.size(), ax_frame)) {
+                if (ax25_session_.on_frame_received(ax_frame))
+                    return;
+            }
+        }
+    }
+
+    // Legacy XID U-frame support (backwards compat with older Iris peers)
+    bool is_xid = false;
+    if (frame.size() >= 24 && frame[15] == IRIS_PID) {
+        std::string src_call;
+        for (int ci = 7; ci < 13 && ci < (int)frame.size(); ci++) {
+            char c = (char)(frame[ci] >> 1);
+            if (c != ' ') src_call += c;
+        }
+        is_xid = true;
+        bool is_self = (src_call == config_.callsign);
+        XidCapability remote_cap;
+        IRIS_LOG("Legacy XID frame from '%s' (self=%d)", src_call.c_str(), is_self ? 1 : 0);
+        if (!is_self && xid_decode(&frame[16], frame.size() - 16, remote_cap)) {
+            if (!config_.ax25_only) {
+                auto agreed = negotiate(local_cap_, remote_cap);
+                if (agreed.capabilities != 0) {
+                    int mod_level = std::min((int)agreed.max_modulation,
+                                            (int)config_.max_modulation);
+                    phy_config_.modulation = (Modulation)mod_level;
+
+                    if (!xid_sent_) {
+                        // Reply with connection header I-frame (not XID)
+                        auto hdr = conn_header_encode(local_cap_);
+                        ax25_session_.send_data(hdr.data(), hdr.size());
+                        xid_sent_ = true;
+                        native_tx_holdoff_ = 10;
+                        IRIS_LOG("Legacy XID received, replying with connection header");
+                    } else {
+                        xid_fallback_ticks_ = 0;
+                        if (config_.mode == "A" || config_.mode == "a") {
+                            probe_.start_initiator(config_.sample_rate);
+                            IRIS_LOG("Legacy XID handshake complete (initiator), starting passband probe");
+                        } else {
+                            IRIS_LOG("Legacy XID handshake complete (initiator), mode %s — skipping probe", config_.mode.c_str());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Detect CAL: UI frames (ctrl=0x03, PID at offset 15, info at 16+)
+    bool is_cal = false;
+    bool is_conn_hdr = false;
+    if (!is_xid && frame.size() > 20) {
+        uint8_t ctrl = frame[14] & ~AX25_PF_MASK;
+        if (ctrl == AX25_CTRL_UI && frame.size() > 16) {
+            const uint8_t* info = frame.data() + 16;
+            size_t info_len = frame.size() - 16;
+            if (info_len >= 4 && info[0] == 'C' && info[1] == 'A' &&
+                info[2] == 'L' && info[3] == ':') {
+                handle_cal_frame(info, info_len);
+                is_cal = true;
+            }
+            // Connection header in UI frame: "IRIS/..."
+            if (!is_cal && info_len >= 5 && !config_.ax25_only) {
+                // Extract source callsign to filter self-heard frames
+                std::string ui_src;
+                for (int ci = 7; ci < 13 && ci < (int)frame.size(); ci++) {
+                    char c = (char)(frame[ci] >> 1);
+                    if (c != ' ') ui_src += c;
+                }
+                bool ui_is_self = (ui_src == config_.callsign);
+
+                XidCapability remote_cap;
+                if (!ui_is_self && conn_header_decode(info, info_len, remote_cap)) {
+                    IRIS_LOG("Connection header UI from %s: v%u caps=%04X mod=%u",
+                             ui_src.c_str(), remote_cap.version, remote_cap.capabilities,
+                             (unsigned)remote_cap.max_modulation);
+                    auto agreed = negotiate(local_cap_, remote_cap);
+                    if (agreed.capabilities != 0) {
+                        int mod_level = std::min((int)agreed.max_modulation,
+                                                (int)config_.max_modulation);
+                        phy_config_.modulation = (Modulation)mod_level;
+
+                        if (!xid_sent_) {
+                            // Responder: reply with our header
+                            xid_peer_call_ = ui_src;
+                            send_conn_header_ui(ui_src);
+                            xid_sent_ = true;
+                            IRIS_LOG("Connection header UI reply sent to %s (responder)", ui_src.c_str());
+                        } else {
+                            // Initiator: handshake complete
+                            xid_fallback_ticks_ = 0;
+                            IRIS_LOG("Connection header UI handshake complete (initiator, peer=%s)", ui_src.c_str());
+                        }
+
+                        // Only escalate to native mode if Iris owns the session.
+                        // KISS-managed sessions: just note capabilities, don't
+                        // start probe or switch to native — the KISS client owns
+                        // the AX.25 session and we can't pull the rug out.
+                        if (!ax25_session_.is_kiss_managed() &&
+                            !ax25_session_.is_kiss_passthrough()) {
+                            if (xid_sent_) {
+                                native_tx_holdoff_ = 10;
+                                if (config_.mode == "A" || config_.mode == "a") {
+                                    probe_.start_initiator(config_.sample_rate);
+                                    IRIS_LOG("Starting passband probe (Iris-managed session)");
+                                }
+                            }
+                        } else {
+                            IRIS_LOG("KISS session active — staying in AX.25 (peer is Iris)");
+                        }
+                    }
+                    is_conn_hdr = true;
+                }
+            }
+        }
+    }
+
+    bool is_probe = false;
+    if (!is_xid && !is_cal && frame.size() >= 2) {
+        uint8_t first = frame[0];
+        if (first == PROBE_MSG_RESULT) {
+            probe_.on_message(frame.data(), frame.size());
+            is_probe = true;
+        }
+    }
+
+    if (!is_xid && !is_probe && !is_conn_hdr && frame.size() >= 14) {
+        std::string rx_src;
+        for (int ci = 7; ci < 13; ci++) {
+            char c = (char)(frame[ci] >> 1);
+            if (c != ' ') rx_src += c;
+        }
+        if (rx_src != config_.callsign) {
+            if (gui_log_)
+                gui_log_("[RX] " + describe_ax25(frame.data(), frame.size()));
+            if (rx_callback_)
+                rx_callback_(frame.data(), frame.size());
+        }
+    }
+}
+
 void Modem::process_rx_ax25(const float* audio, int count) {
     state_ = ModemState::RX_AX25;
+
+    // Tick dedup cooldown
+    if (dedup_cooldown_ > 0) {
+        dedup_cooldown_ -= count;
+        if (dedup_cooldown_ < 0) dedup_cooldown_ = 0;
+    }
 
     // Feed raw audio to probe controller if it's listening
     if (probe_.state() == ProbeState::LISTENING_PROBE) {
@@ -474,122 +736,17 @@ void Modem::process_rx_ax25(const float* audio, int count) {
     auto rx_bits = nrzi_decoder_.decode(rx_nrzi);
 
     for (uint8_t b : rx_bits) {
+        // Feed to standard HDLC decoder (plain AX.25)
         if (hdlc_decoder_.push_bit(b)) {
-            const auto& frame = hdlc_decoder_.frame();
-            frames_rx_++;
+            dispatch_rx_frame(hdlc_decoder_.frame());
+            // Don't reset() here — push_bit already prepares for the next
+            // frame (in_frame_=true). reset() would kill in_frame_, causing
+            // the next back-to-back frame to be lost (middle frame in batch).
+        }
 
-            // Try ARQ session first — ARQ frames are raw bytes without
-            // AX.25 headers, so they must be handled before the AX.25 checks.
-            {
-                ArqState arq_st = arq_.state();
-                if (arq_st != ArqState::IDLE) {
-                    if (arq_.on_frame_received(frame.data(), frame.size())) {
-                        hdlc_decoder_.reset();
-                        continue;  // ARQ handled it
-                    }
-                }
-            }
-
-            // Try AX.25 connected mode session (only when native ARQ not active)
-            {
-                bool native_active = (arq_.state() != ArqState::IDLE &&
-                                      arq_.state() != ArqState::LISTENING);
-                if (!native_active || ax25_session_.is_active()) {
-                    Ax25Frame ax_frame;
-                    if (ax25_parse(frame.data(), frame.size(), ax_frame)) {
-                        if (ax25_session_.on_frame_received(ax_frame)) {
-                            hdlc_decoder_.reset();
-                            continue;  // AX.25 session consumed it
-                        }
-                    }
-                }
-            }
-
-            bool is_xid = false;
-            if (frame.size() >= 24 && frame[15] == IRIS_PID) {
-                // Extract source callsign from AX.25 header (bytes 7-12, shifted)
-                std::string src_call;
-                for (int ci = 7; ci < 13 && ci < (int)frame.size(); ci++) {
-                    char c = (char)(frame[ci] >> 1);
-                    if (c != ' ') src_call += c;
-                }
-                // All XID frames are internal protocol — never forward to KISS
-                is_xid = true;
-                // Ignore our own XID (self-hearing on shared channel)
-                bool is_self = (src_call == config_.callsign);
-                XidCapability remote_cap;
-                IRIS_LOG("XID frame from '%s' (self=%d, xid_sent=%d)", src_call.c_str(), is_self ? 1 : 0, xid_sent_ ? 1 : 0);
-                if (!is_self && xid_decode(&frame[16], frame.size() - 16, remote_cap)) {
-                    is_xid = true;
-                    if (config_.ax25_only) {
-                        // ax25-only mode: ignore XID entirely, stay in AX.25
-                        IRIS_LOG("XID received but ax25_only=1, ignoring");
-                    } else {
-                    auto agreed = negotiate(local_cap_, remote_cap);
-                    if (agreed.capabilities != 0) {
-                        int mod_level = std::min((int)agreed.max_modulation,
-                                                (int)config_.max_modulation);
-                        phy_config_.modulation = (Modulation)mod_level;
-
-                        if (!xid_sent_) {
-                            // We're the responder. Delay XID reply by ~500ms
-                            // so we stay in AX.25 RX mode and can decode any
-                            // trailing data frames from the initiator before
-                            // we start transmitting (which blocks RX).
-                            pending_xid_reply_ = build_xid_frame(
-                                config_.callsign.c_str(), "CQ    ", local_cap_);
-                            xid_reply_delay_samples_ = config_.sample_rate / 2;  // 500ms
-                            xid_sent_ = true;
-                            // Native mode switch after holdoff (in tick())
-                            native_tx_holdoff_ = 10;  // ~1s
-                            IRIS_LOG("XID received (responder): reply delayed 500ms, holdoff=%d", native_tx_holdoff_);
-                        } else {
-                            // We're the initiator — we already sent XID, remote
-                            // is replying. Both sides are Iris-aware.
-                            xid_fallback_ticks_ = 0;
-
-                            // Start passband probe before switching to native mode.
-                            // Probe only for Mode A (audio-coupled FM) where radio
-                            // passband filtering matters. Mode B/C skip probe.
-                            if (config_.mode == "A" || config_.mode == "a") {
-                                probe_.start_initiator(config_.sample_rate);
-                                IRIS_LOG("XID handshake complete (initiator), starting passband probe");
-                            } else {
-                                IRIS_LOG("XID handshake complete (initiator), mode %s — skipping probe", config_.mode.c_str());
-                            }
-                        }
-                    }
-                    } // else (not ax25_only)
-                }
-            }
-
-            // Check for probe protocol messages (RESULT is the only message type)
-            bool is_probe = false;
-            if (!is_xid && frame.size() >= 2) {
-                uint8_t first = frame[0];
-                if (first == PROBE_MSG_RESULT) {
-                    probe_.on_message(frame.data(), frame.size());
-                    is_probe = true;
-                }
-            }
-
-            // Don't forward XID, probe, or self-originated frames to KISS clients
-            if (!is_xid && !is_probe && frame.size() >= 14) {
-                // Check source callsign to filter self-hearing
-                std::string rx_src;
-                for (int ci = 7; ci < 13; ci++) {
-                    char c = (char)(frame[ci] >> 1);
-                    if (c != ' ') rx_src += c;
-                }
-                if (rx_src != config_.callsign) {
-                    if (gui_log_)
-                        gui_log_("[RX] " + describe_ax25(frame.data(), frame.size()));
-                    if (rx_callback_)
-                        rx_callback_(frame.data(), frame.size());
-                }
-            }
-
-            hdlc_decoder_.reset();
+        // Feed to FX.25 decoder in parallel (always active for backwards compat)
+        if (fx25_decoder_.push_bit(b)) {
+            dispatch_rx_frame(fx25_decoder_.frame(), true);
         }
     }
 
@@ -822,6 +979,29 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
         return;
     }
 
+    // DCD (Data Carrier Detect): defer TX while channel is busy.
+    // On half-duplex FM, we must wait for the remote to finish transmitting.
+    // Use RX audio energy as a simple carrier detect — if signal is above
+    // threshold, the channel is busy and we should not key up.
+    if (!loopback_mode_ && config_.dcd_threshold > 0 && rx_raw_rms_ > config_.dcd_threshold) {
+        // Channel busy — don't start a new transmission
+        dcd_holdoff_ = DCD_HOLDOFF_TICKS;  // wait after carrier drops
+        std::memset(tx_audio, 0, frame_count * sizeof(float));
+        return;
+    }
+    if (dcd_holdoff_ > 0) {
+        dcd_holdoff_--;
+        std::memset(tx_audio, 0, frame_count * sizeof(float));
+        return;
+    }
+
+    // CSMA guard: wait after last frame decode before starting TX
+    if (csma_holdoff_ > 0) {
+        csma_holdoff_--;
+        std::memset(tx_audio, 0, frame_count * sizeof(float));
+        return;
+    }
+
     {
         std::lock_guard<std::mutex> lock(tx_mutex_);
 
@@ -829,17 +1009,42 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
         // then regular tx_queue_ (native or AX.25 depending on mode)
         bool have_frame = false;
         if (!ax25_tx_queue_.empty()) {
-            auto frame_data = std::move(ax25_tx_queue_.front());
-            ax25_tx_queue_.pop();
-            IRIS_LOG("TX frame %zu bytes (forced AX.25)", frame_data.size());
+            // Batch all forced-AX.25 frames into one TX burst (same as tx_queue_)
             state_ = ModemState::TX_AX25;
-            // Preamble flags: TXDelay worth of 0x7E flags for receiver sync
             int preamble_flags = std::max(8, config_.ptt_pre_delay_ms * config_.ax25_baud / 8000);
-            auto bits = hdlc_encode(frame_data.data(), frame_data.size(), preamble_flags, 4);
-            if (config_.ax25_baud == 9600)
-                tx_buffer_ = gfsk_mod_.modulate(bits);
-            else
-                tx_buffer_ = afsk_mod_.modulate(bits);
+            std::vector<uint8_t> raw_bits;  // pre-NRZI
+
+            bool first = true;
+            while (!ax25_tx_queue_.empty()) {
+                auto frame_data = std::move(ax25_tx_queue_.front());
+                ax25_tx_queue_.pop();
+                IRIS_LOG("TX frame %zu bytes (forced AX.25%s%s)", frame_data.size(),
+                         config_.fx25_mode > 0 ? " FX.25" : "",
+                         first ? "" : " batched");
+                if (packet_log_ && frame_data.size() >= 14) {
+                    std::string proto = config_.fx25_mode > 0
+                        ? "FX.25-" + std::to_string(config_.fx25_mode)
+                        : (config_.ax25_baud == 9600 ? "AX.25-9600" : "AX.25-1200");
+                    packet_log_(true, proto, describe_ax25(frame_data.data(), frame_data.size()));
+                }
+                int flags = first ? preamble_flags : 2;
+                if (config_.fx25_mode > 0) {
+                    if (!fx25_encode_raw(raw_bits, frame_data.data(), frame_data.size(),
+                                        config_.fx25_mode, flags))
+                        hdlc_encode_raw(raw_bits, frame_data.data(), frame_data.size(), flags, 4);
+                } else {
+                    hdlc_encode_raw(raw_bits, frame_data.data(), frame_data.size(), flags, 4);
+                }
+                first = false;
+            }
+
+            if (!raw_bits.empty()) {
+                auto nrzi_bits = nrzi_encode(raw_bits);
+                if (config_.ax25_baud == 9600)
+                    tx_buffer_ = gfsk_mod_.modulate(nrzi_bits);
+                else
+                    tx_buffer_ = afsk_mod_.modulate(nrzi_bits);
+            }
             have_frame = true;
         } else if (!tx_queue_.empty()) {
             // Native hail: use native PHY for ARQ hail/connect frames
@@ -923,16 +1128,44 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                         tx_buffer_[i] = iq[2 * i];
                 }
             } else {
-                auto frame_data = std::move(tx_queue_.front());
-                tx_queue_.pop();
-                IRIS_LOG("TX frame %zu bytes (native=0)", frame_data.size());
+                // AX.25 mode: batch all queued frames into one TX burst
+                // to minimize PTT on-time and reduce half-duplex collisions.
+                // First frame gets full preamble, subsequent get 2 inter-frame flags.
                 state_ = ModemState::TX_AX25;
                 int preamble_flags = std::max(8, config_.ptt_pre_delay_ms * config_.ax25_baud / 8000);
-                auto bits = hdlc_encode(frame_data.data(), frame_data.size(), preamble_flags, 4);
-                if (config_.ax25_baud == 9600)
-                    tx_buffer_ = gfsk_mod_.modulate(bits);
-                else
-                    tx_buffer_ = afsk_mod_.modulate(bits);
+                std::vector<uint8_t> raw_bits;  // pre-NRZI
+
+                bool first = true;
+                while (!tx_queue_.empty()) {
+                    auto frame_data = std::move(tx_queue_.front());
+                    tx_queue_.pop();
+                    IRIS_LOG("TX frame %zu bytes (AX.25%s%s)", frame_data.size(),
+                             config_.fx25_mode > 0 ? " FX.25" : "",
+                             first ? "" : " batched");
+                    if (packet_log_ && frame_data.size() >= 14) {
+                        std::string proto = config_.fx25_mode > 0
+                            ? "FX.25-" + std::to_string(config_.fx25_mode)
+                            : (config_.ax25_baud == 9600 ? "AX.25-9600" : "AX.25-1200");
+                        packet_log_(true, proto, describe_ax25(frame_data.data(), frame_data.size()));
+                    }
+                    int flags = first ? preamble_flags : 2;
+                    if (config_.fx25_mode > 0) {
+                        if (!fx25_encode_raw(raw_bits, frame_data.data(), frame_data.size(),
+                                            config_.fx25_mode, flags))
+                            hdlc_encode_raw(raw_bits, frame_data.data(), frame_data.size(), flags, 4);
+                    } else {
+                        hdlc_encode_raw(raw_bits, frame_data.data(), frame_data.size(), flags, 4);
+                    }
+                    first = false;
+                }
+
+                if (!raw_bits.empty()) {
+                    auto nrzi_bits = nrzi_encode(raw_bits);
+                    if (config_.ax25_baud == 9600)
+                        tx_buffer_ = gfsk_mod_.modulate(nrzi_bits);
+                    else
+                        tx_buffer_ = afsk_mod_.modulate(nrzi_bits);
+                }
             }
             have_frame = true;
         }
@@ -1046,29 +1279,13 @@ void Modem::queue_tx_frame(const uint8_t* frame, size_t len) {
     }
     std::lock_guard<std::mutex> lock(tx_mutex_);
 
-    // If AX.25 mode and native upgrade allowed, send XID before first user frame
-    if (!native_mode_ && !config_.ax25_only && !xid_sent_) {
-        auto xid_frame = build_xid_frame(config_.callsign.c_str(), "CQ    ",
-                                           local_cap_);
-        tx_queue_.push(std::move(xid_frame));
-        xid_sent_ = true;
-        // Defer the data frame — don't send it alongside XID.
-        // It will be flushed when XID handshake completes (native mode),
-        // or after fallback timeout (remote not Iris-aware).
-        deferred_tx_queue_.push(std::vector<uint8_t>(frame, frame + len));
-        xid_fallback_ticks_ = 40;  // ~3-4 seconds (tick may run faster than 100ms)
-        IRIS_LOG("XID sent, data deferred (%zu bytes), fallback=%d ticks", len, xid_fallback_ticks_);
-        return;
-    }
+    // Notify AX.25 session of outgoing frame so it can track KISS-initiated
+    // connections (SABM/DISC) without generating duplicate frames.
+    // Must be under tx_mutex_ to synchronize with connection header injection.
+    ax25_session_.notify_outgoing(frame, len);
 
-    // If XID handshake is in progress (sent but not yet complete), defer data
-    if (xid_sent_ && !native_mode_ && !config_.ax25_only) {
-        deferred_tx_queue_.push(std::vector<uint8_t>(frame, frame + len));
-        IRIS_LOG("Data deferred during XID handshake (%zu bytes)", len);
-        return;
-    }
-
-    tx_queue_.push(std::vector<uint8_t>(frame, frame + len));
+    std::vector<uint8_t> tx_frame(frame, frame + len);
+    tx_queue_.push(std::move(tx_frame));
     if (gui_log_ && len >= 14)
         gui_log_("[TX] " + describe_ax25(frame, len));
 }
@@ -1192,7 +1409,7 @@ void Modem::tick() {
                 constexpr float MAX_OCCUPIED_BW_HZ = 20000.0f;
                 float usable_bw = std::min(bandwidth - 200.0f, MAX_OCCUPIED_BW_HZ);  // 100 Hz margin each edge
                 constexpr int SPS_MIN = 6;    // 8000 baud max
-                constexpr int SPS_MAX = 30;   // 1600 baud min
+                constexpr int SPS_MAX = 80;   // 600 baud min (fits in AFSK-width passband)
                 int new_sps = 20;             // default: 2400 baud
                 int new_baud = config_.sample_rate / new_sps;
                 for (int sps = SPS_MIN; sps <= SPS_MAX; sps++) {
@@ -1217,14 +1434,6 @@ void Modem::tick() {
             IRIS_LOG("Probe complete: band %.0f-%.0f Hz (%.0f Hz), center %.0f Hz, baud %d",
                      low, high, bandwidth, center, phy_config_.baud_rate);
         }
-        // Flush deferred data (now goes via native PHY)
-        {
-            std::lock_guard<std::mutex> lock(tx_mutex_);
-            while (!deferred_tx_queue_.empty()) {
-                tx_queue_.push(std::move(deferred_tx_queue_.front()));
-                deferred_tx_queue_.pop();
-            }
-        }
         IRIS_LOG("Native mode active (post-probe)");
     }
 
@@ -1234,32 +1443,27 @@ void Modem::tick() {
         if (probe_fallback_ticks_ == 0 && !native_mode_ && !probe_.is_done()) {
             native_mode_ = true;
             native_tx_ready_ = true;
-            {
-                std::lock_guard<std::mutex> lock(tx_mutex_);
-                while (!deferred_tx_queue_.empty()) {
-                    tx_queue_.push(std::move(deferred_tx_queue_.front()));
-                    deferred_tx_queue_.pop();
-                }
-            }
             IRIS_LOG("Probe fallback: no probe received, native mode active");
         }
     }
 
-    // XID fallback: if remote didn't reply, flush deferred data as AX.25
+    // Delayed connection header: wait for AX.25 session to settle before probing
+    if (xid_delay_ticks_ > 0) {
+        xid_delay_ticks_--;
+        if (xid_delay_ticks_ == 0 && !xid_sent_ && !config_.ax25_only &&
+            !native_mode_ && ax25_session_.is_active()) {
+            send_conn_header_ui(xid_peer_call_);
+            xid_sent_ = true;
+            xid_fallback_ticks_ = 40;  // ~4 seconds to hear back
+            IRIS_LOG("Connection header sent to %s (delayed in-session, UI)", xid_peer_call_.c_str());
+        }
+    }
+
+    // Connection header fallback: peer didn't reply — stay AX.25
     if (xid_fallback_ticks_ > 0) {
         xid_fallback_ticks_--;
         if (xid_fallback_ticks_ == 0 && !native_mode_) {
-            std::lock_guard<std::mutex> lock(tx_mutex_);
-            int count = 0;
-            while (!deferred_tx_queue_.empty()) {
-                tx_queue_.push(std::move(deferred_tx_queue_.front()));
-                deferred_tx_queue_.pop();
-                count++;
-            }
-            // Clear xid_sent_ so subsequent data isn't deferred
-            xid_sent_ = false;
-            if (count > 0)
-                IRIS_LOG("XID fallback: flushed %d deferred frames as AX.25", count);
+            IRIS_LOG("Connection header fallback: remote is not Iris, staying AX.25");
         }
     }
 }
@@ -1283,6 +1487,10 @@ ModemDiag Modem::get_diagnostics() const {
     diag.cal_measured_rms = cal_measured_rms_;
     diag.arq_state = arq_.state();
     diag.arq_role = arq_.role();
+    diag.ax25_state = ax25_session_.state();
+    diag.dcd_busy = (config_.dcd_threshold > 0) &&
+                     ((rx_raw_rms_ > config_.dcd_threshold) || (dcd_holdoff_ > 0));
+    diag.rx_raw_rms = rx_raw_rms_;
 
     {
         std::lock_guard<std::mutex> lock(diag_mutex_);
@@ -1344,16 +1552,89 @@ void Modem::compute_spectrum(const float* audio, int count) {
 }
 
 // --- Calibration ---
+// Protocol:
+//   Initiator: clicks Auto Cal → sends CAL:START UI frame → tone 1s → WAIT_REPORT
+//   Responder: auto-detects CAL:START → measures tone RMS → sends CAL:RMS=X.XXXX
+//   Initiator: receives report → adjusts TX level → DONE
+
+// Send connection header as a UI frame (no sequence numbers, no offsetter needed)
+void Modem::send_conn_header_ui(const std::string& dest_call) {
+    auto src = ax25_make_addr(config_.callsign);
+    auto dst = ax25_make_addr(dest_call);
+    auto frame = ax25_build_u(dst, src, AX25_CTRL_UI, false, true);
+    frame.push_back(AX25_PID_NONE);
+    auto hdr = conn_header_encode(local_cap_);
+    frame.insert(frame.end(), hdr.begin(), hdr.end());
+    IRIS_LOG("Connection header UI to %s (%zu bytes)", dest_call.c_str(), hdr.size());
+    std::lock_guard<std::mutex> lock(tx_mutex_);
+    ax25_tx_queue_.push(std::move(frame));
+}
+
+// Build and queue a UI frame with cal payload (e.g., "CAL:START" or "CAL:RMS=0.1234")
+void Modem::send_cal_ui(const char* payload) {
+    auto src = ax25_make_addr(config_.callsign);
+    auto dst = ax25_make_addr("CAL");
+    // UI frame: dst(7) + src(7) + ctrl(1) + PID(1) + info
+    auto frame = ax25_build_u(dst, src, AX25_CTRL_UI, false, true);
+    frame.push_back(AX25_PID_NONE);
+    size_t plen = strlen(payload);
+    frame.insert(frame.end(), (const uint8_t*)payload, (const uint8_t*)payload + plen);
+    std::lock_guard<std::mutex> lock(tx_mutex_);
+    ax25_tx_queue_.push(std::move(frame));
+}
+
+// Handle incoming CAL: frame (called from dispatch_rx_frame)
+void Modem::handle_cal_frame(const uint8_t* info, size_t len) {
+    std::string payload((const char*)info, len);
+
+    if (payload.find("CAL:START") != std::string::npos) {
+        // Remote is starting cal — enter RX measurement mode
+        if (cal_state_ == CalState::IDLE) {
+            IRIS_LOG("[CAL] Received CAL:START — entering measurement mode");
+            if (gui_log_) gui_log_("[CAL] Measuring remote tone...");
+            state_ = ModemState::CALIBRATING;
+            cal_state_ = CalState::RX_TONE;
+            cal_rms_accum_ = 0;
+            cal_rms_count_ = 0;
+            cal_measured_rms_ = 0;
+        }
+    } else if (payload.find("CAL:RMS=") != std::string::npos) {
+        // Remote is reporting our tone's RMS at their end
+        size_t pos = payload.find("CAL:RMS=");
+        float remote_rms = std::stof(payload.substr(pos + 8));
+        IRIS_LOG("[CAL] Remote measured RMS=%.4f", remote_rms);
+        if (remote_rms > 0.001f && cal_state_ == CalState::WAIT_REPORT) {
+            float correction = CAL_TARGET_RMS / remote_rms;
+            config_.tx_level *= correction;
+            config_.tx_level = std::clamp(config_.tx_level, 0.01f, 1.0f);
+            config_.calibrated_tx_level = config_.tx_level;
+            cal_measured_rms_ = remote_rms;
+            IRIS_LOG("[CAL] Adjusted TX level to %.3f (correction %.2fx)",
+                     config_.tx_level, correction);
+            if (gui_log_) {
+                char msg[128];
+                snprintf(msg, sizeof(msg), "[CAL] Done! TX level = %.3f (remote RMS was %.4f)",
+                         config_.tx_level, remote_rms);
+                gui_log_(msg);
+            }
+            cal_state_ = CalState::DONE;
+            state_ = ModemState::IDLE;
+        }
+    }
+}
 
 void Modem::start_calibration() {
+    IRIS_LOG("[CAL] Starting calibration");
+    if (gui_log_) gui_log_("[CAL] Sending tone to remote...");
     state_ = ModemState::CALIBRATING;
-    cal_state_ = CalState::TX_TONE;
+    cal_state_ = CalState::SEND_CMD;
     cal_tone_samples_ = 0;
     cal_tone_phase_ = 0;
     cal_rms_accum_ = 0;
     cal_rms_count_ = 0;
     cal_measured_rms_ = 0;
-    ptt_on();
+    // Queue the CAL:START command frame
+    send_cal_ui("CAL:START");
 }
 
 void Modem::generate_cal_tone(float* audio, int count) {
@@ -1368,27 +1649,54 @@ void Modem::generate_cal_tone(float* audio, int count) {
     if (cal_tone_samples_ >= CAL_TONE_DURATION) {
         ptt_off();
         cal_state_ = CalState::WAIT_REPORT;
+        IRIS_LOG("[CAL] Tone sent, waiting for remote report");
     }
 }
 
 void Modem::process_calibration_rx(const float* audio, int count) {
-    if (cal_state_ == CalState::RX_TONE) {
-        for (int i = 0; i < count; i++) {
-            cal_rms_accum_ += audio[i] * audio[i];
-            cal_rms_count_++;
+    if (cal_state_ == CalState::SEND_CMD) {
+        // Wait for the CAL:START frame to be transmitted
+        if (tx_buffer_.empty() && ax25_tx_queue_.empty()) {
+            // Command sent — start transmitting tone
+            cal_state_ = CalState::TX_TONE;
+            ptt_on();
+            IRIS_LOG("[CAL] CAL:START sent, transmitting tone");
         }
-        if (cal_rms_count_ >= CAL_TONE_DURATION) {
-            cal_measured_rms_ = std::sqrt(cal_rms_accum_ / cal_rms_count_);
-            char report[32];
-            snprintf(report, sizeof(report), "CAL:RMS=%.4f", cal_measured_rms_);
-            {
-                std::lock_guard<std::mutex> lock(tx_mutex_);
-                tx_queue_.push(std::vector<uint8_t>((uint8_t*)report,
-                    (uint8_t*)report + strlen(report)));
+    } else if (cal_state_ == CalState::RX_TONE) {
+        // Measure incoming audio RMS (skip first 100ms for PTT settle)
+        int skip_samples = config_.sample_rate / 10;
+        for (int i = 0; i < count; i++) {
+            cal_rms_count_++;
+            if (cal_rms_count_ > skip_samples) {
+                cal_rms_accum_ += audio[i] * audio[i];
             }
-            cal_state_ = CalState::TX_REPORT;
+        }
+        if (cal_rms_count_ >= CAL_TONE_DURATION + skip_samples) {
+            int measure_count = cal_rms_count_ - skip_samples;
+            cal_measured_rms_ = std::sqrt(cal_rms_accum_ / measure_count);
+            IRIS_LOG("[CAL] Measured RMS = %.4f, sending report", cal_measured_rms_);
+            if (gui_log_) {
+                char msg[128];
+                snprintf(msg, sizeof(msg), "[CAL] Remote RMS = %.4f, sending report",
+                         cal_measured_rms_);
+                gui_log_(msg);
+            }
+            // Send report back
+            char report[48];
+            snprintf(report, sizeof(report), "CAL:RMS=%.4f", cal_measured_rms_);
+            send_cal_ui(report);
+            cal_state_ = CalState::SEND_REPORT;
+        }
+    } else if (cal_state_ == CalState::SEND_REPORT) {
+        // Wait for report TX to drain, then return to idle
+        if (tx_buffer_.empty() && ax25_tx_queue_.empty()) {
+            IRIS_LOG("[CAL] Report sent, calibration complete (responder)");
+            if (gui_log_) gui_log_("[CAL] Report sent.");
+            cal_state_ = CalState::IDLE;
+            state_ = ModemState::IDLE;
         }
     } else if (cal_state_ == CalState::WAIT_REPORT) {
+        // Demodulate AFSK looking for CAL:RMS= frame from remote
         std::vector<uint8_t> rx_nrzi;
         if (config_.ax25_baud == 9600)
             rx_nrzi = gfsk_demod_.demodulate(audio, count);
@@ -1399,30 +1707,11 @@ void Modem::process_calibration_rx(const float* audio, int count) {
         for (uint8_t b : rx_bits) {
             if (hdlc_decoder_.push_bit(b)) {
                 const auto& frame = hdlc_decoder_.frame();
+                // UI frame: 7(dst) + 7(src) + 1(ctrl) + 1(PID) = 16 bytes header
                 if (frame.size() > 16) {
-                    std::string payload(frame.begin() + 16, frame.end());
-                    size_t pos = payload.find("CAL:RMS=");
-                    if (pos != std::string::npos) {
-                        float remote_rms = std::stof(payload.substr(pos + 8));
-                        if (remote_rms > 0.001f) {
-                            float correction = CAL_TARGET_RMS / remote_rms;
-                            config_.tx_level *= correction;
-                            config_.tx_level = std::clamp(config_.tx_level, 0.01f, 1.0f);
-                            config_.calibrated_tx_level = config_.tx_level;
-                            cal_measured_rms_ = remote_rms;
-                        }
-                        cal_state_ = CalState::DONE;
-                        state_ = ModemState::IDLE;
-                    }
+                    handle_cal_frame(frame.data() + 16, frame.size() - 16);
                 }
-                hdlc_decoder_.reset();
             }
-        }
-    } else if (cal_state_ == CalState::TX_REPORT) {
-        if (state_ != ModemState::TX_AX25 && tx_buffer_.empty()) {
-            cal_state_ = CalState::RX_TONE;
-            cal_rms_accum_ = 0;
-            cal_rms_count_ = 0;
         }
     }
 }

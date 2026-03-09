@@ -6,11 +6,13 @@
 #include "imgui_impl_opengl3.h"
 #include "engine/speed_level.h"
 #include "arq/arq.h"
+#include "ax25/ax25_session.h"
 #include "probe/passband_probe.h"
 
 #include <cstdio>
 #include <cmath>
 #include <cstring>
+#include <ctime>
 
 // === Platform backend selection ===
 // SDL2 is preferred (cross-platform). Falls back to Win32 on Windows.
@@ -462,6 +464,8 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
         if (ImGui::BeginMenu("View")) {
             if (ImGui::MenuItem("Event Log...", nullptr, show_log_))
                 show_log_ = !show_log_;
+            if (ImGui::MenuItem("Packet Log...", nullptr, show_packet_log_))
+                show_packet_log_ = !show_packet_log_;
             ImGui::EndMenu();
         }
         ImGui::EndMainMenuBar();
@@ -566,16 +570,30 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
         {
             const char* arq_str = "IDLE";
             ImVec4 arq_color(0.5f, 0.5f, 0.5f, 1.0f);
-            if (diag.arq_state == ArqState::CONNECTING) {
+
+            // AX.25 session state takes priority for display when active
+            if (diag.ax25_state == Ax25SessionState::CONNECTED ||
+                diag.ax25_state == Ax25SessionState::TIMER_RECOVERY) {
+                arq_str = "CONNECTED"; arq_color = ImVec4(0, 1, 0, 1);
+            } else if (diag.ax25_state == Ax25SessionState::AWAITING_CONNECTION) {
+                arq_str = "CONNECTING"; arq_color = ImVec4(1, 1, 0, 1);
+            } else if (diag.ax25_state == Ax25SessionState::AWAITING_RELEASE) {
+                arq_str = "DISCONNECTING"; arq_color = ImVec4(1, 0.5f, 0, 1);
+            } else if (diag.arq_state == ArqState::CONNECTING) {
                 arq_str = "CONNECTING"; arq_color = ImVec4(1, 1, 0, 1);
             } else if (diag.arq_state == ArqState::CONNECTED) {
                 arq_str = "CONNECTED"; arq_color = ImVec4(0, 1, 0, 1);
             } else if (diag.arq_state == ArqState::DISCONNECTING) {
                 arq_str = "DISCONNECTING"; arq_color = ImVec4(1, 0.5f, 0, 1);
+            } else if (diag.arq_state == ArqState::HAILING) {
+                arq_str = "HAILING"; arq_color = ImVec4(1, 1, 0, 1);
+            } else if (diag.arq_state == ArqState::LISTENING) {
+                arq_str = "LISTENING"; arq_color = ImVec4(0.3f, 0.6f, 0.9f, 1.0f);
             }
 
             ImGui::TextColored(arq_color, "%s", arq_str);
-            if (diag.arq_state != ArqState::IDLE) {
+            if (diag.arq_state != ArqState::IDLE &&
+                diag.arq_state != ArqState::LISTENING) {
                 ImGui::Text("Role: %s",
                     diag.arq_role == ArqRole::COMMANDER ? "Commander" : "Responder");
             }
@@ -750,6 +768,20 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
         ImGui::EndChild();
     }
 
+    // ========== DCD Threshold (inline, above waterfall) ==========
+    {
+        ImGui::PushItemWidth(200);
+        float thr = config.dcd_threshold;
+        if (ImGui::SliderFloat("DCD threshold", &thr, 0.0f, 0.30f, "%.3f"))
+            config.dcd_threshold = thr;
+        ImGui::PopItemWidth();
+        ImGui::SameLine();
+        if (diag.dcd_busy)
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "BUSY (%.4f)", diag.rx_raw_rms);
+        else
+            ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.4f, 1.0f), "clear (%.4f)", diag.rx_raw_rms);
+    }
+
     // ========== Waterfall (fills remaining space above status bar) ==========
     {
         float status_bar_h = 27.0f;
@@ -769,13 +801,22 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
         ImDrawList* dl = ImGui::GetWindowDrawList();
         ImVec2 p = ImGui::GetCursorScreenPos();
 
-        // Status LED
+        // Status LED — AX.25 session takes priority when active
         ImU32 led_col;
         const char* status_text;
-        if (diag.arq_state == ArqState::CONNECTED) {
+        if (diag.ax25_state == Ax25SessionState::CONNECTED ||
+            diag.ax25_state == Ax25SessionState::TIMER_RECOVERY) {
+            led_col = IM_COL32(0, 220, 0, 255); status_text = "CONNECTED";
+        } else if (diag.ax25_state == Ax25SessionState::AWAITING_CONNECTION) {
+            led_col = IM_COL32(220, 220, 0, 255); status_text = "CONNECTING";
+        } else if (diag.ax25_state == Ax25SessionState::AWAITING_RELEASE) {
+            led_col = IM_COL32(220, 120, 0, 255); status_text = "DISCONNECTING";
+        } else if (diag.arq_state == ArqState::CONNECTED) {
             led_col = IM_COL32(0, 220, 0, 255); status_text = "CONNECTED";
         } else if (diag.arq_state == ArqState::CONNECTING) {
             led_col = IM_COL32(220, 220, 0, 255); status_text = "CONNECTING";
+        } else if (diag.arq_state == ArqState::HAILING) {
+            led_col = IM_COL32(220, 220, 0, 255); status_text = "HAILING";
         } else if (diag.arq_state == ArqState::LISTENING) {
             led_col = IM_COL32(80, 160, 220, 255); status_text = "LISTENING";
         } else {
@@ -799,10 +840,12 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
         ImGui::TextColored(ImVec4(0.3f, 0.3f, 0.3f, 1.0f), "|");
         ImGui::SameLine(0, 6);
 
-        // TX/RX indicator
+        // TX/RX/DCD indicator
         bool is_tx = diag.ptt_active;
         if (is_tx)
             ImGui::TextColored(ImVec4(1.0f, 0.2f, 0.2f, 1.0f), "TX");
+        else if (diag.dcd_busy)
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "DCD");
         else
             ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "RX");
 
@@ -858,6 +901,55 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
             ImGui::TextUnformatted(line.c_str());
         if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
             ImGui::SetScrollHereY(1.0f);
+        ImGui::End();
+    }
+
+    // ========== Packet Log Window (separate, toggled from View menu) ==========
+    if (show_packet_log_) {
+        ImGui::SetNextWindowSize(ImVec2(600, 350), ImGuiCond_FirstUseEver);
+        ImGui::Begin("Packet Log", &show_packet_log_);
+
+        // Clear button
+        if (ImGui::Button("Clear")) {
+            std::lock_guard<std::mutex> lock(packet_log_mutex_);
+            packet_log_.clear();
+        }
+        ImGui::SameLine();
+        {
+            std::lock_guard<std::mutex> lock(packet_log_mutex_);
+            ImGui::Text("%zu packets", packet_log_.size());
+        }
+        ImGui::Separator();
+
+        // Build text buffer from packet log for selectable/copyable display
+        static std::string pkt_text_buf;
+        bool auto_scroll = false;
+        {
+            std::lock_guard<std::mutex> lock(packet_log_mutex_);
+            pkt_text_buf.clear();
+            pkt_text_buf.reserve(packet_log_.size() * 80);
+            for (const auto& entry : packet_log_) {
+                pkt_text_buf += entry.timestamp;
+                pkt_text_buf += entry.is_tx ? " TX [" : " RX [";
+                pkt_text_buf += entry.protocol;
+                pkt_text_buf += "] ";
+                pkt_text_buf += entry.description;
+                pkt_text_buf += '\n';
+            }
+            static size_t prev_count = 0;
+            if (packet_log_.size() != prev_count) {
+                auto_scroll = true;
+                prev_count = packet_log_.size();
+            }
+        }
+        // Read-only multiline input — supports text selection and Ctrl+C
+        ImVec2 avail = ImGui::GetContentRegionAvail();
+        // Need writable buffer for InputTextMultiline
+        pkt_text_buf.push_back('\0');  // ensure null terminator space
+        ImGui::InputTextMultiline("##pktlog", pkt_text_buf.data(),
+                                  pkt_text_buf.size(),
+                                  avail, ImGuiInputTextFlags_ReadOnly);
+
         ImGui::End();
     }
 
@@ -1118,6 +1210,31 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
                 ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
                     "These values are set by your KISS host (Winlink, etc).");
 
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+                ImGui::Text("DCD (Carrier Detect)");
+                ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
+                    "DCD threshold is adjustable on the main screen.");
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+                ImGui::Text("FX.25 Forward Error Correction");
+                {
+                    int fx25_idx = 0;
+                    if (config.fx25_mode == 16) fx25_idx = 1;
+                    else if (config.fx25_mode == 32) fx25_idx = 2;
+                    else if (config.fx25_mode == 64) fx25_idx = 3;
+                    const char* fx25_items[] = {"Off", "16 check bytes", "32 check bytes", "64 check bytes"};
+                    if (ImGui::Combo("FX.25 TX Mode", &fx25_idx, fx25_items, 4)) {
+                        const int fx25_vals[] = {0, 16, 32, 64};
+                        config.fx25_mode = fx25_vals[fx25_idx];
+                    }
+                }
+                ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
+                    "Reed-Solomon FEC for AX.25. RX decodes FX.25 automatically.");
+
                 ImGui::EndTabItem();
             }
 
@@ -1181,6 +1298,15 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
                     ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
                         "Auto-negotiated by passband probe during connection.");
                 }
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                ImGui::Text("AFSK De-emphasis Compensation");
+                ImGui::SliderFloat("Pre-emph alpha", &config.preemph_alpha, 0.0f, 0.99f, "%.2f");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Compensates FM de-emphasis. 0.95 = standard FM, 0.0 = flat (no compensation).");
 
                 ImGui::Spacing();
                 ImGui::Separator();
@@ -1259,6 +1385,20 @@ void IrisGui::log(const std::string& msg) {
     log_lines_.push_back(msg);
     if (log_lines_.size() > 1000)
         log_lines_.erase(log_lines_.begin());
+}
+
+void IrisGui::log_packet(bool is_tx, const std::string& protocol,
+                          const std::string& description) {
+    // Get current time as HH:MM:SS
+    char ts[16];
+    time_t now = time(nullptr);
+    struct tm* t = localtime(&now);
+    snprintf(ts, sizeof(ts), "%02d:%02d:%02d", t->tm_hour, t->tm_min, t->tm_sec);
+
+    std::lock_guard<std::mutex> lock(packet_log_mutex_);
+    packet_log_.push_back({is_tx, ts, protocol, description});
+    if (packet_log_.size() > 2000)
+        packet_log_.erase(packet_log_.begin());
 }
 
 } // namespace iris

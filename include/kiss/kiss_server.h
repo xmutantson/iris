@@ -26,6 +26,10 @@ public:
     using ParamCallback = std::function<void(uint8_t cmd, uint8_t value)>;
     void set_param_callback(ParamCallback cb) { param_callback_ = cb; }
 
+    // Called when a KISS client connects or disconnects
+    using ClientCallback = std::function<void(int count)>;
+    void set_client_callback(ClientCallback cb) { client_callback_ = cb; }
+
     // Start listening on the given port
     bool start(int port = 8001);
     void stop();
@@ -45,6 +49,7 @@ private:
     std::thread accept_thread_;
     TxCallback tx_callback_;
     ParamCallback param_callback_;
+    ClientCallback client_callback_;
 
     std::mutex clients_mutex_;
     std::vector<int> client_sockets_;

@@ -112,6 +112,14 @@ void AgwServer::stop() {
 
 void AgwServer::accept_thread() {
     while (running_) {
+        // Use select() with timeout so we can check running_ periodically
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET((socket_t)listen_sock_, &fds);
+        struct timeval tv = {1, 0};  // 1 second timeout
+        int sel = select((int)listen_sock_ + 1, &fds, nullptr, nullptr, &tv);
+        if (sel <= 0) continue;  // timeout or error — recheck running_
+
         struct sockaddr_in client_addr = {};
         int addr_len = sizeof(client_addr);
 

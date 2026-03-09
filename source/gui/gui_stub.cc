@@ -40,6 +40,11 @@ void IrisGui::log(const std::string& msg) {
         log_lines_.erase(log_lines_.begin());
 }
 
+void IrisGui::log_packet(bool is_tx, const std::string& protocol,
+                          const std::string& description) {
+    printf("[%s] [%s] %s\n", is_tx ? "TX" : "RX", protocol.c_str(), description.c_str());
+}
+
 } // namespace iris
 
 #endif // !IRIS_HAS_IMGUI

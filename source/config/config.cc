@@ -2,6 +2,7 @@
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <set>
 
 namespace iris {
 
@@ -105,10 +106,27 @@ void IniFile::set_bool(const std::string& section, const std::string& key, bool 
 
 // --- Config load/save ---
 
+// Check which parameters need default-reset due to version bump.
+// Returns a set of "Section.Key" strings that should use code defaults.
+static std::set<std::string> find_stale_params(const IniFile& ini) {
+    std::set<std::string> stale;
+    for (int i = 0; i < NUM_PARAM_VERSIONS; i++) {
+        const auto& pv = PARAM_VERSIONS[i];
+        std::string ver_key = std::string(pv.section) + "_" + pv.key + "_ver";
+        int ini_ver = ini.get_int("Version", ver_key, 0);
+        if (ini_ver < pv.version) {
+            stale.insert(std::string(pv.section) + "." + pv.key);
+        }
+    }
+    return stale;
+}
+
 IrisConfig load_config(const std::string& path) {
     IrisConfig cfg;
     IniFile ini;
     if (!ini.load(path)) return cfg;
+
+    auto stale = find_stale_params(ini);
 
     cfg.callsign = ini.get("Station", "Callsign", cfg.callsign);
     cfg.ssid = ini.get_int("Station", "SSID", cfg.ssid);
@@ -146,16 +164,23 @@ IrisConfig load_config(const std::string& path) {
     cfg.encryption_mode = ini.get_int("Security", "EncryptionMode", cfg.encryption_mode);
     cfg.psk_hex = ini.get("Security", "PSK", cfg.psk_hex);
 
-    cfg.band_low_hz = ini.get_float("Modem", "BandLowHz", cfg.band_low_hz);
-    cfg.band_high_hz = ini.get_float("Modem", "BandHighHz", cfg.band_high_hz);
+    if (!stale.count("Modem.BandLowHz"))
+        cfg.band_low_hz = ini.get_float("Modem", "BandLowHz", cfg.band_low_hz);
+    if (!stale.count("Modem.BandHighHz"))
+        cfg.band_high_hz = ini.get_float("Modem", "BandHighHz", cfg.band_high_hz);
     cfg.center_freq_hz = ini.get_float("Modem", "CenterFreqHz", cfg.center_freq_hz);
 
     cfg.b2f_unroll = ini.get_bool("Modem", "B2FUnroll", cfg.b2f_unroll);
     cfg.native_hail = ini.get_bool("Modem", "NativeHail", cfg.native_hail);
+    cfg.fx25_mode = ini.get_int("Modem", "FX25Mode", cfg.fx25_mode);
+    cfg.preemph_alpha = ini.get_float("Modem", "PreemphAlpha", cfg.preemph_alpha);
 
     cfg.calibrated_tx_level = ini.get_float("Calibration", "TxLevel", cfg.calibrated_tx_level);
 
     cfg.log_enabled = ini.get_bool("Logging", "LogEnabled", cfg.log_enabled);
+
+    if (!stale.count("Modem.DcdThreshold"))
+        cfg.dcd_threshold = ini.get_float("Modem", "DcdThreshold", cfg.dcd_threshold);
 
     cfg.show_constellation = ini.get_bool("GUI", "ShowConstellation", cfg.show_constellation);
     cfg.show_waterfall = ini.get_bool("GUI", "ShowWaterfall", cfg.show_waterfall);
@@ -204,13 +229,24 @@ bool save_config(const std::string& path, const IrisConfig& cfg) {
 
     ini.set_bool("Modem", "B2FUnroll", cfg.b2f_unroll);
     ini.set_bool("Modem", "NativeHail", cfg.native_hail);
+    ini.set_int("Modem", "FX25Mode", cfg.fx25_mode);
+    ini.set_float("Modem", "PreemphAlpha", cfg.preemph_alpha);
 
     ini.set_float("Calibration", "TxLevel", cfg.calibrated_tx_level);
 
     ini.set_bool("Logging", "LogEnabled", cfg.log_enabled);
 
+    ini.set_float("Modem", "DcdThreshold", cfg.dcd_threshold);
+
     ini.set_bool("GUI", "ShowConstellation", cfg.show_constellation);
     ini.set_bool("GUI", "ShowWaterfall", cfg.show_waterfall);
+
+    // Write current parameter versions so future upgrades know what's stale
+    for (int i = 0; i < NUM_PARAM_VERSIONS; i++) {
+        const auto& pv = PARAM_VERSIONS[i];
+        std::string ver_key = std::string(pv.section) + "_" + pv.key + "_ver";
+        ini.set_int("Version", ver_key, pv.version);
+    }
 
     return ini.save(path);
 }
