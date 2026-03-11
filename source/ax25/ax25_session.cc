@@ -32,6 +32,7 @@ void Ax25Session::reset_session() {
     acknowledge_pending_ = false;
     last_received_ctrl_ = 0;
     kiss_managed_ = false;
+    we_initiated_ = false;
     kiss_ns_offset_ = 0;
     kiss_inject_ns_ = 0;
     kiss_inject_acked_ = false;
@@ -55,7 +56,7 @@ void Ax25Session::establish_data_link() {
     clear_exception_conditions();
     retry_count_ = 0;
     send_sabm();
-    t1_ = T1_TICKS;
+    t1_ = t1_value_;
     t3_ = 0;  // Stop T3
 }
 
@@ -88,14 +89,31 @@ void Ax25Session::notify_outgoing(const uint8_t* frame, size_t len) {
             retry_count_ = 0;
             kiss_managed_ = true;
             kiss_passthrough_ = true;  // KISS client active — forward incoming connections
-            t1_ = T1_TICKS;
+            we_initiated_ = true;
+            t1_ = t1_value_;
             t3_ = 0;
             set_state(Ax25SessionState::AWAITING_CONNECTION);
             IRIS_LOG("AX25 KISS SABM to %s — tracking session", remote_call_.c_str());
+        } else if (ut == Ax25UType::UA &&
+                   state_ == Ax25SessionState::DISCONNECTED) {
+            // KISS client responding to incoming SABM — responder path.
+            // Track the session so connection header exchange works.
+            remote_call_ = f.dst.to_string();
+            local_addr_ = ax25_make_addr(local_call_);
+            remote_addr_ = f.dst;
+            retry_count_ = 0;
+            kiss_managed_ = true;
+            kiss_passthrough_ = true;
+            we_initiated_ = false;  // We're the responder
+            vs_ = vr_ = va_ = 0;
+            t1_ = 0;
+            t3_ = T3_TICKS;
+            set_state(Ax25SessionState::CONNECTED);
+            IRIS_LOG("AX25 KISS UA to %s — tracking as responder", remote_call_.c_str());
         } else if (ut == Ax25UType::DISC &&
                    (state_ == Ax25SessionState::CONNECTED ||
                     state_ == Ax25SessionState::TIMER_RECOVERY)) {
-            t1_ = T1_TICKS;
+            t1_ = t1_value_;
             t3_ = 0;
             set_state(Ax25SessionState::AWAITING_RELEASE);
             IRIS_LOG("AX25 KISS DISC — tracking disconnect");
@@ -116,6 +134,7 @@ void Ax25Session::connect(const std::string& remote_call) {
     remote_call_ = remote_call;
     local_addr_ = ax25_make_addr(local_call_);
     remote_addr_ = ax25_make_addr(remote_call_);
+    we_initiated_ = true;
     establish_data_link();
     set_state(Ax25SessionState::AWAITING_CONNECTION);
 }
@@ -145,7 +164,7 @@ void Ax25Session::disconnect() {
 
     retry_count_ = 0;
     send_disc();
-    t1_ = T1_TICKS;
+    t1_ = t1_value_;
     t3_ = 0;
     set_state(Ax25SessionState::AWAITING_RELEASE);
 }
@@ -266,7 +285,7 @@ void Ax25Session::send_next_iframe() {
             tx_window_[slot].sent = true;
             acknowledge_pending_ = false;  // Piggyback ack on I-frame
             if (t1_ == 0)
-                t1_ = T1_TICKS;  // Start T1 if not running
+                t1_ = t1_value_;  // Start T1 if not running
             t3_ = 0;  // Stop T3 while transmitting
         }
     }
@@ -287,7 +306,7 @@ void Ax25Session::ack_frames(uint8_t nr) {
         t1_ = 0;           // All acknowledged — stop T1
         t3_ = T3_TICKS;    // Start idle supervision
     } else {
-        t1_ = T1_TICKS;    // Restart T1 for remaining frames
+        t1_ = t1_value_;    // Restart T1 for remaining frames
     }
     retry_count_ = 0;
 }
@@ -441,6 +460,7 @@ bool Ax25Session::on_frame_received(const Ax25Frame& frame) {
                 IRIS_LOG("AX25 RX SABM from %s (P=%d) [DISCONNECTED -> accept]",
                          frame.src.to_string().c_str(), frame.poll_final() ? 1 : 0);
                 reset_session();
+                we_initiated_ = false;
                 remote_call_ = frame.src.to_string();
                 local_addr_ = ax25_make_addr(local_call_);
                 remote_addr_ = frame.src;
@@ -960,45 +980,45 @@ void Ax25Session::tick() {
                     // KISS client handles SABM retries — just reset T1 and wait.
                     // The KISS client will re-send SABM if needed; each one
                     // resets our retry_count via notify_outgoing().
-                    t1_ = T1_TICKS;
+                    t1_ = t1_value_;
                     IRIS_LOG("AX25 T1 (KISS-managed) — waiting for KISS client retry (%d/%d)", retry_count_, N2);
                 } else {
                     IRIS_LOG("AX25 T1 retry SABM (%d/%d)", retry_count_, N2);
                     send_sabm();
-                    t1_ = T1_TICKS;
+                    t1_ = t1_value_;
                 }
             } else if (state_ == Ax25SessionState::AWAITING_RELEASE) {
                 if (kiss_managed_) {
-                    t1_ = T1_TICKS;
+                    t1_ = t1_value_;
                     IRIS_LOG("AX25 T1 (KISS-managed) — waiting for KISS client DISC retry (%d/%d)", retry_count_, N2);
                 } else {
                     IRIS_LOG("AX25 T1 retry DISC (%d/%d)", retry_count_, N2);
                     send_disc();
-                    t1_ = T1_TICKS;
+                    t1_ = t1_value_;
                 }
             } else if (state_ == Ax25SessionState::CONNECTED) {
                 if (kiss_managed_) {
                     // KISS client handles its own polling — don't send RR
-                    t1_ = T1_TICKS;
+                    t1_ = t1_value_;
                     IRIS_LOG("AX25 T1 (KISS-managed) — skipping poll in CONNECTED (%d/%d)", retry_count_, N2);
                 } else {
                     // Enter Timer Recovery (State 4)
                     IRIS_LOG("AX25 T1 timeout -> TIMER_RECOVERY, poll (%d/%d)",
                              retry_count_, N2);
                     send_rr(true, true);  // Command with P=1
-                    t1_ = T1_TICKS;
+                    t1_ = t1_value_;
                     set_state(Ax25SessionState::TIMER_RECOVERY);
                 }
             } else if (state_ == Ax25SessionState::TIMER_RECOVERY) {
                 if (kiss_managed_) {
-                    t1_ = T1_TICKS;
+                    t1_ = t1_value_;
                     IRIS_LOG("AX25 T1 (KISS-managed) — skipping re-poll in TIMER_RECOVERY (%d/%d)", retry_count_, N2);
                 } else {
                     // Already in timer recovery — re-poll
                     IRIS_LOG("AX25 T1 re-poll in TIMER_RECOVERY (%d/%d)",
                              retry_count_, N2);
                     send_rr(true, true);  // Command with P=1
-                    t1_ = T1_TICKS;
+                    t1_ = t1_value_;
                 }
             }
         }
@@ -1016,7 +1036,7 @@ void Ax25Session::tick() {
                 IRIS_LOG("AX25 T3 idle timeout, entering timer recovery");
                 retry_count_ = 0;
                 send_rr(true, true);  // Command with P=1
-                t1_ = T1_TICKS;
+                t1_ = t1_value_;
                 set_state(Ax25SessionState::TIMER_RECOVERY);
             }
         }

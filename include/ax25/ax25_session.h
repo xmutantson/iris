@@ -36,6 +36,7 @@ public:
     void set_send_callback(SendFrameFunc cb) { send_frame_ = cb; }
     void set_data_callback(DataReceivedFunc cb) { data_received_ = cb; }
     void set_state_callback(StateChangedFunc cb) { state_changed_ = cb; }
+    void set_t1_ticks(int ticks) { t1_value_ = ticks; }
 
     // Initiate outgoing connection (sends SABM)
     void connect(const std::string& remote_call);
@@ -64,6 +65,7 @@ public:
     const std::string& remote_callsign() const { return remote_call_; }
     int pending_frames() const;
     bool is_active() const { return state_ != Ax25SessionState::DISCONNECTED; }
+    bool we_initiated() const { return we_initiated_; }
     bool is_kiss_managed() const { return kiss_managed_; }
     void set_kiss_passthrough(bool v) { kiss_passthrough_ = v; }
     bool is_kiss_passthrough() const { return kiss_passthrough_; }
@@ -140,6 +142,7 @@ private:
     TxIFrame tx_window_[8];
 
     // Timers (counted in ticks)
+    int t1_value_ = T1_TICKS;  // Configurable T1 value (default 5s)
     int t1_ = 0;       // Acknowledgment timer (T1)
     int t2_ = 0;       // Response delay timer (T2)
     int t3_ = 0;       // Idle supervision timer (T3)
@@ -153,6 +156,7 @@ private:
     bool srej_enabled_ = false;         // SREJ supported (negotiated via XID)
     uint8_t last_received_ctrl_ = 0;    // For FRMR info field
     bool kiss_managed_ = false;          // Session initiated by KISS client (don't generate SABM/DISC retries)
+    bool we_initiated_ = false;          // We sent SABM (true) vs received SABM (false)
     bool kiss_passthrough_ = false;      // KISS client active — don't accept incoming connections
     int kiss_ns_offset_ = 0;             // Sequence offset for injected frames (mod 8)
     uint8_t kiss_inject_ns_ = 0;         // N(S) used for injected frame

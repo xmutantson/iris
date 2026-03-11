@@ -536,8 +536,10 @@ int main(int argc, char** argv) {
             [pb_ptr]() { pb_ptr->mark_drain(); },
             [pb_ptr]() { return pb_ptr->is_drained(); });
 
-        bool cap_ok = capture->open(config.capture_device, config.sample_rate, 1, 480);
-        bool play_ok = playback->open(config.playback_device, config.sample_rate, 1, 480);
+        // 4800 frames = 100ms at 48 kHz.  Larger buffer prevents WASAPI
+        // DATA_DISCONTINUITY glitches under load (two-instance VB-Cable, etc.).
+        bool cap_ok = capture->open(config.capture_device, config.sample_rate, 1, 4800);
+        bool play_ok = playback->open(config.playback_device, config.sample_rate, 1, 4800);
 
         if (cap_ok && play_ok) {
             capture->start();
@@ -632,10 +634,10 @@ int main(int argc, char** argv) {
             else if (diag.arq_state == ArqState::CONNECTING) arq_str = "CONNECTING";
             else if (diag.arq_state == ArqState::CONNECTED) arq_str = "CONNECTED";
             else if (diag.arq_state == ArqState::DISCONNECTING) arq_str = "DISCONNECTING";
-            printf("[Status] KISS: %d, AGW: %d, RX: %d, TX: %d, CRC: %d, SNR: %.1f dB, Level: %s, ARQ: %s, DCD: %s (RMS=%.4f, thr=%.3f)\n",
+            printf("[Status] KISS: %d, AGW: %d, RX: %d, TX: %d, CRC: %d, SNR: %.1f dB, Level: %s, ARQ: %s, DCD: %s (tone=%.0f, RMS=%.4f, thr=%.3f)\n",
                    kiss.client_count(), agw.client_count(), diag.frames_rx, diag.frames_tx,
                    diag.crc_errors, diag.snr_db, SPEED_LEVELS[diag.speed_level].name, arq_str,
-                   diag.dcd_busy ? "BUSY" : "clear", diag.rx_raw_rms, config.dcd_threshold);
+                   diag.dcd_busy ? "BUSY" : "clear", diag.dcd_tone_energy, diag.rx_raw_rms, config.dcd_threshold);
             last_status = now;
         }
 

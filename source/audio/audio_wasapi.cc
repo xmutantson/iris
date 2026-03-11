@@ -210,8 +210,12 @@ private:
 
                 hr = capture->GetBuffer(&data, &frames_available, &flags, nullptr, nullptr);
                 if (SUCCEEDED(hr) && frames_available > 0) {
-                    if ((flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) && discont_count_++ < 3)
-                        printf("[Audio] Capture: DATA_DISCONTINUITY (%u frames)\n", frames_available);
+                    if (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) {
+                        discont_count_++;
+                        if (discont_count_ <= 10)
+                            printf("[Audio] Capture: DATA_DISCONTINUITY #%d (%u frames)\n",
+                                   discont_count_, frames_available);
+                    }
 
                     float* fdata = (float*)data;
                     fifo_push(fdata, frames_available * actual_channels, actual_channels);
