@@ -777,9 +777,9 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
         ImGui::PopItemWidth();
         ImGui::SameLine();
         if (diag.dcd_busy)
-            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "BUSY (%.4f)", diag.rx_raw_rms);
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "BUSY  tone:%.0f  rms:%.4f", diag.dcd_tone_energy, diag.rx_raw_rms);
         else
-            ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.4f, 1.0f), "clear (%.4f)", diag.rx_raw_rms);
+            ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.4f, 1.0f), "clear  tone:%.0f  rms:%.4f", diag.dcd_tone_energy, diag.rx_raw_rms);
     }
 
     // ========== Waterfall (fills remaining space above status bar) ==========

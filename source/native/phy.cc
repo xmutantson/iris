@@ -5,7 +5,25 @@
 namespace iris {
 
 PhyConfig mode_a_config() {
-    return {2400, SAMPLE_RATE / 2400, Modulation::BPSK, RRC_ALPHA};
+    // Default: 1 kHz bandwidth (1200-2200 Hz) → SPS=60, 800 baud, 960 Hz occupied
+    return mode_a_config(1000.0f);
+}
+
+PhyConfig mode_a_config(float bandwidth_hz) {
+    // Find largest SPS where baud = SAMPLE_RATE/SPS fits in bandwidth
+    // SPS must evenly divide SAMPLE_RATE for clean timing
+    float max_baud = bandwidth_hz / (1.0f + RRC_ALPHA);
+    int best_sps = 80;  // fallback: 600 baud
+    for (int sps = 6; sps <= 80; sps++) {
+        if (SAMPLE_RATE % sps != 0) continue;  // must divide evenly
+        int baud = SAMPLE_RATE / sps;
+        if (baud <= max_baud) {
+            best_sps = sps;
+            break;  // smallest SPS (highest baud) that fits
+        }
+    }
+    int baud = SAMPLE_RATE / best_sps;
+    return {baud, best_sps, Modulation::BPSK, RRC_ALPHA};
 }
 
 PhyConfig mode_b_config() {

@@ -142,9 +142,22 @@ bool Modem::init(const IrisConfig& config) {
         probe_audio_pending_.insert(probe_audio_pending_.end(), audio, audio + count);
     };
     probe_.on_send_msg = [this](const uint8_t* data, size_t len) {
-        // Send probe messages via forced AX.25 queue (bypasses XID deferral)
         std::lock_guard<std::mutex> lock(tx_mutex_);
-        ax25_tx_queue_.push(std::vector<uint8_t>(data, data + len));
+        if (ofdm_kiss_probing_) {
+            // OFDM-KISS: wrap probe result in AX.25 UI frame, send via AFSK.
+            // AFSK has TX priority (ax25_tx_queue_ checked before tx_queue_)
+            // and avoids queuing behind slow native data I-frames.
+            auto frame = ax25_build_u(
+                ax25_make_addr(ax25_session_.remote_callsign()),
+                ax25_make_addr(config_.callsign),
+                AX25_CTRL_UI, false, true);
+            frame.push_back(AX25_PID_NONE);
+            frame.insert(frame.end(), data, data + len);
+            ax25_tx_queue_.push(std::move(frame));
+        } else {
+            // Normal ARQ probe: send raw via forced AX.25 queue (AFSK)
+            ax25_tx_queue_.push(std::vector<uint8_t>(data, data + len));
+        }
     };
 
     // Initialize simulated bandpass filter if configured
@@ -408,6 +421,10 @@ bool Modem::init(const IrisConfig& config) {
                 IRIS_LOG("KISS-over-OFDM disabled (AX.25 disconnected)");
                 ofdm_kiss_ = false;
                 ofdm_kiss_tx_ = false;
+                ofdm_kiss_probing_ = false;
+                ofdm_kiss_probe_cd_ = 0;
+                ofdm_kiss_probe_done_ = false;
+                probe_.reset();
             }
             peer_is_iris_ = false;
             switch_sent_ = false;
@@ -480,6 +497,13 @@ void Modem::process_rx(const float* rx_audio, int frame_count) {
         rx_raw_rms_ = std::sqrt(raw_sq / std::max(frame_count, 1));
     }
 
+    // Feed probe analyzer before TX early-return — the probe needs continuous
+    // audio capture on shared audio buses (VB-Cable, real radio).
+    // On half-duplex FM the capture device hears the remote station even during
+    // our TX (the radio squelch opens on their signal, not ours).
+    if (ofdm_kiss_probing_ && probe_.state() == ProbeState::LISTENING_PROBE)
+        probe_.feed_rx(rx_audio, frame_count);
+
     // In loopback mode, skip TX mute — the delay buffer handles timing
     if (!loopback_mode_) {
         if (state_ == ModemState::TX_AX25 || state_ == ModemState::TX_NATIVE)
@@ -545,6 +569,7 @@ void Modem::process_rx(const float* rx_audio, int frame_count) {
         // demod is the primary decoder (AFSK stays active for protocol frames).
         if (ofdm_kiss_) {
             process_rx_native(audio.data(), frame_count);
+            // Probe feed is handled earlier (before TX early-return) for continuous capture.
         }
         // Native hail: also run native demod during LISTENING/HAILING
         // so we can detect native-mode HAIL frames from peers with native_hail enabled.
@@ -675,6 +700,7 @@ void Modem::dispatch_rx_frame(const std::vector<uint8_t>& frame, bool from_fx25,
     // Detect CAL: UI frames (ctrl=0x03, PID at offset 15, info at 16+)
     bool is_cal = false;
     bool is_conn_hdr = false;
+    bool is_probe = false;
     if (!is_xid && frame.size() > 20) {
         uint8_t ctrl = frame[14] & ~AX25_PF_MASK;
         if (ctrl == AX25_CTRL_UI && frame.size() > 16) {
@@ -733,9 +759,13 @@ void Modem::dispatch_rx_frame(const std::vector<uint8_t>& frame, bool from_fx25,
                         csma_holdoff_ = std::max(csma_holdoff_, 100);  // ~1s settle
                         // Native frames are much longer than AFSK — increase T1 to
                         // prevent premature TIMER_RECOVERY during 6s+ native TX.
-                        ax25_session_.set_t1_ticks(200);  // 10s (native frame + holdoff + RR round-trip)
+                        ax25_session_.set_t1_ticks(300);  // 15s at 50ms tick (native frames take 6s+)
                         IRIS_LOG("SWITCH complete (initiator): native RX+TX active");
                         if (gui_log_) gui_log_("OFDM-KISS: switched to native mode (initiator)");
+
+                        // Probe deferred: wait until we receive a native frame from B
+                        // (confirming bidirectional comms) before starting probe countdown.
+                        // See deliver lambda in process_rx_native.
 
                         // Proactive native ping: queue an RR so the responder hears
                         // a native frame immediately and activates its own native TX.
@@ -752,6 +782,23 @@ void Modem::dispatch_rx_frame(const std::vector<uint8_t>& frame, bool from_fx25,
                         }
                     }
                     is_switch = true;
+                }
+            }
+
+            // Probe RESULT in UI frame (OFDM-KISS: probe data wrapped in AX.25 UI).
+            // Sent via AFSK for priority (avoids native data queue backlog).
+            if (!is_cal && ofdm_kiss_ && !ofdm_kiss_probe_done_ && info_len >= 1 &&
+                info[0] == PROBE_MSG_RESULT) {
+                std::string ui_src;
+                for (int ci = 7; ci < 13 && ci < (int)frame.size(); ci++) {
+                    char c = (char)(frame[ci] >> 1);
+                    if (c != ' ') ui_src += c;
+                }
+                if (ui_src != config_.callsign) {
+                    IRIS_LOG("[PROBE] Got probe result in UI frame from %s (%zu bytes)",
+                             ui_src.c_str(), info_len);
+                    probe_.on_message(info, info_len);
+                    is_probe = true;
                 }
             }
 
@@ -812,8 +859,8 @@ void Modem::dispatch_rx_frame(const std::vector<uint8_t>& frame, bool from_fx25,
         }
     }
 
-    bool is_probe = false;
-    if (!is_xid && !is_cal && frame.size() >= 2) {
+    // Legacy probe detection (raw probe messages, non-OFDM-KISS)
+    if (!is_probe && !is_xid && !is_cal && frame.size() >= 2) {
         uint8_t first = frame[0];
         if (first == PROBE_MSG_RESULT) {
             probe_.on_message(frame.data(), frame.size());
@@ -854,7 +901,8 @@ void Modem::process_rx_ax25(const float* audio, int count) {
     }
 
     // Feed raw audio to probe controller if it's listening
-    if (probe_.state() == ProbeState::LISTENING_PROBE) {
+    // Legacy probe feed (ARQ native mode only — OFDM-KISS feeds from process_rx)
+    if (!ofdm_kiss_ && probe_.state() == ProbeState::LISTENING_PROBE) {
         probe_.feed_rx(audio, count);
     }
 
@@ -995,11 +1043,41 @@ void Modem::process_rx_native(const float* audio, int count) {
                 if (ofdm_kiss_) {
                     // OFDM-KISS: payload is a raw AX.25 frame — dispatch through
                     // normal AX.25 path for session handling + KISS forwarding.
-                    // Responder: first native frame received → enable native TX.
+                    // First native frame received → activate TX (responder) or
+                    // start probe countdown (initiator, now that bidir is confirmed).
                     if (!ofdm_kiss_tx_) {
                         ofdm_kiss_tx_ = true;
                         IRIS_LOG("OFDM-KISS TX enabled (responder heard first native frame)");
                         if (gui_log_) gui_log_("OFDM-KISS: native TX active (responder)");
+
+                        // Proactive ping: tell the initiator we're alive so it can
+                        // start its probe countdown immediately (not wait for T1 timer).
+                        {
+                            std::lock_guard<std::mutex> lock(tx_mutex_);
+                            auto ping = ax25_build_u(
+                                ax25_make_addr(ax25_session_.remote_callsign()),
+                                ax25_make_addr(config_.callsign),
+                                AX25_CTRL_UI, false, true);
+                            ping.push_back(AX25_PID_NONE);
+                            tx_queue_.push(std::move(ping));
+                            IRIS_LOG("Native ping queued (responder → initiator activation)");
+                        }
+
+                        // Start probe capture after a countdown — the initiator needs
+                        // to receive our ping, confirm bidir, and send tones (~3-5s).
+                        // Countdown 40 ticks (2s) then start 8s capture window.
+                        if (!ofdm_kiss_probe_done_) {
+                            ofdm_kiss_probe_cd_ = 40;
+                            IRIS_LOG("OFDM-KISS probe: responder countdown started (2s then 8s capture)");
+                        }
+                    } else if (!ofdm_kiss_probing_ && !ofdm_kiss_probe_done_ &&
+                               ofdm_kiss_probe_cd_ == 0 &&
+                               ax25_session_.we_initiated()) {
+                        // Initiator: first native frame from responder confirms bidir.
+                        // Short countdown (1s) then send tones. Responder started capture
+                        // 2s after first-native-heard, so our tones arrive ~1.5s into window.
+                        ofdm_kiss_probe_cd_ = 20;
+                        IRIS_LOG("OFDM-KISS probe: bidir confirmed, initiator countdown started");
                     }
                     std::vector<uint8_t> ax25_frame(data, data + len);
                     if (packet_log_ && len >= 14)
@@ -1239,7 +1317,7 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                     tx_buffer_ = afsk_mod_.modulate(nrzi_bits);
             }
             have_frame = true;
-        } else if (!tx_queue_.empty()) {
+        } else if (!tx_queue_.empty() && !ofdm_kiss_probing_) {
             // Native hail: use native PHY for ARQ hail/connect frames
             bool native_hail_active = false;
             if (config_.native_hail && !native_mode_) {
@@ -1586,7 +1664,9 @@ void Modem::tick() {
     }
 
     // Probe completion: activate native mode with negotiated band parameters
-    if (probe_.is_done() && !native_mode_) {
+    // Skip in OFDM-KISS mode — OFDM-KISS has its own probe completion handler below.
+    // Also skip if OFDM-KISS probe already completed (avoids post-disconnect re-fire).
+    if (probe_.is_done() && !native_mode_ && !ofdm_kiss_ && !ofdm_kiss_probe_done_) {
         native_mode_ = true;
         native_tx_ready_ = true;
         // Apply negotiated passband and baud rate
@@ -1638,6 +1718,40 @@ void Modem::tick() {
                      low, high, bandwidth, center, phy_config_.baud_rate);
         }
         IRIS_LOG("Native mode active (post-probe)");
+    }
+
+    // OFDM-KISS probe countdown (shared by initiator and responder).
+    // Initiator: 20-tick (1s) after bidir confirmed → send tones + 10s capture.
+    // Responder: 40-tick (2s) after first-native-heard → start 8s capture window.
+    if (ofdm_kiss_probe_cd_ > 0) {
+        ofdm_kiss_probe_cd_--;
+        if (ofdm_kiss_probe_cd_ == 0) {
+            ofdm_kiss_probing_ = true;
+            if (ax25_session_.we_initiated()) {
+                probe_.start_initiator(config_.sample_rate, 10.0f);
+                IRIS_LOG("OFDM-KISS probe: initiator sending tones (10s capture for Turn 2)");
+            } else {
+                probe_.start_responder(config_.sample_rate, 8.0f);
+                IRIS_LOG("OFDM-KISS probe: responder capture started (8s window)");
+            }
+        }
+    }
+
+    // OFDM-KISS probe completion: log discovered passband.
+    // PHY reconfiguration deferred — both sides must agree on new baud rate
+    // via a protocol exchange before switching. For now, report results only.
+    if (ofdm_kiss_probing_ && probe_.is_done()) {
+        ofdm_kiss_probing_ = false;
+        ofdm_kiss_probe_done_ = true;
+        if (probe_.has_results() && probe_.negotiated().valid) {
+            float low = probe_.negotiated().low_hz;
+            float high = probe_.negotiated().high_hz;
+            float bandwidth = high - low;
+            IRIS_LOG("OFDM-KISS probe complete: band %.0f-%.0f Hz (%.0f Hz BW), current baud %d",
+                     low, high, bandwidth, phy_config_.baud_rate);
+        } else {
+            IRIS_LOG("OFDM-KISS probe complete: no valid results, keeping defaults");
+        }
     }
 
     // Probe fallback: if probe didn't complete (old peer or stuck), go native anyway

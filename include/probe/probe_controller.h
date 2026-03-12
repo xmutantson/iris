@@ -23,8 +23,8 @@ public:
     std::function<void(const float*, int)> on_send_audio;   // Queue probe audio for TX
     std::function<void(const uint8_t*, size_t)> on_send_msg; // Send probe protocol msg
 
-    void start_initiator(int sample_rate);   // Send probe tones + listen
-    void start_responder(int sample_rate);   // Listen for probe tones
+    void start_initiator(int sample_rate, float capture_seconds = 3.0f);   // Send probe tones + listen
+    void start_responder(int sample_rate, float capture_seconds = 3.0f);   // Listen for probe tones
 
     // Feed captured RX audio during listening phase
     void feed_rx(const float* audio, int count);
@@ -63,7 +63,7 @@ private:
 
     // Timeout counter (ticks)
     int timeout_ = 0;
-    static constexpr int TIMEOUT_TICKS = 100;  // 10 seconds at 100ms/tick
+    static constexpr int TIMEOUT_TICKS = 400;  // 20s at 50ms/tick (covers initiator's 10s capture window)
 
     // Completion tracking (both conditions needed to finalize)
     bool analysis_done_ = false;     // We've analyzed their probe tones

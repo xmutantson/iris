@@ -41,6 +41,11 @@ public:
     void reset();
     void set_preemph_alpha(float alpha) { preemph_alpha_ = alpha; }
 
+    // Tone-based DCD: returns smoothed AFSK tone energy from the last
+    // demodulate() call. High value = AFSK signal present, independent
+    // of whether overall audio level goes up or down with signal.
+    float tone_energy() const { return tone_energy_smooth_; }
+
 private:
     int sample_rate_;
     int samples_per_bit_;
@@ -63,6 +68,10 @@ private:
     // De-emphasis compensation (pre-emphasis filter)
     float preemph_alpha_ = 0.95f;
     float preemph_prev_ = 0;
+
+    // Tone-based DCD: smoothed sum of mark+space correlation energy
+    float tone_energy_smooth_ = 0;
+    float tone_energy_peak_ = 0;  // Peak within current block (reset per demodulate call)
 };
 
 } // namespace iris

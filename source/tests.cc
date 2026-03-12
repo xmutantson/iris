@@ -24,6 +24,10 @@
 #include <cstdlib>
 #include <cmath>
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 using namespace iris;
 
 static int tests_passed = 0;
@@ -504,6 +508,109 @@ static void test_ax25_to_native_upgrade() {
     }
 }
 
+static void test_ofdm_kiss_loopback() {
+    printf("\n=== OFDM-KISS Audio Loopback (Mode A upconvert/downconvert) ===\n");
+
+    // Simulate OFDM-KISS: build native frame, upconvert to audio,
+    // downconvert back to IQ, detect and decode.
+    // This tests the full path that OFDM-KISS uses over FM radio.
+
+    PhyConfig cfg = mode_a_config();
+    cfg.modulation = Modulation::BPSK;  // Speed level 0
+
+    float center = 1700.0f;  // Default center: (1200+2200)/2
+    Upconverter up(center, SAMPLE_RATE);
+    Downconverter down(center, SAMPLE_RATE);
+
+    // Test with a realistic AX.25-sized payload
+    uint8_t payload[64];
+    for (int i = 0; i < 64; i++) payload[i] = (uint8_t)(i * 37 + 13);
+    size_t payload_len = 64;
+
+    // Build native frame (IQ)
+    LdpcRate fec = fec_to_ldpc_rate(1, 2);  // rate 1/2
+    auto iq = build_native_frame(payload, payload_len, cfg, fec);
+    printf("  Payload: %zu bytes -> %zu IQ samples\n", payload_len, iq.size() / 2);
+
+    // Upconvert IQ to audio (mono float)
+    auto audio = up.iq_to_audio(iq.data(), iq.size());
+    printf("  Audio: %zu samples (%.1f ms)\n", audio.size(),
+           1000.0f * audio.size() / SAMPLE_RATE);
+
+    // Check audio bandwidth (peak frequency should be near center)
+    float peak_amp = 0;
+    for (auto s : audio) if (std::abs(s) > peak_amp) peak_amp = std::abs(s);
+    printf("  Audio peak amplitude: %.4f\n", peak_amp);
+    check("Audio peak > 0", peak_amp > 0.001f);
+
+    // Downconvert audio back to IQ
+    auto rx_iq = down.audio_to_iq(audio.data(), audio.size());
+    printf("  RX IQ: %zu floats (%zu IQ pairs)\n", rx_iq.size(), rx_iq.size() / 2);
+
+    // Detect frame start
+    int start = detect_frame_start(rx_iq.data(), rx_iq.size(),
+                                    cfg.samples_per_symbol);
+    check("Frame detected after upconvert/downconvert", start >= 0);
+
+    if (start >= 0) {
+        printf("  Frame start at sample %d\n", start);
+
+        // Decode
+        std::vector<uint8_t> rx_payload;
+        bool ok = decode_native_frame(rx_iq.data(), rx_iq.size(),
+                                       start, cfg, rx_payload);
+        check("Frame decoded after upconvert/downconvert", ok);
+        if (ok) {
+            bool match = (rx_payload.size() == payload_len) &&
+                         (memcmp(rx_payload.data(), payload, payload_len) == 0);
+            check("Payload matches after upconvert/downconvert", match);
+            if (!match) {
+                printf("    Expected %zu bytes, got %zu bytes\n",
+                       payload_len, rx_payload.size());
+                if (rx_payload.size() > 0) {
+                    printf("    First bytes: ");
+                    for (size_t i = 0; i < std::min(rx_payload.size(), (size_t)16); i++)
+                        printf("%02X ", rx_payload[i]);
+                    printf("\n");
+                }
+            }
+        }
+    }
+
+    // Test with simulated FM radio bandpass (300-3000 Hz) + de-emphasis
+    printf("\n  --- With simulated FM bandpass (300-3000 Hz) ---\n");
+    {
+        // Simple brick-wall bandpass: zero out frequencies outside 300-3000 Hz
+        // using FFT-like approach (just attenuate based on frequency content)
+        // Actually, simpler: just apply a basic RC de-emphasis filter
+        // FM de-emphasis: 6 dB/octave above ~2122 Hz (75us time constant)
+        float tau = 75e-6f;  // 75 microsecond time constant
+        float rc_alpha = 1.0f / (1.0f + 2.0f * M_PI * tau * SAMPLE_RATE);
+        std::vector<float> filtered = audio;
+        float prev = 0;
+        for (size_t i = 0; i < filtered.size(); i++) {
+            filtered[i] = prev + rc_alpha * (filtered[i] - prev);
+            prev = filtered[i];
+        }
+
+        auto rx_iq2 = down.audio_to_iq(filtered.data(), filtered.size());
+        int start2 = detect_frame_start(rx_iq2.data(), rx_iq2.size(),
+                                         cfg.samples_per_symbol);
+        check("Frame detected after FM de-emphasis", start2 >= 0);
+        if (start2 >= 0) {
+            std::vector<uint8_t> rx2;
+            bool ok2 = decode_native_frame(rx_iq2.data(), rx_iq2.size(),
+                                            start2, cfg, rx2);
+            check("Frame decoded after FM de-emphasis", ok2);
+            if (ok2) {
+                bool match2 = (rx2.size() == payload_len) &&
+                              (memcmp(rx2.data(), payload, payload_len) == 0);
+                check("Payload matches after FM de-emphasis", match2);
+            }
+        }
+    }
+}
+
 int run_tests() {
     printf("Iris Modem - Loopback Tests\n");
     printf("============================\n");
@@ -524,6 +631,7 @@ int run_tests() {
     test_constellation();
     test_native_phy_loopback();
     test_native_frame_loopback();
+    test_ofdm_kiss_loopback();
 
     // Phase 3: Auto-upgrade
     printf("\n--- Phase 3: Auto-Upgrade ---\n");

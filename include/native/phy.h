@@ -29,7 +29,8 @@ struct PhyConfig {
 };
 
 // Predefined modes
-PhyConfig mode_a_config();  // 2400 baud, audio-coupled
+PhyConfig mode_a_config();                      // 800 baud default (SPS=60, 960 Hz BW)
+PhyConfig mode_a_config(float bandwidth_hz);    // baud = BW / (1 + alpha)
 PhyConfig mode_b_config();  // 4800 baud, 9600 port
 PhyConfig mode_c_config();  // 19200 baud, SDR
 

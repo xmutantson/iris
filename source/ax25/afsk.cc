@@ -64,6 +64,8 @@ void AfskDemodulator::reset() {
     clock_phase_ = 0;
     prev_decision_ = 0;
     preemph_prev_ = 0;
+    tone_energy_smooth_ = 0;
+    tone_energy_peak_ = 0;
     std::fill(mark_i_buf_.begin(), mark_i_buf_.end(), 0.0f);
     std::fill(mark_q_buf_.begin(), mark_q_buf_.end(), 0.0f);
     std::fill(space_i_buf_.begin(), space_i_buf_.end(), 0.0f);
@@ -75,6 +77,7 @@ std::vector<uint8_t> AfskDemodulator::demodulate(const float* samples, size_t co
 
     float mark_inc = 2.0f * M_PI * AFSK_MARK_FREQ / sample_rate_;
     float space_inc = 2.0f * M_PI * AFSK_SPACE_FREQ / sample_rate_;
+    float block_peak = 0;
 
     for (size_t i = 0; i < count; i++) {
         // Optional pre-emphasis filter to compensate FM de-emphasis
@@ -116,6 +119,10 @@ std::vector<uint8_t> AfskDemodulator::demodulate(const float* samples, size_t co
         float mark_energy  = mark_i_sum_ * mark_i_sum_ + mark_q_sum_ * mark_q_sum_;
         float space_energy = space_i_sum_ * space_i_sum_ + space_q_sum_ * space_q_sum_;
 
+        // Track combined tone energy for DCD
+        float tone_e = mark_energy + space_energy;
+        if (tone_e > block_peak) block_peak = tone_e;
+
         float decision = mark_energy - space_energy;
 
         // Clock recovery: detect zero crossings in decision signal
@@ -135,6 +142,17 @@ std::vector<uint8_t> AfskDemodulator::demodulate(const float* samples, size_t co
 
         prev_decision_ = decision;
     }
+
+    // Smooth tone energy: fast attack (~1 block), slow decay (~200ms at 48kHz/1024)
+    // This gives us a stable DCD signal that rises quickly when AFSK appears
+    // and falls off smoothly when it stops.
+    tone_energy_peak_ = block_peak;
+    constexpr float attack = 0.8f;
+    constexpr float decay = 0.05f;
+    if (block_peak > tone_energy_smooth_)
+        tone_energy_smooth_ = attack * block_peak + (1.0f - attack) * tone_energy_smooth_;
+    else
+        tone_energy_smooth_ = decay * block_peak + (1.0f - decay) * tone_energy_smooth_;
 
     return bits;
 }

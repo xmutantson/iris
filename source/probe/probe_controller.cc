@@ -29,11 +29,11 @@ void ProbeController::reset() {
 // Both sides capture during their RX window and use the 64-tone comb
 // detector to find the probe signal among any other audio.
 
-void ProbeController::start_initiator(int sample_rate) {
+void ProbeController::start_initiator(int sample_rate, float capture_seconds) {
     reset();
     sample_rate_ = sample_rate;
     is_initiator_ = true;
-    capture_max_ = 3 * sample_rate;  // 3s capture window
+    capture_max_ = (int)(capture_seconds * sample_rate);
 
     // Turn 1: send probe tones, then start listening for Turn 2.
     // Skip our own TX duration to avoid self-hearing on shared audio bus.
@@ -44,22 +44,25 @@ void ProbeController::start_initiator(int sample_rate) {
     capture_buf_.resize(capture_max_, 0.0f);
     capture_samples_ = 0;
     capture_skip_ = probe_samples + sample_rate / 4;  // probe + 250ms margin
-    timeout_ = TIMEOUT_TICKS;
-    IRIS_LOG("[PROBE] Initiator: sent probe, listening for response");
+    timeout_ = std::max(TIMEOUT_TICKS, (int)(capture_seconds * 20) + 200);
+    IRIS_LOG("[PROBE] Initiator: sent probe, listening for response (%.0fs window)", capture_seconds);
 }
 
-void ProbeController::start_responder(int sample_rate) {
+void ProbeController::start_responder(int sample_rate, float capture_seconds) {
     reset();
     sample_rate_ = sample_rate;
     is_initiator_ = false;
-    capture_max_ = 3 * sample_rate;  // 3s capture window
+    capture_max_ = (int)(capture_seconds * sample_rate);
 
     // No message to send — just start listening for initiator's probe tones
     state_ = ProbeState::LISTENING_PROBE;
     capture_buf_.resize(capture_max_, 0.0f);
     capture_samples_ = 0;
-    timeout_ = TIMEOUT_TICKS;
-    IRIS_LOG("[PROBE] Responder: listening for probe tones");
+    // Timeout must cover the full capture window + exchange time.
+    // Main loop ticks at ~20/s (50ms sleep). Add 200 ticks (10s) margin
+    // for result exchange after analysis.
+    timeout_ = std::max(TIMEOUT_TICKS, (int)(capture_seconds * 20) + 200);
+    IRIS_LOG("[PROBE] Responder: listening for probe tones (%.0fs window)", capture_seconds);
 }
 
 void ProbeController::feed_rx(const float* audio, int count) {

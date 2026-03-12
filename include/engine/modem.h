@@ -96,6 +96,7 @@ struct ModemDiag {
     // DCD (carrier detect)
     bool dcd_busy = false;
     float rx_raw_rms = 0;          // Pre-AGC RMS for DCD tuning
+    float dcd_tone_energy = 0;     // AFSK tone correlation energy for tone-based DCD
 
     // Negotiated band info (from probe or config)
     float band_low_hz = 300.0f;
@@ -186,11 +187,12 @@ public:
 private:
     void process_rx_ax25(const float* audio, int count);
     void process_rx_native(const float* audio, int count);
-    void dispatch_rx_frame(const std::vector<uint8_t>& frame, bool from_fx25 = false);
+    void dispatch_rx_frame(const std::vector<uint8_t>& frame, bool from_fx25 = false, bool from_ofdm = false);
     void process_calibration_rx(const float* audio, int count);
     void generate_cal_tone(float* audio, int count);
     void send_cal_ui(const char* payload);
     void send_conn_header_ui(const std::string& dest_call);
+    void send_switch_ui(const std::string& dest_call);
     void handle_cal_frame(const uint8_t* info, size_t len);
 
     void ptt_on();
@@ -273,6 +275,7 @@ private:
     // TX/RX muting for half-duplex
     std::atomic<bool> rx_muted_{false};
     int rx_mute_holdoff_ = 0;  // Samples to remain muted after TX ends
+    int native_selfhear_guard_ = 0;  // Samples: discard native RX frames (self-hear from pipeline latency)
 
     // DCD (Data Carrier Detect) — defer TX while channel is busy
     static constexpr int DCD_HOLDOFF_TICKS = 5;  // ~50-100ms quiet after carrier drops
@@ -297,6 +300,18 @@ private:
     bool native_tx_ready_ = false;  // TX may use native PHY (delayed after XID)
     int  native_tx_holdoff_ = 0;    // tick() countdown before native TX allowed
     bool xid_sent_ = false;
+    bool peer_is_iris_ = false;     // Remote confirmed as Iris via connection header
+    bool ofdm_kiss_ = false;        // OFDM RX enabled (SWITCH complete, native demod active)
+    bool ofdm_kiss_tx_ = false;     // OFDM TX enabled (initiator: SWITCH complete; responder: heard native)
+    bool ofdm_kiss_probing_ = false; // Native probe in progress (suppress data TX)
+    int  ofdm_kiss_probe_cd_ = 0;   // Tick countdown before initiator starts probe
+    bool ofdm_kiss_probe_done_ = false; // Probe completed, PHY reconfigured
+    bool switch_sent_ = false;      // We sent a SWITCH UI frame
+    bool switch_received_ = false;  // We received a SWITCH UI frame from peer
+    int  switch_fallback_ticks_ = 0; // Timeout: if no SWITCH reply, stay AX.25
+    int  conn_hdr_retries_ = 0;              // Remaining connection header UI retransmits
+    bool conn_hdr_yield_started_ = false;    // True after first yield (prevents infinite retry reset)
+    std::atomic<int> conn_hdr_retry_cd_{0};  // Tick countdown; atomic — read by audio thread
     XidCapability local_cap_;
 
     // Connection header handshake timing
