@@ -721,7 +721,7 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
 
             // Row 1: Our TX -> Their RX
             ImVec2 r1 = ImGui::GetCursorScreenPos();
-            dl->AddText(ImVec2(r1.x, r1.y + 1), IM_COL32(180, 180, 180, 255), "TX\xe2\x86\x92RX");
+            dl->AddText(ImVec2(r1.x, r1.y + 1), IM_COL32(180, 180, 180, 255), "They hear");
             for (int k = 0; k < PassbandProbeConfig::N_TONES; k++) {
                 float x0 = r1.x + label_w + k * tone_w;
                 ImU32 col = diag.probe_my_tx.tone_detected[k]
@@ -732,7 +732,7 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
 
             // Row 2: Their TX -> Our RX
             ImVec2 r2 = ImGui::GetCursorScreenPos();
-            dl->AddText(ImVec2(r2.x, r2.y + 1), IM_COL32(180, 180, 180, 255), "RX\xe2\x86\x90TX");
+            dl->AddText(ImVec2(r2.x, r2.y + 1), IM_COL32(180, 180, 180, 255), "We hear");
             for (int k = 0; k < PassbandProbeConfig::N_TONES; k++) {
                 float x0 = r2.x + label_w + k * tone_w;
                 ImU32 col = diag.probe_their_tx.tone_detected[k]

@@ -9,6 +9,7 @@
 #include "native/frame.h"
 #include "native/xid.h"
 #include "native/upconvert.h"
+#include "native/channel_eq.h"
 #include "arq/arq.h"
 #include "ax25/ax25_session.h"
 #include "compress/compress.h"
@@ -239,6 +240,10 @@ private:
     Downconverter downconverter_;
     bool use_upconvert_ = false;
 
+    // Channel equalization (built from probe tone power measurements)
+    ChannelEqualizer rx_channel_eq_;   // RX: flatten incoming channel
+    ChannelEqualizer tx_channel_eq_;   // TX: pre-equalize outgoing signal
+
     // Engine
     Gearshift gearshift_;
     AGC agc_;
@@ -279,6 +284,12 @@ private:
     };
     Biquad sim_bp_hi_[4], sim_bp_lo_[4];  // 4-stage HP + 4-stage LP = 8th order BP
     bool sim_bp_enabled_ = false;
+
+    // Simulated FM de-emphasis filter (--deemphasis, for testing)
+    // Standard 75µs (US) or 50µs (EU) first-order LPF: H(s) = 1/(1+sτ)
+    // Produces ~6 dB/octave rolloff above corner frequency (2122 Hz for 75µs)
+    Biquad sim_deemph_;
+    bool sim_deemph_enabled_ = false;
 
     // PTT
     std::unique_ptr<PttController> ptt_;
@@ -346,6 +357,10 @@ private:
     std::vector<uint8_t> b2f_proxy_plaintext_;  // Accumulated plaintext from B2F unroll
     bool b2f_proxy_active_ = false;             // TX intercepting B2F payload
     bool b2f_proxy_rx_active_ = false;          // RX reassembling B2F payload
+    // B2F AFSK history: buffer I-frame info fields during AFSK phase so the
+    // B2F handler can replay SID/FC/FS exchanges when it initializes at OFDM-KISS activation.
+    std::vector<std::vector<uint8_t>> b2f_afsk_tx_history_;
+    std::vector<std::vector<uint8_t>> b2f_afsk_rx_history_;
     uint8_t b2f_proxy_vr_ = 0;                  // V(R) for generating local RR ACKs
     uint8_t b2f_proxy_addr_[14] = {};            // Cached AX.25 address header (for ACK/I-frame construction)
     bool b2f_proxy_addr_valid_ = false;         // Address header cached
@@ -378,6 +393,12 @@ private:
     std::atomic<uint64_t> bytes_rx_{0};
     std::atomic<uint64_t> bytes_tx_{0};
     int crypto_state_ = 0;  // 0=off, 1=kx, 2=encrypted, 3=psk_mismatch
+    void generate_ephemeral_x25519();
+    void start_mlkem_exchange();
+    void handle_mlkem_frame(const uint8_t* data, size_t len);
+    void rekey_hybrid();
+    bool mlkem_kx_pending_ = false;   // waiting for ML-KEM exchange to complete
+    std::vector<uint8_t> mlkem_held_frames_;  // strict mode: hold data until hybrid KX done
     float rx_rms_ = 0;
     std::atomic<float> rx_raw_rms_{0};  // Pre-AGC RMS for DCD
     float rx_peak_ = 0;  // Peak sample value (decays over time)

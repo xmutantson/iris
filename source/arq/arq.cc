@@ -86,6 +86,9 @@ void ArqSession::reset() {
     break_drop_step_ = 1;
     emergency_nack_count_ = 0;
 
+    memset(peer_x25519_pub_, 0, 32);
+    has_peer_x25519_ = false;
+
     rx_mute_ = false;
 
     for (int i = 0; i < ARQ_WINDOW_SIZE; i++) {
@@ -151,9 +154,10 @@ void ArqSession::clear_stale_buffers() {
         rx_window_[i] = RxSlot{};
     rx_expected_ = 0;
 
-    // Mute RX for ~500ms to let stale audio drain
+    // Mute RX for ~200ms to let stale audio drain.
+    // VHF FM audio pipeline latency is ~50-100ms; 200ms is sufficient.
     rx_mute_ = true;
-    rx_mute_until_ = Clock::now() + std::chrono::milliseconds(500);
+    rx_mute_until_ = Clock::now() + std::chrono::milliseconds(200);
 
     batch_data_delivered_ = false;
     last_received_eob_seq_ = -1;
@@ -226,6 +230,10 @@ void ArqSession::handle_hail_ack(const ArqFrame& frame) {
     conn.flags = (uint8_t)speed_level_;
     conn.payload.push_back((uint8_t)(local_caps_ >> 8));
     conn.payload.push_back((uint8_t)(local_caps_ & 0xFF));
+    // Append X25519 public key (32 bytes) for DH key exchange
+    if (has_local_x25519_) {
+        conn.payload.insert(conn.payload.end(), local_x25519_pub_, local_x25519_pub_ + 32);
+    }
     conn.payload.insert(conn.payload.end(), callsign_.begin(), callsign_.end());
     send_arq_frame(conn);
 }
@@ -354,9 +362,18 @@ void ArqSession::handle_connect(const ArqFrame& frame) {
 
     if (frame.payload.size() >= 2) {
         peer_caps_ = ((uint16_t)frame.payload[0] << 8) | frame.payload[1];
-        remote_callsign_.assign(frame.payload.begin() + 2, frame.payload.end());
+        // Check for X25519 pubkey: caps(2) + x25519(32) + callsign(1+)
+        if ((peer_caps_ & CAP_ENCRYPTION) && frame.payload.size() >= 2 + 32 + 1) {
+            memcpy(peer_x25519_pub_, frame.payload.data() + 2, 32);
+            has_peer_x25519_ = true;
+            remote_callsign_.assign(frame.payload.begin() + 34, frame.payload.end());
+        } else {
+            has_peer_x25519_ = false;
+            remote_callsign_.assign(frame.payload.begin() + 2, frame.payload.end());
+        }
     } else {
         peer_caps_ = 0;
+        has_peer_x25519_ = false;
         remote_callsign_.assign(frame.payload.begin(), frame.payload.end());
     }
 
@@ -372,6 +389,10 @@ void ArqSession::handle_connect(const ArqFrame& frame) {
     ack.flags = (uint8_t)speed_level_;
     ack.payload.push_back((uint8_t)(local_caps_ >> 8));
     ack.payload.push_back((uint8_t)(local_caps_ & 0xFF));
+    // Append X25519 public key for DH key exchange
+    if (has_local_x25519_) {
+        ack.payload.insert(ack.payload.end(), local_x25519_pub_, local_x25519_pub_ + 32);
+    }
     ack.payload.insert(ack.payload.end(), callsign_.begin(), callsign_.end());
     send_arq_frame(ack);
 }
@@ -382,9 +403,18 @@ void ArqSession::handle_connect_ack(const ArqFrame& frame) {
 
     if (frame.payload.size() >= 2) {
         peer_caps_ = ((uint16_t)frame.payload[0] << 8) | frame.payload[1];
-        remote_callsign_.assign(frame.payload.begin() + 2, frame.payload.end());
+        // Check for X25519 pubkey: caps(2) + x25519(32) + callsign(1+)
+        if ((peer_caps_ & CAP_ENCRYPTION) && frame.payload.size() >= 2 + 32 + 1) {
+            memcpy(peer_x25519_pub_, frame.payload.data() + 2, 32);
+            has_peer_x25519_ = true;
+            remote_callsign_.assign(frame.payload.begin() + 34, frame.payload.end());
+        } else {
+            has_peer_x25519_ = false;
+            remote_callsign_.assign(frame.payload.begin() + 2, frame.payload.end());
+        }
     } else {
         peer_caps_ = 0;
+        has_peer_x25519_ = false;
         remote_callsign_.assign(frame.payload.begin(), frame.payload.end());
     }
 

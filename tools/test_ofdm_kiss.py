@@ -28,8 +28,8 @@ if not os.path.isfile(IRIS):
 # Both stations play to CABLE Input and capture from CABLE Output.
 # The cable acts as a shared audio buffer — like a radio frequency.
 # DCD/CSMA + rx_mute handle contention (half-duplex discipline).
-SHARED_PLAYBACK = 1006  # CABLE Input (VB-Audio Virtual Cable)
-SHARED_CAPTURE  = 12    # CABLE Output (VB-Audio Virtual Cable)
+SHARED_PLAYBACK = 1006  # CABLE Input (VB-Audio Virtual Cable) — run --list-audio if IDs shift
+SHARED_CAPTURE  = 12    # CABLE Output (VB-Audio Virtual Cable) — run --list-audio if IDs shift
 
 # Ports
 A_KISS_PORT = 8001

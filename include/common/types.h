@@ -70,6 +70,10 @@ constexpr uint8_t COMPRESSED_PAYLOAD_MAGIC = 0xCC;  // Batch-compressed OFDM-KIS
 constexpr uint8_t B2F_DATA_MAGIC = 0xCD;            // B2F proxy data frame
 constexpr size_t  B2F_BUFFER_SIZE = 2 * 1024 * 1024; // 2MB B2F proxy buffer
 
+// ML-KEM key exchange frame markers (sent as ARQ DATA payloads)
+constexpr uint8_t MLKEM_PK_MAGIC = 0xE1;   // ML-KEM encapsulation key (1184 bytes)
+constexpr uint8_t MLKEM_CT_MAGIC = 0xE2;   // ML-KEM ciphertext (1088 bytes)
+
 } // namespace iris
 
 #endif // IRIS_TYPES_H

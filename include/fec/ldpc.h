@@ -35,6 +35,9 @@ enum class LdpcDecoder {
 // Map FEC rate fraction to LdpcRate enum
 LdpcRate fec_to_ldpc_rate(int num, int den);
 
+// Returns worst-case iteration count from last decode_soft call
+int ldpc_last_max_iters();
+
 // LDPC encoder/decoder
 // Uses systematic encoding: output = [data | parity]
 // Block size: 1600 bits for all rates (N_MAX)

@@ -1,4 +1,5 @@
 #include "fec/ldpc.h"
+#include "common/logging.h"
 #include "fec/mercury_normal_8_16.h"
 #include "fec/mercury_normal_12_16.h"
 #include "fec/mercury_normal_14_16.h"
@@ -11,6 +12,10 @@ namespace iris {
 
 // All rates use 1600-bit codewords, systematic: [data | parity]
 static constexpr int LDPC_N = 1600;
+
+// Track worst-case LDPC iterations across blocks in last decode_soft call
+static int g_ldpc_max_iters = 0;
+int ldpc_last_max_iters() { return g_ldpc_max_iters; }
 
 // Data bits (K) for each rate — P = N - K
 static int rate_to_k(LdpcRate rate) {
@@ -453,6 +458,8 @@ std::vector<uint8_t> LdpcCodec::decode(const std::vector<uint8_t>& codeword, Ldp
 std::vector<uint8_t> LdpcCodec::decode_soft(const std::vector<float>& llrs, LdpcRate rate,
                                               LdpcDecoder algo, int max_iter,
                                               std::atomic<bool>* abort_flag) {
+    g_ldpc_max_iters = 0;  // reset per-frame tracker
+
     if (rate == LdpcRate::NONE) {
         std::vector<uint8_t> out(llrs.size());
         for (size_t i = 0; i < llrs.size(); i++)
@@ -489,7 +496,16 @@ std::vector<uint8_t> LdpcCodec::decode_soft(const std::vector<float>& llrs, Ldpc
         }
 
         if (result < 0) return {};
-        if (!ws.check_syndrome(M)) return {};
+        if (!ws.check_syndrome(M)) {
+            IRIS_LOG("[LDPC] block %zu did not converge after %d iters",
+                     offset / n, result);
+            g_ldpc_max_iters = max_iter;
+            return {};
+        }
+        IRIS_LOG("[LDPC] block %zu converged in %d/%d iters",
+                 offset / n, result, max_iter);
+        if (result > g_ldpc_max_iters)
+            g_ldpc_max_iters = result;
 
         for (int i = 0; i < k; i++)
             output.push_back(ws.posterior[i] < 0 ? 1 : 0);

@@ -25,8 +25,8 @@ struct PassbandProbeConfig {
     static constexpr float TONE_SPACING_HZ =
         (TONE_HIGH_HZ - TONE_LOW_HZ) / (N_TONES - 1);  // ~66.7 Hz
     static constexpr float PROBE_DURATION_S = 2.25f;     // 2.25s probe burst (3x for better SNR)
-    static constexpr float DETECT_THRESHOLD_DB = 10.0f;  // Above noise floor
-    static constexpr float EDGE_MARGIN_HZ = 50.0f;       // Safety margin
+    static constexpr float DETECT_THRESHOLD_DB = 15.0f;  // Below peak tone (wider catches edge rolloff)
+    static constexpr float EDGE_MARGIN_HZ = 25.0f;       // Safety margin (was 50 Hz)
 };
 
 // Result of analyzing a received probe
@@ -73,8 +73,9 @@ NegotiatedPassband probe_negotiate(const ProbeResult& a_to_b,
                                     const ProbeResult& b_to_a);
 
 // Serialize/deserialize ProbeResult for AX.25 transport
-// Wire format: 1 byte magic (0xBC) + 4 bytes low_hz + 4 bytes high_hz
-//            + 2 bytes n_tones + 8 bytes (64-bit tone bitmap) = 19 bytes
+// Wire format: magic(1) + low_hz(4) + high_hz(4) + n_tones(2) + bitmap(8) = 19 bytes
+//            + caps(2) + tone_power_db(64) = 85 bytes total (v3)
+// Old peers (v2): 21 bytes (no tone powers). Backward compatible.
 std::vector<uint8_t> probe_result_encode(const ProbeResult& r);
 bool probe_result_decode(const uint8_t* data, size_t len, ProbeResult& r);
 

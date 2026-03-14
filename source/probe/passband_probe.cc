@@ -27,12 +27,32 @@ int probe_generate(float* out, int max_samples, int sample_rate,
     // Hann ramp for first/last 5% to avoid clicks
     int ramp = n_samples / 20;
 
+    // Pre-emphasis gains: boost tones at passband edges to compensate for
+    // expected FM de-emphasis (~6 dB/octave above 2122 Hz for 75µs networks).
+    // This helps detect tones in the filter transition band that would
+    // otherwise fall below the detection threshold.
+    float tone_gain[PassbandProbeConfig::N_TONES];
+    constexpr float PRE_EMPH_CORNER = 2122.0f;  // 75µs corner frequency
+    constexpr float MAX_PRE_EMPH_DB = 6.0f;     // Limit boost to avoid clipping
+    for (int k = 0; k < PassbandProbeConfig::N_TONES; k++) {
+        float freq = probe_tone_freq(k);
+        // Standard FM pre-emphasis: +6 dB/octave above corner
+        float emph_db = 10.0f * std::log10(1.0f + (freq / PRE_EMPH_CORNER) *
+                                                    (freq / PRE_EMPH_CORNER));
+        // Normalize so gain at center (~1600 Hz) is 0 dB
+        float center_db = 10.0f * std::log10(1.0f + (1600.0f / PRE_EMPH_CORNER) *
+                                                      (1600.0f / PRE_EMPH_CORNER));
+        emph_db -= center_db;
+        emph_db = std::min(emph_db, MAX_PRE_EMPH_DB);
+        tone_gain[k] = std::pow(10.0f, emph_db / 20.0f);
+    }
+
     for (int i = 0; i < n_samples; i++) {
         float t = (float)i / sample_rate;
         float sample = 0.0f;
         for (int k = 0; k < PassbandProbeConfig::N_TONES; k++) {
             float freq = probe_tone_freq(k);
-            sample += std::sin(2.0f * (float)M_PI * freq * t);
+            sample += tone_gain[k] * std::sin(2.0f * (float)M_PI * freq * t);
         }
         sample /= norm;
 
@@ -233,7 +253,7 @@ ProbeResult probe_analyze(const float* samples, int n_samples, int sample_rate) 
             // Average power of the two flanking tones
             float tone_avg = (result.tone_power_db[k] + result.tone_power_db[k + 1]) / 2.0f;
 
-            if (tone_avg - mid_power >= 10.0f)
+            if (tone_avg - mid_power >= 8.0f)
                 null_passes++;
         }
 
@@ -328,6 +348,15 @@ std::vector<uint8_t> probe_result_encode(const ProbeResult& r) {
     out.push_back((uint8_t)(r.capabilities & 0xFF));
     out.push_back((uint8_t)((r.capabilities >> 8) & 0xFF));
 
+    // Per-tone power levels (64 bytes, quantized to 0.5 dB resolution)
+    // Enables channel equalization on the receiving side.
+    // Encoding: uint8_t val = clamp((power_db + 80) * 2, 0, 255)
+    // Range: -80 dB to +47.5 dB in 0.5 dB steps
+    for (int k = 0; k < PassbandProbeConfig::N_TONES; k++) {
+        float val = (r.tone_power_db[k] + 80.0f) * 2.0f;
+        out.push_back((uint8_t)std::max(0.0f, std::min(255.0f, val)));
+    }
+
     return out;
 }
 
@@ -357,6 +386,16 @@ bool probe_result_decode(const uint8_t* data, size_t len, ProbeResult& r) {
     } else {
         r.capabilities = 0;  // Old peer without caps
     }
+
+    // Per-tone power levels (optional, appended by v3+ peers with EQ support)
+    // 64 bytes after caps (TOTAL + 2 + 64)
+    constexpr int TONE_POWER_OFFSET = TOTAL + 2;
+    if (len >= (size_t)(TONE_POWER_OFFSET + PassbandProbeConfig::N_TONES)) {
+        for (int k = 0; k < PassbandProbeConfig::N_TONES; k++) {
+            r.tone_power_db[k] = (float)data[TONE_POWER_OFFSET + k] / 2.0f - 80.0f;
+        }
+    }
+    // If old peer without tone powers, tone_power_db stays at 0 (no EQ applied)
 
     return true;
 }

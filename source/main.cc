@@ -150,6 +150,7 @@ int main(int argc, char** argv) {
     int cli_speed_level = -1;
     float cli_noise = 0.0f;
     float cli_bp_low = 0.0f, cli_bp_high = 0.0f;
+    float cli_deemph_us = 0.0f;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--test") == 0) {
@@ -250,6 +251,8 @@ int main(int argc, char** argv) {
                 cli_bp_low = (float)atof(bp);
                 cli_bp_high = (float)atof(dash + 1);
             }
+        } else if (strcmp(argv[i], "--deemphasis") == 0 && i + 1 < argc) {
+            cli_deemph_us = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage();
             return 0;
@@ -307,6 +310,7 @@ int main(int argc, char** argv) {
         config.sim_bandpass_low = cli_bp_low;
         config.sim_bandpass_high = cli_bp_high;
     }
+    if (cli_deemph_us > 0.0f) config.sim_deemph_us = cli_deemph_us;
     if (!cli_encrypt.empty()) {
         if (cli_encrypt == "strict") config.encryption_mode = 1;
         else if (cli_encrypt == "fast") config.encryption_mode = 2;

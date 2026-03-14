@@ -84,6 +84,10 @@ struct IrisConfig {
     float sim_bandpass_low = 0.0f;   // 0 = disabled
     float sim_bandpass_high = 0.0f;
 
+    // Test: simulated FM de-emphasis (--deemphasis <us>)
+    // Standard values: 75 (US/Japan), 50 (Europe/Australia). 0 = disabled.
+    float sim_deemph_us = 0.0f;
+
     // DCD (Data Carrier Detect) — defer TX when channel is busy
     // 0 = disabled, typical values: 0.05-0.20 (adjustable in GUI)
     float dcd_threshold = 0.05f;

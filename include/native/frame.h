@@ -63,6 +63,9 @@ bool decode_was_overflow();
 // Returns IQ pairs consumed by last successful decode (for buffer drain)
 size_t decode_consumed_iq();
 
+// Returns SNR (dB) estimated from last decoded frame's phase-corrected preamble
+float decode_snr_db();
+
 } // namespace iris
 
 #endif

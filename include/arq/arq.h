@@ -5,6 +5,7 @@
 #include "common/types.h"
 #include <vector>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <string>
 #include <queue>
@@ -71,9 +72,9 @@ static constexpr int ARQ_WINDOW_SIZE = 8;
 static constexpr int ARQ_MAX_RETRIES = 10;
 static constexpr int ARQ_CONNECT_TIMEOUT_MS = 5000;
 static constexpr int ARQ_DEFAULT_ACK_TIMEOUT_MS = 2000;
-static constexpr int ARQ_MIN_ACK_TIMEOUT_MS = 500;
+static constexpr int ARQ_MIN_ACK_TIMEOUT_MS = 300;
 static constexpr int ARQ_MAX_ACK_TIMEOUT_MS = 10000;
-static constexpr int ARQ_MAX_PAYLOAD = 256;
+static constexpr int ARQ_MAX_PAYLOAD = 1024;
 
 // HAIL beacon constants
 static constexpr int HAIL_INTERVAL_MS = 3500;   // Must exceed full round-trip: TX(717ms) + responder accumulate/decode(~800ms) + response TX(717ms)
@@ -90,7 +91,8 @@ static constexpr int BREAK_EMERGENCY_NACK_THRESHOLD = 2;  // consecutive bad blo
 
 // Frame layout descriptions:
 // HAIL:      [type:1][seq:1][flags:1][callsign:N]
-// CONNECT:   [type:1][seq:1][flags:1][caps_hi:1][caps_lo:1][speed:1][callsign:N]
+// CONNECT:   [type:1][seq:1][flags:1][caps_hi:1][caps_lo:1][x25519_pub:32][callsign:N]
+//            Old peers: [type:1][seq:1][flags:1][caps_hi:1][caps_lo:1][callsign:N]
 // DATA:      [type:1][seq:1][flags:1][payload:N]  (flags bit7 = end-of-batch)
 // ACK:       [type:1][seq:1][ack_mask:1][snr_lo:1][snr_hi:1]
 // SET_SPEED: [type:1][seq:1][new_speed:1]
@@ -124,6 +126,7 @@ public:
     void set_callsign(const std::string& cs) { callsign_ = cs; }
     void set_local_capabilities(uint16_t caps) { local_caps_ = caps; }
     void set_local_snr(float snr) { local_snr_ = snr; }
+    void set_local_x25519_pubkey(const uint8_t key[32]) { memcpy(local_x25519_pub_, key, 32); has_local_x25519_ = true; }
 
     // Commander: start a connection and queue data for transfer
     void connect(const std::string& remote_callsign);
@@ -156,6 +159,8 @@ public:
     bool negotiated(uint16_t cap) const { return (local_caps_ & peer_caps_ & cap) != 0; }
     TurboPhase turbo_phase() const { return turbo_phase_; }
     int ack_timeout_ms() const { return ack_timeout_ms_; }
+    bool has_peer_x25519() const { return has_peer_x25519_; }
+    const uint8_t* peer_x25519_pubkey() const { return peer_x25519_pub_; }
 
     void reset();
 
@@ -213,6 +218,12 @@ private:
     // Capability negotiation
     uint16_t local_caps_ = 0;
     uint16_t peer_caps_ = 0;
+
+    // X25519 public keys for DH key exchange
+    uint8_t local_x25519_pub_[32] = {};
+    uint8_t peer_x25519_pub_[32] = {};
+    bool has_local_x25519_ = false;
+    bool has_peer_x25519_ = false;
 
     // Adaptive timeout
     int ack_timeout_ms_ = ARQ_DEFAULT_ACK_TIMEOUT_MS;

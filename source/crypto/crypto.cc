@@ -195,14 +195,19 @@ void CipherSuite::derive_session_key(const char* local_call, const char* remote_
         crypto_wipe(psk_hash, 32);
     }
 
-    if (local_call) {
-        int cl = (int)strlen(local_call);
-        memcpy(salt + salt_len, local_call, cl);
+    // Canonicalize callsign order so both sides derive the same key.
+    // Always put the lexicographically smaller callsign first.
+    const char* call_a = local_call ? local_call : "";
+    const char* call_b = remote_call ? remote_call : "";
+    if (strcmp(call_a, call_b) > 0) { const char* t = call_a; call_a = call_b; call_b = t; }
+    {
+        int cl = (int)strlen(call_a);
+        memcpy(salt + salt_len, call_a, cl);
         salt_len += cl;
     }
-    if (remote_call) {
-        int cl = (int)strlen(remote_call);
-        memcpy(salt + salt_len, remote_call, cl);
+    {
+        int cl = (int)strlen(call_b);
+        memcpy(salt + salt_len, call_b, cl);
         salt_len += cl;
     }
 

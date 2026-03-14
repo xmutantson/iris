@@ -124,8 +124,10 @@ bool Modem::init(const IrisConfig& config) {
         local_cap_.capabilities |= CAP_MODE_B;
     if (config_.mode == "C" || config_.mode == "c")
         local_cap_.capabilities |= CAP_MODE_C;
-    if (config_.encryption_mode > 0)
+    if (config_.encryption_mode > 0) {
         local_cap_.capabilities |= CAP_ENCRYPTION;
+        local_cap_.capabilities |= CAP_PQ_CRYPTO;
+    }
     if (config_.b2f_unroll)
         local_cap_.capabilities |= CAP_B2F_UNROLL;
     local_cap_.max_modulation = config_.max_modulation;
@@ -205,6 +207,27 @@ bool Modem::init(const IrisConfig& config) {
                  config_.sim_bandpass_low, config_.sim_bandpass_high);
     }
 
+    // Initialize simulated FM de-emphasis filter if configured
+    if (config_.sim_deemph_us > 0) {
+        sim_deemph_enabled_ = true;
+        // First-order lowpass: H(s) = 1/(1+sτ) → bilinear transform
+        float tau = config_.sim_deemph_us * 1e-6f;
+        float fs = (float)config_.sample_rate;
+        float wc = 1.0f / tau;  // corner angular frequency
+        // Bilinear transform: s = (2*fs)*(z-1)/(z+1)
+        float K = 2.0f * fs;
+        float a = K + wc;
+        sim_deemph_.b0 = wc / a;
+        sim_deemph_.b1 = wc / a;
+        sim_deemph_.b2 = 0;
+        sim_deemph_.a1 = (wc - K) / a;
+        sim_deemph_.a2 = 0;
+        sim_deemph_.z1 = sim_deemph_.z2 = 0;
+        float corner_hz = wc / (2.0f * 3.14159265f);
+        IRIS_LOG("Simulated FM de-emphasis: %.0f µs (corner %.0f Hz, ~6 dB/octave above)",
+                 config_.sim_deemph_us, corner_hz);
+    }
+
     // Wire ARQ session
     arq_.set_callsign(config_.callsign);
     arq_.set_local_capabilities(local_cap_.capabilities);
@@ -216,6 +239,13 @@ bool Modem::init(const IrisConfig& config) {
         tx_queue_.push(std::vector<uint8_t>(data, data + len));
     };
     arq_cb.on_data_received = [this](const uint8_t* data, size_t len) {
+        // Intercept ML-KEM key exchange frames BEFORE decryption
+        // (KX frames are sent unencrypted over the X25519-encrypted channel)
+        if (len > 1 && (data[0] == MLKEM_PK_MAGIC || data[0] == MLKEM_CT_MAGIC)) {
+            handle_mlkem_frame(data, len);
+            return;
+        }
+
         if (!rx_callback_) return;
         const uint8_t* cur = data;
         size_t cur_len = len;
@@ -273,24 +303,53 @@ bool Modem::init(const IrisConfig& config) {
 
             // Init encryption if negotiated
             if (arq_.negotiated(CAP_ENCRYPTION) && config_.encryption_mode > 0) {
-                // Parse PSK from hex
-                std::vector<uint8_t> psk;
-                for (size_t i = 0; i + 1 < config_.psk_hex.size(); i += 2) {
-                    char byte_str[3] = {config_.psk_hex[i], config_.psk_hex[i+1], 0};
-                    psk.push_back((uint8_t)strtol(byte_str, nullptr, 16));
+                bool kx_ok = false;
+                // Compute X25519 shared secret from peer's public key
+                // (exchanged via CONNECT/CONNECT_ACK payloads)
+                if (arq_.has_peer_x25519()) {
+                    int rc = cipher_.compute_x25519_shared(arq_.peer_x25519_pubkey());
+                    if (rc == 0) {
+                        IRIS_LOG("[CRYPTO] X25519 DH key exchange complete");
+                        kx_ok = true;
+                    } else {
+                        IRIS_LOG("[CRYPTO] X25519 shared secret computation failed (bad peer key?)");
+                        crypto_state_ = 3;  // crypto failure
+                    }
+                } else {
+                    IRIS_LOG("[CRYPTO] WARNING: peer advertised CAP_ENCRYPTION but no X25519 pubkey");
+                    crypto_state_ = 1;  // KEY EXCHANGE incomplete
                 }
-                // X25519 key exchange happens via CONNECT/CONNECT_ACK payloads
-                // (handled by ARQ session). Here we just derive the session key.
-                bool is_commander = (arq_.role() == ArqRole::COMMANDER);
-                crypto_direction_ = is_commander ? DIR_CMD_TO_RSP : DIR_RSP_TO_CMD;
-                cipher_.derive_session_key(config_.callsign.c_str(),
-                                            arq_.remote_callsign().c_str(),
-                                            psk.empty() ? nullptr : psk.data(),
-                                            (int)psk.size(), false);
-                cipher_.activate();
-                tx_batch_counter_ = 0;
-                rx_batch_counter_ = 0;
-                crypto_state_ = 2;  // ENCRYPTED
+
+                if (kx_ok) {
+                    // Parse PSK from hex (authentication binding, not encryption key material)
+                    std::vector<uint8_t> psk;
+                    for (size_t i = 0; i + 1 < config_.psk_hex.size(); i += 2) {
+                        char byte_str[3] = {config_.psk_hex[i], config_.psk_hex[i+1], 0};
+                        psk.push_back((uint8_t)strtol(byte_str, nullptr, 16));
+                    }
+
+                    bool is_commander = (arq_.role() == ArqRole::COMMANDER);
+                    crypto_direction_ = is_commander ? DIR_CMD_TO_RSP : DIR_RSP_TO_CMD;
+                    cipher_.derive_session_key(config_.callsign.c_str(),
+                                                arq_.remote_callsign().c_str(),
+                                                psk.empty() ? nullptr : psk.data(),
+                                                (int)psk.size(), false);
+                    cipher_.activate();
+                    tx_batch_counter_ = 0;
+                    rx_batch_counter_ = 0;
+                    crypto_state_ = 2;  // ENCRYPTED (X25519-only, upgrading to hybrid)
+                    IRIS_LOG("[CRYPTO] Session encrypted (X25519 ECDH + ChaCha20-Poly1305)");
+
+                    // Start ML-KEM-768 post-quantum upgrade (commander initiates)
+                    if (arq_.negotiated(CAP_PQ_CRYPTO)) {
+                        mlkem_kx_pending_ = true;
+                        if (arq_.role() == ArqRole::COMMANDER) {
+                            start_mlkem_exchange();
+                        }
+                        // strict mode: don't release data until hybrid KX done
+                        // fast mode: data flows immediately with X25519-only key
+                    }
+                }
             } else if (config_.encryption_mode > 0) {
                 crypto_state_ = 1;  // KEY EXCHANGE (wanted encryption but peer didn't negotiate)
             }
@@ -317,6 +376,8 @@ bool Modem::init(const IrisConfig& config) {
             rx_compressor_.deinit();
             cipher_.wipe();
             crypto_state_ = 0;  // OFF
+            mlkem_kx_pending_ = false;
+            mlkem_held_frames_.clear();
             b2f_handler_.deinit();
 
             // Reset native mode so next session starts clean.
@@ -351,6 +412,16 @@ bool Modem::init(const IrisConfig& config) {
             tx_queue_.push(std::vector<uint8_t>(data, data + len));
         } else {
             ax25_tx_queue_.push(std::vector<uint8_t>(data, data + len));
+            // Buffer I-frame info fields during AFSK phase for B2F replay.
+            // The B2F handler isn't initialized until OFDM-KISS activates, but
+            // the SID/FC/FS exchange happens during AFSK.  Buffer the info so
+            // we can replay it when the handler initializes.
+            if (ofdm_kiss_ && len > 16) {
+                uint8_t ctrl = data[14];
+                if ((ctrl & 0x01) == 0) {  // I-frame
+                    b2f_afsk_tx_history_.emplace_back(data + 16, data + len);
+                }
+            }
         }
     });
     ax25_session_.set_data_callback([this](const uint8_t* data, size_t len) {
@@ -419,7 +490,11 @@ bool Modem::init(const IrisConfig& config) {
                     b2f_proxy_plaintext_.clear();
                     b2f_proxy_plaintext_.shrink_to_fit();
                 }
+                b2f_afsk_tx_history_.clear();
+                b2f_afsk_rx_history_.clear();
                 ofdm_kiss_peer_caps_ = 0;
+                rx_channel_eq_.reset();
+                tx_channel_eq_.reset();
                 b2f_proxy_active_ = false;
                 b2f_proxy_rx_active_ = false;
                 b2f_proxy_addr_valid_ = false;
@@ -731,6 +806,15 @@ void Modem::dispatch_rx_frame(const std::vector<uint8_t>& frame, bool from_fx25,
         }
     }
 
+    // Buffer RX I-frame info fields during AFSK phase for B2F replay.
+    // Same reason as TX: SID/FC/FS exchange happens over AFSK before OFDM-KISS activates.
+    if (ofdm_kiss_ && !from_ofdm && !ofdm_kiss_b2f_.is_initialized() && frame.size() > 16) {
+        uint8_t ctrl = frame[14];
+        if ((ctrl & 0x01) == 0) {  // I-frame
+            b2f_afsk_rx_history_.emplace_back(frame.data() + 16, frame.data() + frame.size());
+        }
+    }
+
     // B2F proxy: feed incoming I-frame info fields to filter_rx for state tracking.
     // This drives B2F state transitions (detects FS responses, FC proposals, etc.)
     // Must run BEFORE ax25_session consumes the frame.
@@ -912,7 +996,15 @@ void Modem::process_rx_native(const float* audio, int count) {
     size_t iq_count;
 
     if (use_upconvert_) {
-        iq_buf = downconverter_.audio_to_iq(audio, count);
+        // Channel equalization: flatten FM de-emphasis before downconversion.
+        // Operates on real passband audio so both I and Q see equalized signal.
+        if (rx_channel_eq_.is_configured()) {
+            std::vector<float> eq_audio(audio, audio + count);
+            rx_channel_eq_.apply(eq_audio.data(), count);
+            iq_buf = downconverter_.audio_to_iq(eq_audio.data(), count);
+        } else {
+            iq_buf = downconverter_.audio_to_iq(audio, count);
+        }
         iq_data = iq_buf.data();
         iq_count = iq_buf.size();
     } else {
@@ -992,23 +1084,23 @@ void Modem::process_rx_native(const float* audio, int count) {
             IRIS_LOG("RX native frame %zu bytes at offset %d", payload.size(), start);
 
             {
-                auto preamble_ref = generate_preamble();
-                int sps = phy_config_.samples_per_symbol;
-                size_t n_iq = rx_overlap_buf_.size() / 2;
-                int preamble_syms = (int)preamble_ref.size();
-                std::vector<std::complex<float>> rx_preamble;
-                for (int i = 0; i < preamble_syms; i++) {
-                    size_t idx = start + i * sps;
-                    if (idx < n_iq)
-                        rx_preamble.push_back({rx_overlap_buf_[2 * idx],
-                                                rx_overlap_buf_[2 * idx + 1]});
-                }
-                if ((int)rx_preamble.size() >= preamble_syms) {
-                    float snr = estimate_snr(preamble_ref.data(), rx_preamble.data(),
-                                              preamble_syms);
-                    snr_db_ = snr;
-                    gearshift_.update(snr);
-                }
+                // Use SNR computed inside the frame decoder, which has:
+                // - RRC-filtered samples
+                // - Fine timing (sub-sample interpolation)
+                // - Phase + frequency offset correction
+                // This is much more accurate than external estimation.
+                float snr = decode_snr_db();
+                snr_db_ = snr;
+                int ldpc_iters = ldpc_last_max_iters();
+                gearshift_.feed_ldpc_iters(ldpc_iters, 50);
+                int old_level = gearshift_.current_level();
+                gearshift_.update(snr);
+                arq_.set_local_snr(snr);
+                int new_level = gearshift_.current_level();
+                IRIS_LOG("[SNR] est=%.1f dB, ldpc_iters=%d, boost=+%.1f, eff=%.1f, gearshift: %d->%d (smoothed=%.1f, cd=%d)",
+                         snr, ldpc_iters, gearshift_.boost(),
+                         gearshift_.smoothed_snr() + gearshift_.boost(),
+                         old_level, new_level, gearshift_.smoothed_snr(), gearshift_.cooldown());
             }
 
             {
@@ -1203,8 +1295,14 @@ void Modem::process_rx_native(const float* audio, int count) {
                      start, rx_overlap_buf_.size() / 2, pending_need_floats_ / 2);
         } else {
             crc_errors_++;
-            IRIS_LOG("RX decode FAIL at offset %d corr=%.3f (crc_errors=%d)",
-                     start, det_corr, (int)crc_errors_);
+            gearshift_.report_failure();
+            IRIS_LOG("RX decode FAIL at offset %d corr=%.3f (crc_errors=%d, gearshift->%d)",
+                     start, det_corr, (int)crc_errors_, gearshift_.current_level());
+            // NACK: in OFDM-KISS mode, send AX.25 REJ immediately so the peer
+            // retransmits without waiting for T1 timeout (~30s).
+            if (ofdm_kiss_ && ax25_session_.is_active()) {
+                ax25_session_.request_retransmit();
+            }
             // Skip past the estimated frame to avoid re-detecting its remnants.
             // Use the consumed_iq from the decoder if available, else estimate.
             size_t consumed_iq = decode_consumed_iq();
@@ -1250,7 +1348,7 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
         if (to_copy < (size_t)frame_count)
             std::memset(tx_audio + to_copy, 0, (frame_count - to_copy) * sizeof(float));
 
-        // Apply simulated bandpass filter to TX audio
+        // Apply simulated channel effects to TX audio
         if (sim_bp_enabled_) {
             for (int i = 0; i < frame_count; i++) {
                 float s = tx_audio[i];
@@ -1258,6 +1356,10 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                 for (int j = 0; j < 4; j++) s = sim_bp_lo_[j].process(s);
                 tx_audio[i] = s;
             }
+        }
+        if (sim_deemph_enabled_) {
+            for (int i = 0; i < frame_count; i++)
+                tx_audio[i] = sim_deemph_.process(tx_audio[i]);
         }
 
         if (tx_pos_ >= tx_buffer_.size()) {
@@ -1330,7 +1432,8 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
     // probing, and pending native frame (waiting for more data after preamble).
     bool native_frame_pending = (pending_frame_start_ >= 0 && pending_frame_timeout_ > 0);
     bool tx_blocked = dcd_busy || (dcd_holdoff_ > 0) || (csma_holdoff_ > 0)
-                      || ofdm_kiss_probing_ || native_frame_pending;
+                      || ofdm_kiss_probing_ || ofdm_kiss_probe_cd_ > 0
+                      || native_frame_pending;
     ax25_session_.set_channel_busy(tx_blocked);
 
     if (dcd_busy || dcd_holdoff_ > 0) {
@@ -1545,6 +1648,9 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                     tx_mod = SPEED_LEVELS[level].modulation;
                     tx_fec_n = SPEED_LEVELS[level].fec_rate_num;
                     tx_fec_d = SPEED_LEVELS[level].fec_rate_den;
+                    IRIS_LOG("[TX] speed=%s (level=%d) mod=%d fec=%d/%d, %zu bytes",
+                             SPEED_LEVELS[level].name, level,
+                             (int)tx_mod, tx_fec_n, tx_fec_d, frame_data.size());
                 }
                 tx_config.modulation = tx_mod;
                 LdpcRate fec = fec_to_ldpc_rate(tx_fec_n, tx_fec_d);
@@ -1552,6 +1658,16 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
 
                 if (use_upconvert_) {
                     tx_buffer_ = upconverter_.iq_to_audio(iq.data(), iq.size());
+                    // TX pre-equalization: compensate for peer's RX de-emphasis
+                    if (tx_channel_eq_.is_configured()) {
+                        tx_channel_eq_.apply(tx_buffer_.data(), (int)tx_buffer_.size());
+                        // Peak limiter: prevent FM overmodulation from EQ boost.
+                        // Soft-clip at 0.95 to keep deviation within limits.
+                        for (auto& s : tx_buffer_) {
+                            if (s > 0.95f) s = 0.95f + 0.05f * std::tanh((s - 0.95f) / 0.05f);
+                            else if (s < -0.95f) s = -0.95f + 0.05f * std::tanh((s + 0.95f) / 0.05f);
+                        }
+                    }
                 } else {
                     tx_buffer_.resize(iq.size() / 2);
                     for (size_t i = 0; i < iq.size() / 2; i++)
@@ -1647,7 +1763,7 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
             if (to_copy < (size_t)frame_count)
                 std::memset(tx_audio + to_copy, 0, (frame_count - to_copy) * sizeof(float));
 
-            // Apply simulated bandpass filter
+            // Apply simulated channel effects
             if (sim_bp_enabled_) {
                 for (int i = 0; i < frame_count; i++) {
                     float s = tx_audio[i];
@@ -1655,6 +1771,10 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                     for (int j = 0; j < 4; j++) s = sim_bp_lo_[j].process(s);
                     tx_audio[i] = s;
                 }
+            }
+            if (sim_deemph_enabled_) {
+                for (int i = 0; i < frame_count; i++)
+                    tx_audio[i] = sim_deemph_.process(tx_audio[i]);
             }
             return;
         }
@@ -1692,6 +1812,14 @@ void Modem::queue_tx_frame(const uint8_t* frame, size_t len) {
                 cur = compressed.data();
                 cur_len = comp_len;
             }
+        }
+
+        // Strict mode: hold data until post-quantum KX completes
+        if (mlkem_kx_pending_ && config_.encryption_mode == 1) {
+            // Buffer the original frame — will be flushed after hybrid rekey
+            mlkem_held_frames_.insert(mlkem_held_frames_.end(), frame, frame + len);
+            IRIS_LOG("[CRYPTO] Strict mode: holding %zu bytes until ML-KEM completes", len);
+            return;
         }
 
         // Layer 3: Encrypt if active
@@ -1891,6 +2019,8 @@ void Modem::send_connected_data(const uint8_t* data, size_t len) {
 
 void Modem::arq_connect(const std::string& remote_callsign) {
     IRIS_LOG("ARQ connect to %s", remote_callsign.c_str());
+    // Generate ephemeral X25519 keypair for DH key exchange
+    generate_ephemeral_x25519();
     // Start in AX.25 — upgrade to native after XID negotiation
     arq_.connect(remote_callsign);
 }
@@ -1911,7 +2041,90 @@ void Modem::arq_listen() {
     // when the remote station proves it supports Iris native PHY.
     // --ax25-only suppresses XID entirely.
     IRIS_LOG("ARQ listen (native_mode=0, ax25_only=%d)", config_.ax25_only ? 1 : 0);
+    // Generate ephemeral X25519 keypair for DH key exchange
+    generate_ephemeral_x25519();
     arq_.listen();
+}
+
+void Modem::generate_ephemeral_x25519() {
+    if (config_.encryption_mode == 0) return;
+    uint8_t pubkey[X25519_KEY_SIZE];
+    if (cipher_.generate_x25519_keypair(pubkey) == 0) {
+        arq_.set_local_x25519_pubkey(pubkey);
+        IRIS_LOG("[CRYPTO] Generated ephemeral X25519 keypair");
+    } else {
+        IRIS_LOG("[CRYPTO] WARNING: X25519 keypair generation failed");
+    }
+}
+
+void Modem::start_mlkem_exchange() {
+    // Commander generates ML-KEM-768 keypair and sends encapsulation key
+    uint8_t encaps_key[MLKEM_PK_SIZE];
+    if (cipher_.generate_mlkem_keypair(encaps_key) != 0) {
+        IRIS_LOG("[CRYPTO] ML-KEM keypair generation failed, staying X25519-only");
+        mlkem_kx_pending_ = false;
+        return;
+    }
+    // Send as ARQ data: [MLKEM_PK_MAGIC][encaps_key(1184)]
+    std::vector<uint8_t> kx_frame;
+    kx_frame.reserve(1 + MLKEM_PK_SIZE);
+    kx_frame.push_back(MLKEM_PK_MAGIC);
+    kx_frame.insert(kx_frame.end(), encaps_key, encaps_key + MLKEM_PK_SIZE);
+    arq_.send_data(kx_frame.data(), kx_frame.size());
+    IRIS_LOG("[CRYPTO] ML-KEM: sent encapsulation key (%d bytes)", MLKEM_PK_SIZE);
+}
+
+void Modem::handle_mlkem_frame(const uint8_t* data, size_t len) {
+    if (data[0] == MLKEM_PK_MAGIC && len == 1 + MLKEM_PK_SIZE) {
+        // Responder received encapsulation key — encapsulate and send ciphertext back
+        IRIS_LOG("[CRYPTO] ML-KEM: received encapsulation key (%zu bytes)", len - 1);
+        uint8_t ciphertext[MLKEM_CT_SIZE];
+        if (cipher_.encapsulate_mlkem(data + 1, ciphertext) != 0) {
+            IRIS_LOG("[CRYPTO] ML-KEM encapsulation failed, staying X25519-only");
+            mlkem_kx_pending_ = false;
+            return;
+        }
+        // Send ciphertext back
+        std::vector<uint8_t> ct_frame;
+        ct_frame.reserve(1 + MLKEM_CT_SIZE);
+        ct_frame.push_back(MLKEM_CT_MAGIC);
+        ct_frame.insert(ct_frame.end(), ciphertext, ciphertext + MLKEM_CT_SIZE);
+        arq_.send_data(ct_frame.data(), ct_frame.size());
+        IRIS_LOG("[CRYPTO] ML-KEM: sent ciphertext (%d bytes)", MLKEM_CT_SIZE);
+        // Responder has both shared secrets now — rekey
+        rekey_hybrid();
+    } else if (data[0] == MLKEM_CT_MAGIC && len == 1 + MLKEM_CT_SIZE) {
+        // Commander received ciphertext — decapsulate
+        IRIS_LOG("[CRYPTO] ML-KEM: received ciphertext (%zu bytes)", len - 1);
+        if (cipher_.decapsulate_mlkem(data + 1) != 0) {
+            IRIS_LOG("[CRYPTO] ML-KEM decapsulation failed, staying X25519-only");
+            mlkem_kx_pending_ = false;
+            return;
+        }
+        // Commander has both shared secrets now — rekey
+        rekey_hybrid();
+    } else {
+        IRIS_LOG("[CRYPTO] ML-KEM: unexpected frame (magic=0x%02X, len=%zu)", data[0], len);
+    }
+}
+
+void Modem::rekey_hybrid() {
+    // Re-derive session key with both X25519 + ML-KEM shared secrets
+    std::vector<uint8_t> psk;
+    for (size_t i = 0; i + 1 < config_.psk_hex.size(); i += 2) {
+        char byte_str[3] = {config_.psk_hex[i], config_.psk_hex[i+1], 0};
+        psk.push_back((uint8_t)strtol(byte_str, nullptr, 16));
+    }
+    cipher_.derive_session_key(config_.callsign.c_str(),
+                                arq_.remote_callsign().c_str(),
+                                psk.empty() ? nullptr : psk.data(),
+                                (int)psk.size(), true);  // mlkem_done=true
+    // Reset batch counters — both sides rekey at the same point
+    tx_batch_counter_ = 0;
+    rx_batch_counter_ = 0;
+    mlkem_kx_pending_ = false;
+    IRIS_LOG("[CRYPTO] HYBRID REKEY: X25519 + ML-KEM-768 (SNDL-proof)");
+    if (gui_log_) gui_log_("[CRYPTO] Post-quantum encryption active");
 }
 
 // After this many AFSK SABM failures, escalate to native BPSK hailing
@@ -1998,16 +2211,16 @@ void Modem::tick() {
         if (ofdm_kiss_probe_cd_ == 0) {
             if (probe_manual_) {
                 // Manual probe button: always initiator, generous capture window.
-                probe_.start_initiator(config_.sample_rate, 15.0f);
+                probe_.start_initiator(config_.sample_rate, 25.0f);
                 ofdm_kiss_probing_ = true;
-                IRIS_LOG("[PROBE] Manual probe: sending tones now (15s capture)");
+                IRIS_LOG("[PROBE] Manual probe: sending tones now (25s capture)");
             } else {
-                // Auto-probe initiator: 15s capture.  Responder's probe tones
-                // arrive ~10-12s after we start listening (our 2.25s TX +
-                // responder 8-12s capture + analysis + TX).  8s was too short.
-                probe_.start_initiator(config_.sample_rate, 15.0f);
+                // Auto-probe initiator: 25s capture. Responder needs 12s capture +
+                // ~2s analysis + ~4s TX (result + 2.25s probe). Total ~18s.
+                // 25s provides comfortable margin for radio latency.
+                probe_.start_initiator(config_.sample_rate, 25.0f);
                 ofdm_kiss_probing_ = true;
-                IRIS_LOG("OFDM-KISS probe: initiator sending tones (8s capture)");
+                IRIS_LOG("OFDM-KISS probe: initiator sending tones (25s capture)");
             }
         }
     }
@@ -2071,6 +2284,16 @@ void Modem::tick() {
                 }
             }
 
+            // Configure channel equalization from probe tone power data.
+            // RX EQ: flatten what we receive (their TX → our RX channel response)
+            // TX EQ: pre-compensate what we send (our TX → their RX channel response)
+            rx_channel_eq_.configure(probe_.their_tx_result(), probe_.negotiated(), config_.sample_rate, 3.0f);
+            tx_channel_eq_.configure(probe_.my_tx_result(), probe_.negotiated(), config_.sample_rate, 6.0f);
+            if (rx_channel_eq_.is_configured())
+                IRIS_LOG("Probe: RX channel EQ active (%d taps)", (int)rx_channel_eq_.taps().size());
+            if (tx_channel_eq_.is_configured())
+                IRIS_LOG("Probe: TX channel EQ active (%d taps)", (int)tx_channel_eq_.taps().size());
+
             IRIS_LOG("Probe complete: band %.0f-%.0f Hz (%.0f Hz BW), center %.0f Hz, baud %d",
                      low, high, bandwidth, center, phy_config_.baud_rate);
             if (gui_log_) {
@@ -2105,6 +2328,38 @@ void Modem::tick() {
                     ofdm_kiss_b2f_.init();
                     b2f_proxy_plaintext_.reserve(B2F_BUFFER_SIZE);
                     IRIS_LOG("OFDM-KISS: B2F unroll/reroll enabled");
+
+                    // Replay buffered AFSK I-frame info fields so the B2F
+                    // handler sees the SID/FC/FS exchange that happened before
+                    // OFDM-KISS activated.  Without this, the handler stays in
+                    // B2F_IDLE and never enters PAYLOAD_TRANSFER.
+                    if (!b2f_afsk_tx_history_.empty() || !b2f_afsk_rx_history_.empty()) {
+                        std::vector<uint8_t> scratch(16384);
+                        for (auto& info : b2f_afsk_tx_history_) {
+                            ofdm_kiss_b2f_.filter_tx(
+                                (const char*)info.data(), (int)info.size(),
+                                (char*)scratch.data(), (int)scratch.size());
+                        }
+                        for (auto& info : b2f_afsk_rx_history_) {
+                            ofdm_kiss_b2f_.filter_rx(
+                                (const char*)info.data(), (int)info.size(),
+                                (char*)scratch.data(), (int)scratch.size());
+                        }
+                        IRIS_LOG("OFDM-KISS: B2F replayed %zu TX + %zu RX AFSK I-frames",
+                                 b2f_afsk_tx_history_.size(), b2f_afsk_rx_history_.size());
+                        b2f_afsk_tx_history_.clear();
+                        b2f_afsk_rx_history_.clear();
+
+                        // Safety: if payload transfer already started during AFSK,
+                        // some LZHUF bytes were sent as-is.  Can't partially unroll
+                        // (remote would get LZHUF + plaintext mix = corrupt).
+                        if (ofdm_kiss_b2f_.is_payload_transfer()) {
+                            IRIS_LOG("OFDM-KISS: B2F payload already in-flight from AFSK — "
+                                     "disabling unroll for this session");
+                            ofdm_kiss_b2f_.deinit();
+                            ofdm_kiss_peer_caps_ &= ~CAP_B2F_UNROLL;
+                        }
+                    }
                 }
             }
 

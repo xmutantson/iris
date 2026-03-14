@@ -264,6 +264,9 @@ bool decode_was_overflow() { return g_decode_overflow; }
 static size_t g_decode_consumed_iq = 0;
 size_t decode_consumed_iq() { return g_decode_consumed_iq; }
 
+static float g_decode_snr = 0.0f;
+float decode_snr_db() { return g_decode_snr; }
+
 int detect_frame_start(const float* iq_samples, size_t count, int sps) {
     auto preamble = generate_preamble();
     auto sync = generate_sync_word();
@@ -492,6 +495,35 @@ bool decode_native_frame(const float* iq_samples, size_t count,
              phase_ref * 180.0f / (float)M_PI, freq_offset_hz, channel_gain,
              best_timing - frame_start, timing_frac);
 
+    // Compute SNR from phase-corrected, properly-timed preamble symbols.
+    // This matches what the decoder actually sees, unlike the modem's external
+    // estimator which lacks fine timing and phase/frequency correction.
+    {
+        float signal_power = 0, noise_power = 0;
+        for (int i = 0; i < IRIS_PREAMBLE_LEN; i++) {
+            float pos = preamble_start + i * sps + timing_frac;
+            if (pos + 1 >= filt_len) break;
+            float iv = interp(i_filt, pos);
+            float qv = interp(q_filt, pos);
+            // Phase correction: rotate by -(phase_ref + phase_per_symbol * (i - ref_symbol))
+            float sym_phase = phase_ref + phase_per_symbol * (i - ref_symbol);
+            float cc = std::cos(-sym_phase) / channel_gain;
+            float ss = std::sin(-sym_phase) / channel_gain;
+            float re = iv * cc - qv * ss;
+            float im = iv * ss + qv * cc;
+            // Known preamble symbol is real-valued (BPSK m-sequence, ±1)
+            float expected_re = preamble_ref[i].real();  // ±1
+            float err_re = re - expected_re;
+            float err_im = im;  // expected Q = 0
+            signal_power += expected_re * expected_re;  // = 1.0 per symbol
+            noise_power += err_re * err_re + err_im * err_im;
+        }
+        if (noise_power < 1e-12f)
+            g_decode_snr = 60.0f;
+        else
+            g_decode_snr = 10.0f * std::log10(signal_power / noise_power);
+    }
+
     int header_start = rx_frame_start + (IRIS_PREAMBLE_LEN + IRIS_SYNC_LEN) * sps;
 
     // Decode header (32 BPSK symbols) with recursive 2nd-order PLL
@@ -540,6 +572,8 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     }
 
     // Header decoded: mod, payload_len, fec known. Continue to payload decode.
+    IRIS_LOG("[DECODE] RX header: mod=%d fec=%d payload=%d bytes",
+             (int)mod, (int)fec, payload_len);
 
     if (payload_len > NATIVE_MAX_PAYLOAD) {
         IRIS_LOG("[DECODE] payload_len %d too large (max %d)", payload_len, NATIVE_MAX_PAYLOAD);
@@ -760,6 +794,14 @@ bool decode_native_frame(const float* iq_samples, size_t count,
         // Clamp LLR magnitude to prevent decoder overflow
         for (auto& l : llrs) {
             l = std::max(-10.0f, std::min(10.0f, l));
+        }
+
+        // LLR quality stats: mean |LLR| indicates channel confidence
+        {
+            float sum_abs = 0;
+            for (auto& l : llrs) sum_abs += std::abs(l);
+            float mean_llr = llrs.size() > 0 ? sum_abs / llrs.size() : 0;
+            IRIS_LOG("[DECODE] LLR stats: mean_abs=%.2f, n=%zu", mean_llr, llrs.size());
         }
 
         // Pre-LDPC channel quality: count bit errors vs hard decision

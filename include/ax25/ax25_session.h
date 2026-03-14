@@ -94,6 +94,12 @@ public:
     void set_own_busy(bool busy);
     bool own_busy() const { return own_busy_; }
 
+    // Request immediate retransmission: sends REJ(V(R)) to tell the peer
+    // to retransmit from the last expected sequence number.  Use when the
+    // modem detects a native frame decode failure (CRC/LDPC) — much faster
+    // than waiting for the AX.25 T1 timeout (~30s).
+    void request_retransmit();
+
 private:
     void set_state(Ax25SessionState s);
 

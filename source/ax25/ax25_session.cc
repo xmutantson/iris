@@ -275,6 +275,16 @@ void Ax25Session::set_own_busy(bool busy) {
     }
 }
 
+void Ax25Session::request_retransmit() {
+    if (state_ != Ax25SessionState::CONNECTED &&
+        state_ != Ax25SessionState::TIMER_RECOVERY)
+        return;
+    if (reject_exception_) return;  // REJ already pending
+    reject_exception_ = true;
+    send_rej(false, true);  // Command REJ, no poll bit
+    acknowledge_pending_ = false;
+}
+
 void Ax25Session::send_next_iframe() {
     if (peer_busy_) return;
     if (state_ != Ax25SessionState::CONNECTED &&
