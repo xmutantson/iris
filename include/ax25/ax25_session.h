@@ -86,6 +86,7 @@ public:
     void set_kiss_passthrough(bool v) { kiss_passthrough_ = v; }
     bool is_kiss_passthrough() const { return kiss_passthrough_; }
     int retry_count() const { return retry_count_; }
+    uint8_t vr() const { return vr_; }  // For B2F proxy I-frame injection
 
     // Flow control: set receiver busy (sends RNR instead of RR to polls).
     // Use during modem reconfiguration (speed change, probe) to pause

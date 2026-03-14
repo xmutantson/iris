@@ -416,12 +416,14 @@ bool Modem::init(const IrisConfig& config) {
                 }
                 if (ofdm_kiss_peer_caps_ & CAP_B2F_UNROLL) {
                     ofdm_kiss_b2f_.deinit();
-                    b2f_buffer_.clear();
-                    b2f_buffer_.shrink_to_fit();
+                    b2f_proxy_plaintext_.clear();
+                    b2f_proxy_plaintext_.shrink_to_fit();
                 }
                 ofdm_kiss_peer_caps_ = 0;
                 b2f_proxy_active_ = false;
                 b2f_proxy_rx_active_ = false;
+                b2f_proxy_addr_valid_ = false;
+                b2f_proxy_vr_ = 0;
             }
 
             // Restore original band/baud/center if probe changed them
@@ -729,6 +731,23 @@ void Modem::dispatch_rx_frame(const std::vector<uint8_t>& frame, bool from_fx25,
         }
     }
 
+    // B2F proxy: feed incoming I-frame info fields to filter_rx for state tracking.
+    // This drives B2F state transitions (detects FS responses, FC proposals, etc.)
+    // Must run BEFORE ax25_session consumes the frame.
+    if (ofdm_kiss_ && from_ofdm && (ofdm_kiss_peer_caps_ & CAP_B2F_UNROLL) &&
+        ofdm_kiss_b2f_.is_initialized() && frame.size() > 16) {
+        uint8_t ctrl = frame[14];
+        if ((ctrl & 0x01) == 0) {  // I-frame
+            const uint8_t* info = frame.data() + 16;
+            int info_len = (int)(frame.size() - 16);
+            std::vector<uint8_t> b2f_rx_out(info_len * 2 + 4096);
+            ofdm_kiss_b2f_.filter_rx(
+                (const char*)info, info_len,
+                (char*)b2f_rx_out.data(), (int)b2f_rx_out.size());
+            // Output ignored — original I-frame delivered to Winlink as-is
+        }
+    }
+
     // Try AX.25 connected mode session
     {
         bool native_active = (arq_.state() != ArqState::IDLE &&
@@ -1033,6 +1052,62 @@ void Modem::process_rx_native(const float* audio, int count) {
                             if (migrated > 0)
                                 IRIS_LOG("OFDM-KISS: migrated %d I-frames to native (responder)", migrated);
                         }
+                    }
+
+                    // B2F proxy RX: handle B2F_DATA frames (unrolled plaintext from remote)
+                    if (len >= 2 && data[0] == B2F_DATA_MAGIC &&
+                        (ofdm_kiss_peer_caps_ & CAP_B2F_UNROLL) &&
+                        ofdm_kiss_b2f_.is_initialized()) {
+                        // Decompress the B2F data block
+                        std::vector<uint8_t> decomp(len * 4 + 4096);
+                        int dec_len = ofdm_kiss_rx_compressor_.decompress_block(
+                            data + 1, (int)(len - 1),
+                            decomp.data(), (int)decomp.size());
+                        if (dec_len <= 0) {
+                            // Decompression failed — try as raw uncompressed
+                            dec_len = (int)(len - 1);
+                            decomp.assign(data + 1, data + len);
+                        }
+
+                        IRIS_LOG("[B2F-PROXY] RX: received B2F_DATA %zu bytes -> %d decompressed",
+                                 len - 1, dec_len);
+
+                        // Feed decompressed plaintext to filter_rx for rerolling
+                        std::vector<uint8_t> lzhuf_out(dec_len * 2 + 4096);
+                        int lzhuf_len = ofdm_kiss_b2f_.filter_rx(
+                            (const char*)decomp.data(), dec_len,
+                            (char*)lzhuf_out.data(), (int)lzhuf_out.size());
+
+                        if (lzhuf_len > 0 && rx_callback_) {
+                            // Construct I-frames with rerolled LZHUF and inject to Winlink
+                            b2f_proxy_rx_active_ = true;
+                            Ax25Address dst = ax25_make_addr(config_.callsign);
+                            Ax25Address src = ax25_make_addr(ax25_session_.remote_callsign());
+                            uint8_t ns = ax25_session_.vr();  // Continue from last known N(S)
+
+                            IRIS_LOG("[B2F-PROXY] RX: rerolled %d bytes LZHUF, injecting I-frames (ns=%d)",
+                                     lzhuf_len, ns);
+
+                            // Split into MAX_INFO-sized I-frames
+                            constexpr int MAX_INFO = 256;
+                            int offset = 0;
+                            while (offset < lzhuf_len) {
+                                int chunk = std::min(MAX_INFO, lzhuf_len - offset);
+                                auto iframe = ax25_build_i(dst, src, ns, 0, false,
+                                    AX25_PID_NONE,
+                                    lzhuf_out.data() + offset, chunk);
+                                rx_callback_(iframe.data(), iframe.size());
+                                ns = (ns + 1) & 0x07;
+                                offset += chunk;
+                            }
+                        }
+
+                        // Check if B2F handler exited payload transfer (all proposals done)
+                        if (!ofdm_kiss_b2f_.is_rx_payload_active()) {
+                            b2f_proxy_rx_active_ = false;
+                            IRIS_LOG("[B2F-PROXY] RX: payload transfer complete");
+                        }
+                        return;
                     }
 
                     std::vector<uint8_t> ax25_frame(data, data + len);
@@ -1435,8 +1510,10 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
 
                 // OFDM-KISS batch compression: compress the assembled payload.
                 // Prepend COMPRESSED_PAYLOAD_MAGIC so RX knows to decompress.
+                // Skip if payload is B2F_DATA (already compressed internally).
                 if (ofdm_kiss_tx_ && (ofdm_kiss_peer_caps_ & CAP_COMPRESSION) &&
-                    frame_data.size() > 20) {  // Don't bother compressing tiny frames
+                    frame_data.size() > 20 &&
+                    frame_data[0] != B2F_DATA_MAGIC) {  // Don't double-compress B2F_DATA
                     std::vector<uint8_t> comp_buf(frame_data.size() + COMPRESS_HEADER_SIZE + 256);
                     int comp_len = ofdm_kiss_tx_compressor_.compress_block(
                         frame_data.data(), (int)frame_data.size(),
@@ -1641,6 +1718,128 @@ void Modem::queue_tx_frame(const uint8_t* frame, size_t len) {
     // connections (SABM/DISC) without generating duplicate frames.
     // Must be under tx_mutex_ to synchronize with connection header injection.
     ax25_session_.notify_outgoing(frame, len);
+
+    // B2F proxy TX: sniff outgoing I-frame info fields through B2F handler.
+    // During PAYLOAD_TRANSFER (local proposer): intercept LZHUF I-frames,
+    // unroll via handler, compress plaintext, send as B2F_DATA over OFDM.
+    // Line protocol I-frames (SID, FC, FS, FF, FQ) are forwarded normally.
+    if (ofdm_kiss_tx_ && (ofdm_kiss_peer_caps_ & CAP_B2F_UNROLL) &&
+        ofdm_kiss_b2f_.is_initialized() && len > 16) {
+        uint8_t ctrl = frame[14];
+        bool is_iframe = (ctrl & 0x01) == 0;
+
+        if (is_iframe) {
+            const uint8_t* info = frame + 16;  // 14 addr + 1 ctrl + 1 pid
+            int info_len = (int)(len - 16);
+
+            // Check BEFORE feeding: is handler already in TX payload mode?
+            // Transition happens in filter_rx (when FS arrives from remote),
+            // so by the time we see LZHUF I-frames here, it's already set.
+            bool intercepting = ofdm_kiss_b2f_.is_tx_payload_active();
+
+            if (intercepting) {
+                // Feed LZHUF data to filter_tx for unrolling
+                std::vector<uint8_t> b2f_out(info_len * 2 + 4096);
+                int out_len = ofdm_kiss_b2f_.filter_tx(
+                    (const char*)info, info_len,
+                    (char*)b2f_out.data(), (int)b2f_out.size());
+
+                if (out_len > 0) {
+                    // Unrolled plaintext ready (one proposal complete)
+                    b2f_proxy_plaintext_.insert(b2f_proxy_plaintext_.end(),
+                        b2f_out.begin(), b2f_out.begin() + out_len);
+                }
+
+                // Check if all proposals done
+                if (!ofdm_kiss_b2f_.is_tx_payload_active()) {
+                    b2f_proxy_active_ = false;
+                    // Flush accumulated plaintext as B2F_DATA frame(s)
+                    if (!b2f_proxy_plaintext_.empty()) {
+                        IRIS_LOG("[B2F-PROXY] TX: unrolled %zu bytes plaintext, sending B2F_DATA",
+                                 b2f_proxy_plaintext_.size());
+                        // Segment into chunks that fit in NATIVE_MAX_PAYLOAD
+                        // Each chunk: [0xCD][compressed_block]
+                        const int CHUNK_SIZE = 3000;  // leaves room for compression overhead
+                        size_t offset = 0;
+                        while (offset < b2f_proxy_plaintext_.size()) {
+                            size_t chunk = std::min((size_t)CHUNK_SIZE,
+                                                     b2f_proxy_plaintext_.size() - offset);
+                            // Compress this chunk
+                            std::vector<uint8_t> comp(chunk + COMPRESS_HEADER_SIZE + 256);
+                            int comp_len = ofdm_kiss_tx_compressor_.compress_block(
+                                b2f_proxy_plaintext_.data() + offset, (int)chunk,
+                                comp.data(), (int)comp.size());
+                            // Build B2F_DATA frame
+                            std::vector<uint8_t> b2f_frame;
+                            b2f_frame.push_back(B2F_DATA_MAGIC);
+                            if (comp_len > 0 && comp_len < (int)chunk) {
+                                b2f_frame.insert(b2f_frame.end(), comp.begin(), comp.begin() + comp_len);
+                                IRIS_LOG("[B2F-PROXY] TX: chunk %zu bytes -> %d compressed",
+                                         chunk, comp_len);
+                            } else {
+                                // Incompressible — send raw with empty compression header
+                                b2f_frame.insert(b2f_frame.end(),
+                                    b2f_proxy_plaintext_.begin() + offset,
+                                    b2f_proxy_plaintext_.begin() + offset + chunk);
+                            }
+                            tx_queue_.push(std::move(b2f_frame));
+                            offset += chunk;
+                        }
+                        b2f_proxy_plaintext_.clear();
+                    }
+                }
+
+                // Generate RR ACK back to local Winlink so it doesn't timeout.
+                // Construct RR frame: swap src/dst, N(R) = N(S)+1
+                if (b2f_proxy_addr_valid_ && len > 14) {
+                    uint8_t ns = (ctrl >> 1) & 0x07;
+                    b2f_proxy_vr_ = (ns + 1) & 0x07;
+                    // Build RR response: [dst(7)][src(7)][ctrl_RR(1)]
+                    // dst = original src (our Winlink), src = original dst (remote)
+                    std::vector<uint8_t> rr(15);
+                    memcpy(rr.data(), frame + 7, 7);      // dst = original src
+                    memcpy(rr.data() + 7, frame, 7);      // src = original dst
+                    // Fix address extension bits
+                    rr[6] &= 0xFE;    // dst: clear end-of-address bit
+                    rr[13] |= 0x01;   // src: set end-of-address bit
+                    // RR S-frame control: (N(R) << 5) | (F << 4) | 0x01
+                    bool poll = (ctrl & 0x10) != 0;
+                    rr[14] = (b2f_proxy_vr_ << 5) | (poll ? 0x10 : 0) | 0x01;
+                    if (rx_callback_)
+                        rx_callback_(rr.data(), rr.size());
+                }
+
+                return;  // Don't forward this I-frame
+            }
+
+            // Not intercepting: feed for state tracking (line protocol)
+            std::vector<uint8_t> b2f_out(info_len * 2 + 4096);
+            ofdm_kiss_b2f_.filter_tx(
+                (const char*)info, info_len,
+                (char*)b2f_out.data(), (int)b2f_out.size());
+
+            // Check if handler just transitioned to TX payload mode
+            if (ofdm_kiss_b2f_.is_tx_payload_active() && !b2f_proxy_active_) {
+                b2f_proxy_active_ = true;
+                b2f_proxy_vr_ = 0;
+                b2f_proxy_plaintext_.clear();
+                memcpy(b2f_proxy_addr_, frame, 14);
+                b2f_proxy_addr_valid_ = true;
+                IRIS_LOG("[B2F-PROXY] TX interception started (local proposer payload)");
+            }
+            // Fall through: forward line protocol I-frame normally
+        }
+
+        // B2F proxy RX ACK suppression: during B2F_DATA reception,
+        // Winlink sends RR ACKs for our injected I-frames.
+        // Suppress them — they're not meaningful to the remote station.
+        if (b2f_proxy_rx_active_) {
+            uint8_t ctrl2 = frame[14];
+            if ((ctrl2 & 0x03) == 0x01) {  // S-frame
+                return;  // Suppress
+            }
+        }
+    }
 
     std::vector<uint8_t> tx_frame(frame, frame + len);
     tx_queue_.push(std::move(tx_frame));
@@ -1904,7 +2103,7 @@ void Modem::tick() {
                 }
                 if (ofdm_kiss_peer_caps_ & CAP_B2F_UNROLL) {
                     ofdm_kiss_b2f_.init();
-                    b2f_buffer_.reserve(B2F_BUFFER_SIZE);
+                    b2f_proxy_plaintext_.reserve(B2F_BUFFER_SIZE);
                     IRIS_LOG("OFDM-KISS: B2F unroll/reroll enabled");
                 }
             }

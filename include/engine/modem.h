@@ -343,11 +343,12 @@ private:
 
     // OFDM-KISS B2F proxy
     B2fHandler ofdm_kiss_b2f_;
-    std::vector<uint8_t> b2f_buffer_;           // 2MB buffer for LZHUF accumulation
+    std::vector<uint8_t> b2f_proxy_plaintext_;  // Accumulated plaintext from B2F unroll
     bool b2f_proxy_active_ = false;             // TX intercepting B2F payload
     bool b2f_proxy_rx_active_ = false;          // RX reassembling B2F payload
-    size_t b2f_rx_expected_ = 0;
-    size_t b2f_rx_received_ = 0;
+    uint8_t b2f_proxy_vr_ = 0;                  // V(R) for generating local RR ACKs
+    uint8_t b2f_proxy_addr_[14] = {};            // Cached AX.25 address header (for ACK/I-frame construction)
+    bool b2f_proxy_addr_valid_ = false;         // Address header cached
     int  ofdm_kiss_probe_cd_ = 0;   // Tick countdown before initiator starts probe
     bool ofdm_kiss_probe_done_ = false; // Probe completed, PHY reconfigured
     bool probe_manual_ = false;         // Manual probe (button) vs in-session

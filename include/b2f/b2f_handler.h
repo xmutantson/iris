@@ -53,6 +53,15 @@ public:
     bool is_b2f_session() const { return b2f_detected_; }
     bool is_initialized() const { return initialized_; }
 
+    // State accessors for OFDM-KISS B2F proxy
+    bool is_payload_transfer() const { return state_ == B2F_PAYLOAD_TRANSFER; }
+    bool is_tx_payload_active() const {
+        return state_ == B2F_PAYLOAD_TRANSFER && current_proposer_ == PROPOSER_LOCAL;
+    }
+    bool is_rx_payload_active() const {
+        return state_ == B2F_PAYLOAD_TRANSFER && current_proposer_ == PROPOSER_REMOTE;
+    }
+
     bool unroll_enabled;
 
 private:
