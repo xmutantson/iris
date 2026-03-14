@@ -197,6 +197,17 @@ std::vector<float> build_native_frame(const uint8_t* payload, size_t len,
     // Apply LDPC FEC encoding
     if (fec != LdpcRate::NONE) {
         payload_bits = LdpcCodec::encode(payload_bits, fec);
+        // Interleave each LDPC block to spread burst errors (e.g. signal fade
+        // at frame tail) across the codeword.  LDPC corrects random errors well
+        // but struggles with contiguous bursts in the same parity region.
+        int n_fec = LdpcCodec::codeword_size(fec);
+        constexpr int INTERLEAVE_STRIDE = 41;  // coprime to 1600
+        for (size_t blk = 0; blk + n_fec <= payload_bits.size(); blk += n_fec) {
+            std::vector<uint8_t> tmp(n_fec);
+            for (int i = 0; i < n_fec; i++)
+                tmp[(i * INTERLEAVE_STRIDE) % n_fec] = payload_bits[blk + i];
+            std::copy(tmp.begin(), tmp.end(), payload_bits.begin() + blk);
+        }
     }
 
     // Pad to multiple of bits_per_symbol
@@ -210,8 +221,12 @@ std::vector<float> build_native_frame(const uint8_t* payload, size_t len,
 
     auto payload_symbols = map_bits(payload_bits, config.modulation);
 
-    // Insert mid-frame pilots for 16QAM and above
-    bool use_pilots = (config.modulation >= Modulation::QAM16) && (PILOT_SPACING > 0);
+    // Insert mid-frame pilots for phase tracking.
+    // QAM16+ always needs pilots.  BPSK/QPSK need them on long frames (>256 symbols)
+    // where the decision-directed PLL drifts without known reference points.
+    // OTA testing showed 2400-symbol QPSK frames losing phase lock at the tail.
+    bool use_pilots = (PILOT_SPACING > 0) &&
+        (config.modulation >= Modulation::QAM16 || (int)payload_symbols.size() > 256);
     if (use_pilots) {
         std::vector<std::complex<float>> with_pilots;
         with_pilots.reserve(payload_symbols.size() + payload_symbols.size() / PILOT_SPACING + 1);
@@ -296,6 +311,12 @@ int detect_frame_start(const float* iq_samples, size_t count, int sps) {
         // Properly normalize to [0,1]: divide by sqrt(signal_energy * ref_energy)
         // Reference symbols are unit magnitude, so ref_energy = ref_len
         float norm = (energy > 0) ? mag / std::sqrt(energy * (float)ref_len) : 0;
+
+        // Energy gate: reject detections on very low-energy windows.
+        // When energy ~ 0, even tiny random correlations normalize to ~1.0.
+        // Min energy = 0.01 per symbol (well below any real signal).
+        float energy_per_sym = energy / (float)ref_len;
+        if (energy_per_sym < 0.01f) norm = 0;
 
         if (norm > best_corr) {
             best_corr = norm;
@@ -466,6 +487,7 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     if (channel_gain < 1e-6f) channel_gain = 1.0f;
 
     float freq_offset_hz = phase_per_symbol * default_config.baud_rate / (2.0f * (float)M_PI);
+
     IRIS_LOG("[DECODE] phase=%.1f deg freq=%.1f Hz gain=%.3f timing_adj=%d frac=%.3f",
              phase_ref * 180.0f / (float)M_PI, freq_offset_hz, channel_gain,
              best_timing - frame_start, timing_frac);
@@ -545,7 +567,8 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     int data_symbols = padded_bits / bps;
 
     // Account for mid-frame pilots (must match TX insertion logic)
-    bool use_pilots = (mod >= Modulation::QAM16) && (PILOT_SPACING > 0);
+    bool use_pilots = (PILOT_SPACING > 0) &&
+        (mod >= Modulation::QAM16 || data_symbols > 256);
     int n_pilots = use_pilots ? ((data_symbols > 0) ? ((data_symbols - 1) / PILOT_SPACING) : 0) : 0;
     int payload_symbols = data_symbols + n_pilots;
 
@@ -603,6 +626,7 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     char raw_diag[1024]; int rdp = 0;
     rdp += snprintf(raw_diag+rdp, sizeof(raw_diag)-rdp, "[DECODE] raw_phase: ");
     int data_sym_count = 0;  // counts data symbols (excludes pilots)
+    int since_pilot = 0;     // symbols since last pilot (resets on pilot extraction)
     for (int k2 = 0; k2 < payload_symbols; k2++) {
         float pos = payload_start + k2 * sps + timing_frac;
         float iv = interp(i_filt, pos);
@@ -626,9 +650,12 @@ bool decode_native_frame(const float* iq_samples, size_t count,
         float re = iv * cc - qv * ss;
         float im = iv * ss + qv * cc;
 
-        // Check if this position is a pilot symbol
+        // Check if this position is a pilot symbol.
+        // TX inserts a pilot BEFORE every PILOT_SPACING-th data symbol:
+        //   for (i=0..N) { if (i>0 && i%32==0) insert_pilot; push data[i]; }
+        // RX mirrors: after PILOT_SPACING data symbols, expect one pilot.
         bool is_pilot = false;
-        if (use_pilots && data_sym_count > 0 && (data_sym_count % PILOT_SPACING) == 0) {
+        if (use_pilots && since_pilot == PILOT_SPACING) {
             is_pilot = true;
         }
 
@@ -637,13 +664,17 @@ bool decode_native_frame(const float* iq_samples, size_t count,
             float phase_err = std::atan2(im, re);
             running_phase += payload_pll_alpha * 2.0f * phase_err;
             pll_freq += payload_pll_beta * 2.0f * phase_err;
-            // Update channel gain from pilot magnitude
+            // Update channel gain from pilot magnitude.
+            // Aggressive tracking (0.5/0.5) to follow signal fade during
+            // long frames — OTA logs showed gain dropping 4:1 across 1600 symbols.
             float pilot_mag = std::sqrt(re * re + im * im);
-            channel_gain = 0.8f * channel_gain + 0.2f * pilot_mag;
+            channel_gain = 0.5f * channel_gain + 0.5f * pilot_mag;
+            since_pilot = 0;  // reset counter after pilot consumed
         } else {
             symbols.push_back({re, im});
             sym_reliability.push_back(raw_mag);
             data_sym_count++;
+            since_pilot++;
 
             // Decision-directed PLL: demap to nearest constellation point
             uint8_t dec_bits[8];
@@ -713,11 +744,22 @@ bool decode_native_frame(const float* iq_samples, size_t count,
         scramble_soft(llrs);
         if ((int)llrs.size() > encoded_bits)
             llrs.resize(encoded_bits);
-        // Clamp LLRs and enforce minimum magnitude for min-sum decoder
+
+        // De-interleave each LDPC block (reverses TX interleaver)
+        {
+            int n_fec = LdpcCodec::codeword_size(fec);
+            constexpr int INTERLEAVE_STRIDE = 41;  // must match TX
+            for (size_t blk = 0; blk + n_fec <= llrs.size(); blk += n_fec) {
+                std::vector<float> tmp(n_fec);
+                for (int i = 0; i < n_fec; i++)
+                    tmp[i] = llrs[blk + (i * INTERLEAVE_STRIDE) % n_fec];
+                std::copy(tmp.begin(), tmp.end(), llrs.begin() + blk);
+            }
+        }
+
+        // Clamp LLR magnitude to prevent decoder overflow
         for (auto& l : llrs) {
             l = std::max(-10.0f, std::min(10.0f, l));
-            if (std::abs(l) < 0.05f)
-                l = l >= 0 ? 0.05f : -0.05f;
         }
 
         // Pre-LDPC channel quality: count bit errors vs hard decision

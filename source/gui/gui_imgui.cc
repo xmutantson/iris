@@ -658,6 +658,10 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
             if (ImGui::Button("Auto Cal", ImVec2(90, 28))) {
                 if (callbacks_.on_calibrate) callbacks_.on_calibrate();
             }
+            ImGui::SameLine();
+            if (ImGui::Button("Probe", ImVec2(90, 28))) {
+                if (callbacks_.on_probe) callbacks_.on_probe();
+            }
             if (config.calibrated_tx_level > 0)
                 ImGui::Text("Cal: %.3f", config.calibrated_tx_level);
         }
@@ -770,10 +774,18 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
 
     // ========== DCD Threshold (inline, above waterfall) ==========
     {
+        ImGui::Checkbox("Auto DCD", &config.dcd_auto);
+        ImGui::SameLine();
         ImGui::PushItemWidth(200);
         float thr = config.dcd_threshold;
         if (ImGui::SliderFloat("DCD threshold", &thr, 0.0f, 0.30f, "%.3f"))
             config.dcd_threshold = thr;
+        ImGui::PopItemWidth();
+        ImGui::SameLine();
+        ImGui::PushItemWidth(120);
+        int holdoff = config.dcd_holdoff_ms;
+        if (ImGui::SliderInt("Holdoff ms", &holdoff, 50, 500))
+            config.dcd_holdoff_ms = holdoff;
         ImGui::PopItemWidth();
         ImGui::SameLine();
         if (diag.dcd_busy)
@@ -791,7 +803,7 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
                            ImGuiWindowFlags_NoScrollbar);
         DrawWaterfall(wf_history_, diag.spectrum,
                       ImGui::GetContentRegionAvail().x, wf_h,
-                      diag.band_low_hz, diag.band_high_hz, WF_HISTORY);
+                      diag.spectrum_low_hz, diag.spectrum_high_hz, WF_HISTORY);
         ImGui::EndChild();
     }
 

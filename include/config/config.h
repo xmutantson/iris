@@ -88,6 +88,16 @@ struct IrisConfig {
     // 0 = disabled, typical values: 0.05-0.20 (adjustable in GUI)
     float dcd_threshold = 0.05f;
 
+    // DCD holdoff: how long to keep TX suppressed after carrier drops (ms).
+    // Must exceed FM squelch tail and inter-frame gaps within a burst.
+    // 500ms covers squelch tail (~100-300ms) plus AX.25 inter-frame gap.
+    int dcd_holdoff_ms = 500;
+
+    // Auto-DCD: automatically calibrate DCD threshold and detect inverted-squelch
+    // radios where the noise floor drops when a signal is present.
+    // When enabled, DCD measures the noise baseline at startup and adjusts polarity.
+    bool dcd_auto = true;
+
     // Logging
     bool log_enabled = false;    // Auto-log to AppData/Iris/logs/
 

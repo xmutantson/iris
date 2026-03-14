@@ -45,6 +45,24 @@ private:
     float prev_sample_;
 };
 
+// G3RUH scrambler/descrambler for 9600 baud GFSK (polynomial x^17 + x^12 + 1)
+// Self-synchronizing additive scrambler. Required for interop with Direwolf,
+// hardware TNCs, and all standard G3RUH 9600 baud implementations.
+class G3ruhScrambler {
+public:
+    G3ruhScrambler() : reg_(0) {}
+    void reset() { reg_ = 0; }
+
+    // TX: scramble bits before NRZI encoding
+    void scramble(std::vector<uint8_t>& bits);
+
+    // RX: descramble bits after NRZI decoding (self-synchronizing)
+    void descramble(std::vector<uint8_t>& bits);
+
+private:
+    uint32_t reg_;  // 17-bit shift register
+};
+
 } // namespace iris
 
 #endif

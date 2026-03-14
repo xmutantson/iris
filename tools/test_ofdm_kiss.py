@@ -28,8 +28,8 @@ if not os.path.isfile(IRIS):
 # Both stations play to CABLE Input and capture from CABLE Output.
 # The cable acts as a shared audio buffer — like a radio frequency.
 # DCD/CSMA + rx_mute handle contention (half-duplex discipline).
-SHARED_PLAYBACK = 1005  # CABLE Input
-SHARED_CAPTURE  = 11    # CABLE Output
+SHARED_PLAYBACK = 1006  # CABLE Input (VB-Audio Virtual Cable)
+SHARED_CAPTURE  = 12    # CABLE Output (VB-Audio Virtual Cable)
 
 # Ports
 A_KISS_PORT = 8001
@@ -98,10 +98,10 @@ def parse_log(path):
     """Parse Iris log file, return dict of events with timestamps."""
     events = {
         'connected': None,
-        'iris_header_sent': None,
-        'iris_header_received': None,
-        'switch_sent': None,
-        'switch_received': None,
+        'probe_start': None,       # Probe-after-connect initiated
+        'probe_complete': None,    # Probe completed with results
+        'native_active': None,     # OFDM-KISS native mode active
+        'native_confirmed': None,  # Heard native frame from peer
         'ofdm_kiss_rx': None,      # ofdm_kiss_ = true
         'ofdm_kiss_tx': None,      # ofdm_kiss_tx_ = true
         'native_frames_tx': 0,
@@ -123,21 +123,23 @@ def parse_log(path):
             if 'AX25 state -> 2' in line or 'CONNECTED' in line and 'state ->' in line:
                 if events['connected'] is None:
                     events['connected'] = ts
-            if 'Connection header queued' in line or 'Connection header reply sent' in line:
-                events['iris_header_sent'] = ts
-            if 'Connection header from peer' in line:
-                events['iris_header_received'] = ts
-            if 'SWITCH sent' in line:
-                events['switch_sent'] = ts
-            if 'SWITCH complete' in line or 'SWITCH' in line and 'received' in line.lower():
-                events['switch_received'] = ts
-            if 'native RX active' in line or 'native RX+TX' in line:
+            # Probe-first architecture events
+            if 'Probe-after-connect' in line:
+                events['probe_start'] = ts
+            if 'PROBE:START' in line and 'Received' in line:
+                events['probe_start'] = ts
+            if 'Probe complete:' in line or '[PROBE] Complete!' in line:
+                events['probe_complete'] = ts
+            if 'native mode active' in line:
+                events['native_active'] = ts
                 events['ofdm_kiss_rx'] = ts
-            if 'native RX+TX active' in line or 'TX enabled (responder' in line:
                 events['ofdm_kiss_tx'] = ts
-            if 'TX frame' in line and 'native' in line.lower():
+            if 'native confirmed' in line:
+                events['native_confirmed'] = ts
+            # TX frame counting: OFDM-KISS native frames
+            if 'TX frame' in line and 'OFDM-KISS' in line:
                 events['native_frames_tx'] += 1
-            if re.search(r'state.*TX_NATIVE', line):
+            if 'TX frame' in line and 'native' in line.lower():
                 events['native_frames_tx'] += 1
             if 'RX native frame' in line and 'DISCARDED' not in line:
                 events['native_frames_rx'] += 1
@@ -154,9 +156,8 @@ def print_timeline(events_a, events_b):
     """Print unified timeline from both stations."""
     timeline = []
     for name, events in [('A', events_a), ('B', events_b)]:
-        for key in ['connected', 'iris_header_sent', 'iris_header_received',
-                     'switch_sent', 'switch_received', 'ofdm_kiss_rx',
-                     'ofdm_kiss_tx', 'disconnected']:
+        for key in ['connected', 'probe_start', 'probe_complete',
+                     'native_active', 'native_confirmed', 'disconnected']:
             ts = events.get(key)
             if ts is not None:
                 timeline.append((ts, name, key))
@@ -420,18 +421,16 @@ def main():
     events_b = parse_log(log_b)
 
     if not args.ax25_only:
-        # Check OFDM-KISS phases
+        # Check OFDM-KISS probe-first phases
         phases = [
-            ("Phase 1 (IRIS header)", "iris_header_sent", "iris_header_received"),
-            ("Phase 2 (SWITCH)", "switch_sent", "switch_received"),
-            ("Phase 3 (native RX)", "ofdm_kiss_rx", None),
-            ("Phase 3 (native TX)", "ofdm_kiss_tx", None),
+            ("Phase 1 (probe start)", "probe_start"),
+            ("Phase 2 (probe complete)", "probe_complete"),
+            ("Phase 3 (native active)", "native_active"),
+            ("Phase 4 (native confirmed)", "native_confirmed"),
         ]
-        for phase_name, key_a, key_b in phases:
-            a_val = events_a.get(key_a or key_b)
-            b_val = events_b.get(key_b or key_a) if key_b else events_b.get(key_a)
-            a_ok = a_val is not None
-            b_ok = b_val is not None if key_b else True
+        for phase_name, key in phases:
+            a_ok = events_a.get(key) is not None
+            b_ok = events_b.get(key) is not None
             status = "PASS" if (a_ok or b_ok) else "FAIL"
             print(f"  {phase_name}: {status}")
             if status == "FAIL":

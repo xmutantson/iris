@@ -88,31 +88,73 @@ static void fft_inplace(float* re, float* im, int n) {
 ProbeResult probe_analyze(const float* samples, int n_samples, int sample_rate) {
     ProbeResult result;
 
-    // Use FFT size = next power of 2 >= n_samples (cap at 32768)
-    // At 48kHz: 32768-pt FFT = 1.46 Hz bins, plenty for 67 Hz tone spacing
-    int fft_n = 4096;
-    while (fft_n < n_samples && fft_n < 32768) fft_n <<= 1;
-    if (fft_n > 32768) fft_n = 32768;
-
-    std::vector<float> re(fft_n, 0.0f), im(fft_n, 0.0f);
-
-    // Window and copy samples
-    int copy_n = std::min(n_samples, fft_n);
-    for (int i = 0; i < copy_n; i++) {
-        float w = 0.5f * (1.0f - std::cos(2.0 * M_PI * i / (copy_n - 1)));
-        re[i] = samples[i] * w;
+    // FFT size: 32768 @ 48kHz = 1.46 Hz bins, plenty for 67 Hz tone spacing.
+    // For longer captures, segment-average: split into overlapping windows,
+    // FFT each, take MAX power per bin. Max resists temporary fading (a tone
+    // that dips in one segment is captured by others) and noise spurs (a spur
+    // in one segment doesn't raise the overall floor).
+    constexpr int FFT_N = 32768;
+    int fft_n = FFT_N;
+    if (n_samples < fft_n) {
+        fft_n = 4096;
+        while (fft_n < n_samples && fft_n < FFT_N) fft_n <<= 1;
     }
 
-    fft_inplace(re.data(), im.data(), fft_n);
-
-    // Compute power spectrum (dB) for positive frequencies
     float bin_hz = (float)sample_rate / fft_n;
     int n_pos = fft_n / 2;
-    std::vector<float> power_db(n_pos);
-    for (int i = 0; i < n_pos; i++) {
-        float mag2 = re[i] * re[i] + im[i] * im[i];
+    std::vector<float> power_db(n_pos, -200.0f);      // max across segments (tone detection)
+    std::vector<float> power_db_mean(n_pos, 0.0f);     // mean across segments (null validation)
+
+    // Segment parameters: 50% overlap
+    int hop = fft_n / 2;
+    int n_segments = 0;
+    std::vector<float> re(fft_n), im(fft_n);
+
+    for (int offset = 0; offset + fft_n <= n_samples; offset += hop) {
+        // Window and copy this segment
+        std::fill(re.begin(), re.end(), 0.0f);
+        std::fill(im.begin(), im.end(), 0.0f);
+        for (int i = 0; i < fft_n; i++) {
+            float w = 0.5f * (1.0f - std::cos(2.0 * M_PI * i / (fft_n - 1)));
+            re[i] = samples[offset + i] * w;
+        }
+
+        fft_inplace(re.data(), im.data(), fft_n);
+
+        // Dual-merge: max for tone detection, sum for mean (null validation)
         float norm2 = (float)fft_n * (float)fft_n;
-        power_db[i] = 10.0f * std::log10(mag2 / norm2 + 1e-20f);
+        for (int i = 0; i < n_pos; i++) {
+            float mag2 = re[i] * re[i] + im[i] * im[i];
+            float db = 10.0f * std::log10(mag2 / norm2 + 1e-20f);
+            if (db > power_db[i]) power_db[i] = db;
+            power_db_mean[i] += db;
+        }
+        n_segments++;
+    }
+
+    // If capture was shorter than one FFT window, do a single padded FFT
+    if (n_segments == 0) {
+        std::fill(re.begin(), re.end(), 0.0f);
+        std::fill(im.begin(), im.end(), 0.0f);
+        int copy_n = std::min(n_samples, fft_n);
+        for (int i = 0; i < copy_n; i++) {
+            float w = 0.5f * (1.0f - std::cos(2.0 * M_PI * i / (copy_n - 1)));
+            re[i] = samples[i] * w;
+        }
+        fft_inplace(re.data(), im.data(), fft_n);
+        float norm2 = (float)fft_n * (float)fft_n;
+        for (int i = 0; i < n_pos; i++) {
+            float mag2 = re[i] * re[i] + im[i] * im[i];
+            power_db[i] = 10.0f * std::log10(mag2 / norm2 + 1e-20f);
+            power_db_mean[i] = power_db[i];
+        }
+        n_segments = 1;
+    }
+
+    // Finalize mean spectrum
+    if (n_segments > 1) {
+        for (int i = 0; i < n_pos; i++)
+            power_db_mean[i] /= n_segments;
     }
 
     // Estimate noise floor: median of all bins in our range
@@ -169,6 +211,39 @@ ProbeResult probe_analyze(const float* samples, int n_samples, int sample_rate) 
         result.valid = (result.tones_detected >= 3);  // Need at least 3 tones
     }
 
+    // Pass 3: Comb validation — verify nulls between adjacent detected tones.
+    // Real probe tones have deep nulls between them; broadband noise does not.
+    if (result.valid) {
+        int null_checks = 0, null_passes = 0;
+        for (int k = 0; k < PassbandProbeConfig::N_TONES - 1; k++) {
+            if (!result.tone_detected[k] || !result.tone_detected[k + 1])
+                continue;
+            null_checks++;
+
+            // Midpoint frequency between adjacent tones
+            float mid_freq = (probe_tone_freq(k) + probe_tone_freq(k + 1)) / 2.0f;
+            int mid_bin = (int)(mid_freq / bin_hz + 0.5f);
+
+            // Peak in ±1 bin neighborhood — use MEAN spectrum so random noise
+            // peaks average out instead of accumulating via max-merge
+            float mid_power = power_db_mean[mid_bin];
+            if (mid_bin > 0) mid_power = std::max(mid_power, power_db_mean[mid_bin - 1]);
+            if (mid_bin < n_pos - 1) mid_power = std::max(mid_power, power_db_mean[mid_bin + 1]);
+
+            // Average power of the two flanking tones
+            float tone_avg = (result.tone_power_db[k] + result.tone_power_db[k + 1]) / 2.0f;
+
+            if (tone_avg - mid_power >= 10.0f)
+                null_passes++;
+        }
+
+        // Reject if fewer than 70% of inter-tone nulls are deep enough.
+        // Real probe nulls are 20+ dB deep; OFDM broadband has <6 dB variation.
+        if (null_checks >= 3 && null_passes * 10 < null_checks * 7) {
+            result.valid = false;
+            result.tones_detected = 0;
+        }
+    }
 
     return result;
 }
@@ -249,6 +324,10 @@ std::vector<uint8_t> probe_result_encode(const ProbeResult& r) {
         out.push_back(b);
     }
 
+    // Capability flags (2 bytes LE, appended for v2+ peers)
+    out.push_back((uint8_t)(r.capabilities & 0xFF));
+    out.push_back((uint8_t)((r.capabilities >> 8) & 0xFF));
+
     return out;
 }
 
@@ -271,6 +350,14 @@ bool probe_result_decode(const uint8_t* data, size_t len, ProbeResult& r) {
     }
 
     r.valid = (r.tones_detected >= 3 && r.high_hz > r.low_hz);
+
+    // Capability flags (optional, appended by v2+ peers)
+    if (len >= (size_t)(TOTAL + 2)) {
+        r.capabilities = (uint16_t)data[TOTAL] | ((uint16_t)data[TOTAL + 1] << 8);
+    } else {
+        r.capabilities = 0;  // Old peer without caps
+    }
+
     return true;
 }
 

@@ -239,7 +239,10 @@ void AgwServer::handle_frame(int sock, const AgwHeader& hdr, const std::vector<u
             std::string to = get_call(hdr.call_to);
             printf("[AGW] Connect request: %s -> %s\n", from.c_str(), to.c_str());
             IRIS_LOG("AGW connect: %s -> %s (callback=%d)", from.c_str(), to.c_str(), connect_callback_ ? 1 : 0);
-            connected_client_ = sock;
+            {
+                std::lock_guard<std::mutex> lock(clients_mutex_);
+                connected_client_ = sock;
+            }
             if (connect_callback_) connect_callback_(to);
             break;
         }
@@ -328,9 +331,18 @@ void AgwServer::send_frame(int sock, uint8_t kind, const std::string& from,
     set_call(hdr.call_to, to);
     hdr.data_len = len;
 
-    send((socket_t)sock, (const char*)&hdr, sizeof(hdr), 0);
+    int rc = send((socket_t)sock, (const char*)&hdr, sizeof(hdr), 0);
+    if (rc <= 0) {
+        printf("[AGW] send_frame: header send failed (sock=%d, kind='%c', rc=%d)\n",
+               sock, (char)kind, rc);
+        return;
+    }
     if (data && len > 0) {
-        send((socket_t)sock, (const char*)data, (int)len, 0);
+        rc = send((socket_t)sock, (const char*)data, (int)len, 0);
+        if (rc <= 0) {
+            printf("[AGW] send_frame: data send failed (sock=%d, kind='%c', len=%u, rc=%d)\n",
+                   sock, (char)kind, len, rc);
+        }
     }
 }
 
@@ -348,11 +360,16 @@ void AgwServer::send_to_clients(const uint8_t* frame, size_t len,
     // Route data to the connection-owning client if known, otherwise broadcast
     std::lock_guard<std::mutex> lock(clients_mutex_);
     if (connected_client_ >= 0) {
-        send_frame(connected_client_, 'D', from_call, to_call, frame, (uint32_t)len);
-    } else {
-        for (int s : client_sockets_)
-            send_frame(s, 'D', from_call, to_call, frame, (uint32_t)len);
+        if (std::find(client_sockets_.begin(), client_sockets_.end(), connected_client_) == client_sockets_.end()) {
+            printf("[AGW] send_to_clients: connected_client_ %d is stale, clearing\n", connected_client_);
+            connected_client_ = -1;
+        } else {
+            send_frame(connected_client_, 'D', from_call, to_call, frame, (uint32_t)len);
+            return;
+        }
     }
+    for (int s : client_sockets_)
+        send_frame(s, 'D', from_call, to_call, frame, (uint32_t)len);
 }
 
 void AgwServer::notify_connected(const std::string& from_call, const std::string& to_call) {
@@ -360,13 +377,18 @@ void AgwServer::notify_connected(const std::string& from_call, const std::string
     std::string msg = "*** CONNECTED With Station " + to_call + "\r";
     std::lock_guard<std::mutex> lock(clients_mutex_);
     if (connected_client_ >= 0) {
-        send_frame(connected_client_, 'C', from_call, to_call,
-                   (const uint8_t*)msg.c_str(), (uint32_t)msg.size() + 1);
-    } else {
-        for (int s : client_sockets_)
-            send_frame(s, 'C', from_call, to_call,
+        if (std::find(client_sockets_.begin(), client_sockets_.end(), connected_client_) == client_sockets_.end()) {
+            printf("[AGW] notify_connected: connected_client_ %d is stale, clearing\n", connected_client_);
+            connected_client_ = -1;
+        } else {
+            send_frame(connected_client_, 'C', from_call, to_call,
                        (const uint8_t*)msg.c_str(), (uint32_t)msg.size() + 1);
+            return;
+        }
     }
+    for (int s : client_sockets_)
+        send_frame(s, 'C', from_call, to_call,
+                   (const uint8_t*)msg.c_str(), (uint32_t)msg.size() + 1);
 }
 
 void AgwServer::notify_disconnected(const std::string& from_call, const std::string& to_call) {
@@ -374,14 +396,19 @@ void AgwServer::notify_disconnected(const std::string& from_call, const std::str
     std::string msg = "*** DISCONNECTED From Station " + to_call + "\r";
     std::lock_guard<std::mutex> lock(clients_mutex_);
     if (connected_client_ >= 0) {
-        send_frame(connected_client_, 'd', from_call, to_call,
-                   (const uint8_t*)msg.c_str(), (uint32_t)msg.size() + 1);
-        connected_client_ = -1;
-    } else {
-        for (int s : client_sockets_)
-            send_frame(s, 'd', from_call, to_call,
+        if (std::find(client_sockets_.begin(), client_sockets_.end(), connected_client_) == client_sockets_.end()) {
+            printf("[AGW] notify_disconnected: connected_client_ %d is stale, clearing\n", connected_client_);
+            connected_client_ = -1;
+        } else {
+            send_frame(connected_client_, 'd', from_call, to_call,
                        (const uint8_t*)msg.c_str(), (uint32_t)msg.size() + 1);
+            connected_client_ = -1;
+            return;
+        }
     }
+    for (int s : client_sockets_)
+        send_frame(s, 'd', from_call, to_call,
+                   (const uint8_t*)msg.c_str(), (uint32_t)msg.size() + 1);
 }
 
 int AgwServer::client_count() const {

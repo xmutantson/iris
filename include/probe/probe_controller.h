@@ -25,6 +25,7 @@ public:
 
     void start_initiator(int sample_rate, float capture_seconds = 3.0f);   // Send probe tones + listen
     void start_responder(int sample_rate, float capture_seconds = 3.0f);   // Listen for probe tones
+    void start_standalone(int sample_rate, float capture_seconds = 3.0f);  // TX + self-listen (debug)
 
     // Feed captured RX audio during listening phase
     void feed_rx(const float* audio, int count);
@@ -45,6 +46,9 @@ public:
 
     void reset();
 
+    // Local capability flags to embed in probe result
+    void set_local_caps(uint16_t caps) { local_caps_ = caps; }
+
 private:
     void generate_and_send_probe();
     void analyze_captured();
@@ -54,6 +58,7 @@ private:
     ProbeState state_ = ProbeState::IDLE;
     int sample_rate_ = 48000;
     bool is_initiator_ = false;
+    bool standalone_ = false;   // Debug mode: no peer, finalize after self-analysis
 
     // Capture buffer for listening phase
     std::vector<float> capture_buf_;
@@ -74,6 +79,8 @@ private:
     ProbeResult their_tx_result_;  // What we heard from them
     NegotiatedPassband negotiated_;
     bool has_results_ = false;
+
+    uint16_t local_caps_ = 0;  // Embedded in probe result for peer capability exchange
 };
 
 } // namespace iris

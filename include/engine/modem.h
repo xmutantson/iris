@@ -102,6 +102,10 @@ struct ModemDiag {
     float band_low_hz = 300.0f;
     float band_high_hz = 3500.0f;
     int baud_rate = 2400;
+
+    // Waterfall spectrum range (may differ from operating band)
+    float spectrum_low_hz = 0;
+    float spectrum_high_hz = 4000.0f;
 };
 
 class Modem {
@@ -127,6 +131,9 @@ public:
     void start_calibration();
     bool is_calibrating() const { return state_ == ModemState::CALIBRATING; }
 
+    // Standalone passband probe (debug — TX tones, listen, analyze)
+    void start_probe();
+
     // ARQ session control (native Iris protocol)
     void arq_connect(const std::string& remote_callsign);
     void arq_disconnect();
@@ -141,8 +148,9 @@ public:
     int ax25_pending_frames() const { return ax25_session_.pending_frames(); }
     const std::string& ax25_remote_callsign() const { return ax25_session_.remote_callsign(); }
     void set_kiss_passthrough(bool v) { ax25_session_.set_kiss_passthrough(v); }
+    void set_txdelay_ms(int ms) { ax25_session_.set_txdelay_ms(ms); }
 
-    // Periodic tick for ARQ timeouts (call from main loop ~100ms)
+    // Periodic tick for ARQ timeouts (call from main loop ~50ms)
     void tick();
 
     // PTT control
@@ -191,8 +199,7 @@ private:
     void process_calibration_rx(const float* audio, int count);
     void generate_cal_tone(float* audio, int count);
     void send_cal_ui(const char* payload);
-    void send_conn_header_ui(const std::string& dest_call);
-    void send_switch_ui(const std::string& dest_call);
+    void send_probe_start_ui();
     void handle_cal_frame(const uint8_t* info, size_t len);
 
     void ptt_on();
@@ -202,6 +209,10 @@ private:
     void compute_spectrum(const float* audio, int count);
 
     IrisConfig config_;
+    // Original band/PHY from init — restored on disconnect after probe changes
+    float orig_band_low_hz_ = 0;
+    float orig_band_high_hz_ = 0;
+    PhyConfig orig_phy_config_;
     std::atomic<ModemState> state_{ModemState::IDLE};
     bool loopback_mode_ = false;  // Skip TX mute when using internal loopback
 
@@ -210,6 +221,8 @@ private:
     AfskDemodulator afsk_demod_;
     GfskModulator gfsk_mod_;
     GfskDemodulator gfsk_demod_;
+    G3ruhScrambler g3ruh_tx_scrambler_;
+    G3ruhScrambler g3ruh_rx_scrambler_;
     HdlcDecoder hdlc_decoder_;
     Fx25Decoder fx25_decoder_;    // FX.25 decoder (runs in parallel with HDLC)
     NrziDecoder nrzi_decoder_;
@@ -252,7 +265,6 @@ private:
 
     // Passband probe controller
     ProbeController probe_;
-    int probe_fallback_ticks_ = 0;  // Fallback if peer has no probe support
 
     // Simulated bandpass filter (--bandpass, for testing)
     struct Biquad {
@@ -270,19 +282,33 @@ private:
 
     // PTT
     std::unique_ptr<PttController> ptt_;
-    bool ptt_active_ = false;
+    std::atomic<bool> ptt_active_{false};
 
     // TX/RX muting for half-duplex
     std::atomic<bool> rx_muted_{false};
     int rx_mute_holdoff_ = 0;  // Samples to remain muted after TX ends
-    int native_selfhear_guard_ = 0;  // Samples: discard native RX frames (self-hear from pipeline latency)
+    std::atomic<int> native_selfhear_guard_{0};  // Samples: discard native RX frames (self-hear from pipeline latency)
 
     // DCD (Data Carrier Detect) — defer TX while channel is busy
-    static constexpr int DCD_HOLDOFF_TICKS = 5;  // ~50-100ms quiet after carrier drops
-    int dcd_holdoff_ = 0;
+    std::atomic<int> dcd_holdoff_{0};        // samples remaining (0 = expired)
+    int dcd_diag_ticks_ = 0;                 // DCD diagnostic logging counter
 
     // CSMA guard: defer TX after last frame decode to avoid stepping on response
-    int csma_holdoff_ = 0;  // process_tx ticks remaining
+    std::atomic<int> csma_holdoff_{0};       // samples remaining (0 = expired)
+
+    // Auto-DCD: detect inverted-squelch radios where static is louder than signal.
+    // Calibrates baseline noise level and detects polarity automatically.
+    bool dcd_auto_ = false;          // auto-DCD enabled
+    float dcd_baseline_rms_ = 0;     // measured noise floor RMS
+    int dcd_baseline_samples_ = 0;   // samples collected for baseline
+    bool dcd_baseline_done_ = false; // baseline measurement complete
+    bool dcd_inverted_ = false;      // true = inverted squelch (signal < noise)
+
+
+    // p-persistent CSMA (AX.25 2.2 Section 6.4.2)
+    // After DCD clears + holdoff + csma_holdoff, enter slotted access:
+    // each slottime period, generate random 0-255; if < persist then TX, else wait.
+    int csma_slot_timer_ = 0;  // samples remaining in current slot
 
     // TX queue
     std::mutex tx_mutex_;
@@ -296,31 +322,48 @@ private:
     std::function<bool()> tx_drain_done_;     // true when pipeline has flushed past mark
 
     // RX state
-    bool native_mode_ = false;      // RX can decode native frames
-    bool native_tx_ready_ = false;  // TX may use native PHY (delayed after XID)
-    int  native_tx_holdoff_ = 0;    // tick() countdown before native TX allowed
-    bool xid_sent_ = false;
-    bool peer_is_iris_ = false;     // Remote confirmed as Iris via connection header
-    bool ofdm_kiss_ = false;        // OFDM RX enabled (SWITCH complete, native demod active)
-    bool ofdm_kiss_tx_ = false;     // OFDM TX enabled (initiator: SWITCH complete; responder: heard native)
-    bool ofdm_kiss_probing_ = false; // Native probe in progress (suppress data TX)
+    std::atomic<bool> native_mode_{false};      // RX can decode native frames
+    std::atomic<bool> native_tx_ready_{false};  // TX may use native PHY
+    std::atomic<bool> peer_is_iris_{false};     // Remote confirmed as Iris via probe
+    std::atomic<bool> ofdm_kiss_{false};        // OFDM RX enabled (probe complete, native demod active)
+    std::atomic<bool> ofdm_kiss_tx_{false};     // OFDM TX enabled
+    std::atomic<bool> ofdm_kiss_confirmed_{false}; // Heard native frame from peer (bidirectional)
+    std::atomic<bool> ofdm_kiss_probing_{false}; // Probe in progress (suppress data TX)
+
+    // Adaptive batch airtime: grows on successful ACKs, shrinks on REJ/loss.
+    // TCP-style AIMD: additive increase (+1s per RR), multiplicative decrease (halve on REJ).
+    float batch_airtime_s_ = 3.0f;               // Current batch cap (seconds)
+    static constexpr float BATCH_AIRTIME_MIN = 3.0f;
+    static constexpr float BATCH_AIRTIME_MAX = 9.0f;
+
+    // OFDM-KISS transport-layer compression
+    uint16_t ofdm_kiss_peer_caps_ = 0;         // Negotiated caps (intersection of local & peer)
+    Compressor ofdm_kiss_tx_compressor_;
+    Compressor ofdm_kiss_rx_compressor_;
+
+    // OFDM-KISS B2F proxy
+    B2fHandler ofdm_kiss_b2f_;
+    std::vector<uint8_t> b2f_buffer_;           // 2MB buffer for LZHUF accumulation
+    bool b2f_proxy_active_ = false;             // TX intercepting B2F payload
+    bool b2f_proxy_rx_active_ = false;          // RX reassembling B2F payload
+    size_t b2f_rx_expected_ = 0;
+    size_t b2f_rx_received_ = 0;
     int  ofdm_kiss_probe_cd_ = 0;   // Tick countdown before initiator starts probe
     bool ofdm_kiss_probe_done_ = false; // Probe completed, PHY reconfigured
-    bool switch_sent_ = false;      // We sent a SWITCH UI frame
-    bool switch_received_ = false;  // We received a SWITCH UI frame from peer
-    int  switch_fallback_ticks_ = 0; // Timeout: if no SWITCH reply, stay AX.25
-    int  conn_hdr_retries_ = 0;              // Remaining connection header UI retransmits
-    bool conn_hdr_yield_started_ = false;    // True after first yield (prevents infinite retry reset)
-    std::atomic<int> conn_hdr_retry_cd_{0};  // Tick countdown; atomic — read by audio thread
+    bool probe_manual_ = false;         // Manual probe (button) vs in-session
+    int  disconnect_timeout_ticks_ = 0; // 30s timeout: stop TX if stuck in AWAITING_RELEASE
+    bool probe_start_pending_ = false;  // Deferred PROBE:START (can't send from state callback — tx_mutex_)
+    std::string probe_peer_call_;       // Peer callsign for standalone probe result addressing
     XidCapability local_cap_;
 
-    // Connection header handshake timing
-    int xid_delay_ticks_ = 0;                   // Delay before sending header after CONNECTED
-    std::string xid_peer_call_;                  // Peer callsign for delayed header
-    int xid_fallback_ticks_ = 0;                // Fallback timer if remote not Iris
+    // Probe-before-connect: AX.25 SABM deferred until probe completes
+    std::string pending_connect_call_;   // Remote callsign waiting for probe to finish
+    int probe_connect_timeout_ = 0;     // Ticks before giving up on probe and connecting AFSK
+
+    std::string xid_peer_call_;                  // Peer callsign for probe exchange
 
     // Calibration
-    CalState cal_state_ = CalState::IDLE;
+    std::atomic<CalState> cal_state_{CalState::IDLE};
     float cal_measured_rms_ = 0;
     int cal_tone_samples_ = 0;
     float cal_tone_phase_ = 0;
@@ -335,7 +378,7 @@ private:
     std::atomic<uint64_t> bytes_tx_{0};
     int crypto_state_ = 0;  // 0=off, 1=kx, 2=encrypted, 3=psk_mismatch
     float rx_rms_ = 0;
-    float rx_raw_rms_ = 0;  // Pre-AGC RMS for DCD
+    std::atomic<float> rx_raw_rms_{0};  // Pre-AGC RMS for DCD
     float rx_peak_ = 0;  // Peak sample value (decays over time)
     int rx_diag_counter_ = 0;  // Periodic RX diagnostic counter
 
@@ -344,12 +387,17 @@ private:
     static constexpr size_t RX_OVERLAP_MAX = 48000 * 40;  // 20 seconds of IQ (floats=IQ×2)
     int pending_frame_start_ = -1;   // Cached frame start when waiting for more data
     size_t pending_need_floats_ = 0; // Min buffer size (floats) needed before retry
+    int pending_frame_timeout_ = 0;  // Samples remaining before abandoning pending frame
     bool relisten_pending_ = false;  // Deferred return to LISTENING after failed hail
 
     // Waterfall spectrum
     mutable std::mutex diag_mutex_;
     std::vector<std::complex<float>> last_constellation_;
     std::vector<float> last_spectrum_;
+    float spectrum_low_hz_ = 0;
+    float spectrum_high_hz_ = 4000.0f;
+    std::vector<float> spectrum_buf_;
+    int spectrum_buf_pos_ = 0;
 
     // Callback to deliver received frames
     std::function<void(const uint8_t*, size_t)> rx_callback_;

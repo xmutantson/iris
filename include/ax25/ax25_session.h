@@ -4,7 +4,9 @@
 #include "ax25/ax25_protocol.h"
 #include "common/types.h"
 #include <functional>
+#include <mutex>
 #include <queue>
+#include <random>
 #include <string>
 
 namespace iris {
@@ -38,6 +40,20 @@ public:
     void set_state_callback(StateChangedFunc cb) { state_changed_ = cb; }
     void set_t1_ticks(int ticks) { t1_value_ = ticks; }
 
+    // Update T1 floor based on TNC TXDELAY (accounts for real turnaround time).
+    // T1 >= 2*TXDELAY + 2s processing/frame-time, but never below FRACK default.
+    void set_txdelay_ms(int ms);
+
+    // Update T3 (idle supervision) in ticks
+    void set_t3_ticks(int ticks) { t3_value_ = ticks; }
+
+    // Channel busy feedback (Direwolf pattern): pause T1/T3 while DCD or PTT
+    // is active.  On half-duplex radio, we can't expect an acknowledgment while
+    // the channel is occupied — either by the remote station (DCD) or by our
+    // own transmission (PTT).  Prevents false T1 timeouts and unnecessary
+    // retransmissions.  Call from modem when DCD or PTT state changes.
+    void set_channel_busy(bool busy);
+
     // Initiate outgoing connection (sends SABM)
     void connect(const std::string& remote_call);
 
@@ -54,7 +70,7 @@ public:
     // generating our own frames — the KISS client already has the frame queued).
     void notify_outgoing(const uint8_t* frame, size_t len);
 
-    // Timer tick — call every ~100ms
+    // Timer tick — call every ~50ms
     void tick();
 
     // Reset to disconnected
@@ -71,18 +87,11 @@ public:
     bool is_kiss_passthrough() const { return kiss_passthrough_; }
     int retry_count() const { return retry_count_; }
 
-    // KISS injection: build and queue an I-frame using shadowed sequence numbers.
-    // Bumps kiss_ns_offset_ so subsequent KISS frames get rewritten.
-    // Returns the built frame (caller queues it for TX).
-    std::vector<uint8_t> kiss_inject_iframe(const uint8_t* data, size_t len);
-
-    // Rewrite outgoing KISS I-frame N(S) += kiss_ns_offset_.
-    // Call before transmitting. Also updates shadowed vs_.
-    void kiss_rewrite_outgoing(uint8_t* frame, size_t len);
-
-    // Rewrite incoming I-frame/S-frame N(R) -= kiss_ns_offset_ before
-    // forwarding to KISS client. Returns adjusted frame.
-    void kiss_rewrite_incoming(uint8_t* frame, size_t len);
+    // Flow control: set receiver busy (sends RNR instead of RR to polls).
+    // Use during modem reconfiguration (speed change, probe) to pause
+    // the peer's I-frame transmissions without dropping the connection.
+    void set_own_busy(bool busy);
+    bool own_busy() const { return own_busy_; }
 
 private:
     void set_state(Ax25SessionState s);
@@ -115,13 +124,17 @@ private:
     void check_iframe_queued();
     void check_need_for_response(bool pf);
     void select_t1_value();
+    void update_srt(int rtt);
 
     // AX.25 2.2 system parameters (Section 6)
+    // Tick rate: 50ms (main loop sleeps 50ms, modem.tick() calls ax25_session.tick())
     static constexpr int K = 7;             // Window size (max outstanding I-frames)
-    static constexpr int N2 = 10;           // Max retries
-    static constexpr int T1_TICKS = 50;     // 5.0s ack timeout (at 100ms tick rate)
-    static constexpr int T2_TICKS = 3;      // 0.3s response delay timer
-    static constexpr int T3_TICKS = 300;    // 30s idle supervision
+    static constexpr int N2 = 10;           // Max retries (Direwolf default: 10)
+public:
+    static constexpr int T1_TICKS = 80;     // 4.0s ack timeout (Direwolf FRACK=4)
+private:
+    static constexpr int T2_TICKS = 6;      // 0.3s response delay timer
+    static constexpr int T3_TICKS = 6000;   // 300s idle supervision (Direwolf default: 5 min)
     static constexpr int MAX_INFO = 256;    // Max I-frame info field bytes (N1)
 
     Ax25SessionState state_ = Ax25SessionState::DISCONNECTED;
@@ -141,8 +154,10 @@ private:
     };
     TxIFrame tx_window_[8];
 
-    // Timers (counted in ticks)
-    int t1_value_ = T1_TICKS;  // Configurable T1 value (default 5s)
+    // Timers (counted in ticks, 50ms per tick)
+    int t1_value_ = T1_TICKS;  // Configurable T1 value (default 4s, Direwolf FRACK=4)
+    int t3_value_ = T3_TICKS;  // Configurable T3 value (default 300s)
+    int t1_floor_ = T1_TICKS;  // T1 floor based on TXDELAY (never below FRACK default)
     int t1_ = 0;       // Acknowledgment timer (T1)
     int t2_ = 0;       // Response delay timer (T2)
     int t3_ = 0;       // Idle supervision timer (T3)
@@ -158,13 +173,34 @@ private:
     bool kiss_managed_ = false;          // Session initiated by KISS client (don't generate SABM/DISC retries)
     bool we_initiated_ = false;          // We sent SABM (true) vs received SABM (false)
     bool kiss_passthrough_ = false;      // KISS client active — don't accept incoming connections
-    int kiss_ns_offset_ = 0;             // Sequence offset for injected frames (mod 8)
-    uint8_t kiss_inject_ns_ = 0;         // N(S) used for injected frame
-    bool kiss_inject_acked_ = false;     // Remote has acked past our injection point
+    // Channel busy: pause T1/T3 while DCD or PTT active (Direwolf pattern).
+    // Remaining ticks saved on pause, restored on resume.
+    bool channel_busy_ = false;
+    int t1_paused_remaining_ = 0;       // T1 ticks remaining when paused (0 = not paused)
+    int t3_paused_remaining_ = 0;       // T3 ticks remaining when paused
+
+    // Adaptive T1 via Smoothed Round-Trip Time (Direwolf ax25_link.c:6304-6397).
+    // Measures actual RTT from SABM→UA and poll→response, then adapts T1.
+    // SRT update: first measurement SRT=RTT, subsequent SRT = 7/8*SRT + 1/8*RTT.
+    // T1 = max(floor, 2*SRT).
+    int wall_ticks_ = 0;                // Always-incrementing tick counter (not paused)
+    int rtt_start_ = 0;                 // wall_ticks_ when measurement started
+    bool measuring_rtt_ = false;        // RTT measurement in progress
+    int srt_ticks_ = 0;                 // Smoothed RTT in ticks (0 = not yet measured)
+
+    // T1 retry jitter: breaks synchronized collisions (both sides retrying at
+    // exact same interval).  0-25% jitter desynchronizes after 1-2 retries.
+    std::minstd_rand rng_{std::random_device{}()};
+    int t1_with_jitter() { return t1_value_ + rng_() % (t1_value_ / 4 + 1); }
 
     // Addresses (built once per connection)
     Ax25Address local_addr_;
     Ax25Address remote_addr_;
+
+    // Thread safety: protects timer state (T1/T3/paused/SRT) from concurrent
+    // access by audio callback thread (set_channel_busy, on_frame_received)
+    // and main loop thread (tick).
+    mutable std::mutex timer_mutex_;
 
     // Callbacks
     SendFrameFunc send_frame_;

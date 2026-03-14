@@ -65,6 +65,11 @@ constexpr uint16_t CAP_B2F_UNROLL  = 0x0020;
 constexpr uint16_t CAP_STREAMING   = 0x0040;  // Streaming compression context
 constexpr uint16_t CAP_PQ_CRYPTO   = 0x0080;  // Post-quantum ML-KEM-768
 
+// OFDM-KISS transport layer markers
+constexpr uint8_t COMPRESSED_PAYLOAD_MAGIC = 0xCC;  // Batch-compressed OFDM-KISS payload
+constexpr uint8_t B2F_DATA_MAGIC = 0xCD;            // B2F proxy data frame
+constexpr size_t  B2F_BUFFER_SIZE = 2 * 1024 * 1024; // 2MB B2F proxy buffer
+
 } // namespace iris
 
 #endif // IRIS_TYPES_H

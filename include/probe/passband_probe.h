@@ -24,7 +24,7 @@ struct PassbandProbeConfig {
     static constexpr float TONE_HIGH_HZ = 4500.0f;
     static constexpr float TONE_SPACING_HZ =
         (TONE_HIGH_HZ - TONE_LOW_HZ) / (N_TONES - 1);  // ~66.7 Hz
-    static constexpr float PROBE_DURATION_S = 0.75f;     // 750ms probe burst
+    static constexpr float PROBE_DURATION_S = 2.25f;     // 2.25s probe burst (3x for better SNR)
     static constexpr float DETECT_THRESHOLD_DB = 10.0f;  // Above noise floor
     static constexpr float EDGE_MARGIN_HZ = 50.0f;       // Safety margin
 };
@@ -35,6 +35,7 @@ struct ProbeResult {
     float high_hz = 0;     // Highest surviving tone frequency
     int tones_detected = 0; // Number of tones above threshold
     bool valid = false;
+    uint16_t capabilities = 0;  // CAP_* flags (appended to wire format, 0 if old peer)
 
     // Per-tone power (dB, N_TONES entries) — for GUI visualization
     float tone_power_db[PassbandProbeConfig::N_TONES] = {};

@@ -153,6 +153,8 @@ IrisConfig load_config(const std::string& path) {
     cfg.rigctld_device = ini.get("Radio", "RigctldDevice", cfg.rigctld_device);
     cfg.serial_port = ini.get("Radio", "SerialPort", cfg.serial_port);
     cfg.serial_baud = ini.get_int("Radio", "SerialBaud", cfg.serial_baud);
+    cfg.serial_ptt_line = ini.get_int("Radio", "SerialPTTLine", cfg.serial_ptt_line);
+    cfg.cm108_gpio = ini.get_int("Radio", "CM108GPIO", cfg.cm108_gpio);
     cfg.ptt_pre_delay_ms = ini.get_int("Radio", "TXDelay", cfg.ptt_pre_delay_ms);
     cfg.ptt_post_delay_ms = ini.get_int("Radio", "TXTail", cfg.ptt_post_delay_ms);
     cfg.slottime_ms = ini.get_int("Radio", "SlotTime", cfg.slottime_ms);
@@ -172,7 +174,8 @@ IrisConfig load_config(const std::string& path) {
 
     cfg.b2f_unroll = ini.get_bool("Modem", "B2FUnroll", cfg.b2f_unroll);
     cfg.native_hail = ini.get_bool("Modem", "NativeHail", cfg.native_hail);
-    cfg.fx25_mode = ini.get_int("Modem", "FX25Mode", cfg.fx25_mode);
+    if (!stale.count("Modem.FX25Mode"))
+        cfg.fx25_mode = ini.get_int("Modem", "FX25Mode", cfg.fx25_mode);
     cfg.preemph_alpha = ini.get_float("Modem", "PreemphAlpha", cfg.preemph_alpha);
 
     cfg.calibrated_tx_level = ini.get_float("Calibration", "TxLevel", cfg.calibrated_tx_level);
@@ -181,6 +184,11 @@ IrisConfig load_config(const std::string& path) {
 
     if (!stale.count("Modem.DcdThreshold"))
         cfg.dcd_threshold = ini.get_float("Modem", "DcdThreshold", cfg.dcd_threshold);
+    cfg.dcd_holdoff_ms = ini.get_int("Modem", "DcdHoldoffMs", cfg.dcd_holdoff_ms);
+    cfg.dcd_auto = ini.get_bool("Modem", "DcdAuto", cfg.dcd_auto);
+
+    cfg.sim_bandpass_low = ini.get_float("Test", "SimBandpassLow", cfg.sim_bandpass_low);
+    cfg.sim_bandpass_high = ini.get_float("Test", "SimBandpassHigh", cfg.sim_bandpass_high);
 
     cfg.show_constellation = ini.get_bool("GUI", "ShowConstellation", cfg.show_constellation);
     cfg.show_waterfall = ini.get_bool("GUI", "ShowWaterfall", cfg.show_waterfall);
@@ -212,6 +220,8 @@ bool save_config(const std::string& path, const IrisConfig& cfg) {
     ini.set("Radio", "RigctldDevice", cfg.rigctld_device);
     ini.set("Radio", "SerialPort", cfg.serial_port);
     ini.set_int("Radio", "SerialBaud", cfg.serial_baud);
+    ini.set_int("Radio", "SerialPTTLine", cfg.serial_ptt_line);
+    ini.set_int("Radio", "CM108GPIO", cfg.cm108_gpio);
     ini.set_int("Radio", "TXDelay", cfg.ptt_pre_delay_ms);
     ini.set_int("Radio", "TXTail", cfg.ptt_post_delay_ms);
     ini.set_int("Radio", "SlotTime", cfg.slottime_ms);
@@ -237,6 +247,11 @@ bool save_config(const std::string& path, const IrisConfig& cfg) {
     ini.set_bool("Logging", "LogEnabled", cfg.log_enabled);
 
     ini.set_float("Modem", "DcdThreshold", cfg.dcd_threshold);
+    ini.set_int("Modem", "DcdHoldoffMs", cfg.dcd_holdoff_ms);
+    ini.set_bool("Modem", "DcdAuto", cfg.dcd_auto);
+
+    ini.set_float("Test", "SimBandpassLow", cfg.sim_bandpass_low);
+    ini.set_float("Test", "SimBandpassHigh", cfg.sim_bandpass_high);
 
     ini.set_bool("GUI", "ShowConstellation", cfg.show_constellation);
     ini.set_bool("GUI", "ShowWaterfall", cfg.show_waterfall);

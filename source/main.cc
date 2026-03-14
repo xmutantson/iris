@@ -391,11 +391,12 @@ int main(int argc, char** argv) {
     kiss.set_client_callback([&modem](int count) {
         modem.set_kiss_passthrough(count > 0);
     });
-    kiss.set_param_callback([&config](uint8_t cmd, uint8_t value) {
+    kiss.set_param_callback([&config, &modem](uint8_t cmd, uint8_t value) {
         switch (cmd) {
             case KISS_CMD_TXDELAY:
                 config.ptt_pre_delay_ms = value * 10;
                 printf("[KISS] TXDELAY = %d ms\n", config.ptt_pre_delay_ms);
+                modem.set_txdelay_ms(config.ptt_pre_delay_ms);
                 break;
             case KISS_CMD_P:
                 config.persist = value;
@@ -425,7 +426,17 @@ int main(int argc, char** argv) {
     agw.set_tx_callback([&modem](const uint8_t* frame, size_t len) {
         modem.queue_tx_frame(frame, len);
     });
-    agw.set_connect_callback([&modem, &config](const std::string& remote) {
+    agw.set_connect_callback([&modem, &agw, &config](const std::string& remote) {
+        // Guard: if session already active, re-send CONNECTED notification
+        // instead of nuking the existing connection.  Winlink Express sometimes
+        // retries AGW 'C' before processing the CONNECTED notification, which
+        // would destroy the session and create an infinite SABM loop.
+        if (modem.ax25_state() != Ax25SessionState::DISCONNECTED) {
+            IRIS_LOG("AGW connect to %s — session already active, re-notifying",
+                     remote.c_str());
+            agw.notify_connected(config.callsign, remote);
+            return;
+        }
         // Always start with AX.25 SABM (works with any TNC).
         // If native_hail is enabled and AFSK fails after a few retries,
         // the modem escalates to native BPSK hailing automatically.
@@ -572,6 +583,7 @@ int main(int argc, char** argv) {
                 gui.log("ARQ disconnect requested");
             },
             [&]() { modem.start_calibration(); gui.log("Calibration started"); },
+            [&]() { modem.start_probe(); gui.log("Standalone probe started"); },
             [&](const IrisConfig& new_cfg) {
                 config = new_cfg;
                 save_config(config_path, config);

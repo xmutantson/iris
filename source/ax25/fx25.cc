@@ -665,6 +665,11 @@ bool Fx25Decoder::push_bit(int bit) {
                 k_data_radio_ = tag->k_data_radio - tag->nroots;
                 nroots_ = tag->nroots;
                 coffs_ = tag->k_data_rs;  // = 255 - nroots
+                // Bounds check: reject corrupted tag that would overflow block_[]
+                if (k_data_radio_ <= 0 || k_data_radio_ > FX25_BLOCK_SIZE ||
+                    coffs_ + nroots_ > FX25_BLOCK_SIZE) {
+                    break;
+                }
                 imask_ = 0x01;
                 dlen_ = 0;
                 clen_ = 0;
@@ -676,6 +681,7 @@ bool Fx25Decoder::push_bit(int bit) {
         break;
 
     case FX_DATA:
+        if (dlen_ >= FX25_BLOCK_SIZE) { state_ = FX_TAG; accum_ = 0; break; }
         if (bit) block_[dlen_] |= imask_;
         imask_ <<= 1;
         if (imask_ == 0) {
@@ -706,7 +712,8 @@ bool Fx25Decoder::push_bit(int bit) {
                                                        frame_buf, FX25_MAX_DATA);
 
                     // Minimum: 14 (two addresses) + 1 (control) + 2 (FCS) = 17
-                    if (frame_len >= 17) {
+                    // Also validate frame_len fits in buffer
+                    if (frame_len >= 17 && frame_len <= FX25_MAX_DATA) {
                         // Verify FCS
                         uint16_t rx_fcs = frame_buf[frame_len - 2] |
                                           (frame_buf[frame_len - 1] << 8);

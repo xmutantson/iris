@@ -6,6 +6,7 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <random>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -107,6 +108,11 @@ bool Modem::init(const IrisConfig& config) {
 
     phy_config_.modulation = Modulation::BPSK;
 
+    // Save original band/PHY for restore on disconnect after probe changes
+    orig_band_low_hz_ = config_.band_low_hz;
+    orig_band_high_hz_ = config_.band_high_hz;
+    orig_phy_config_ = phy_config_;
+
     native_mod_ = std::make_unique<NativeModulator>(phy_config_, config_.sample_rate);
     native_demod_ = std::make_unique<NativeDemodulator>(phy_config_, config_.sample_rate);
 
@@ -143,21 +149,18 @@ bool Modem::init(const IrisConfig& config) {
     };
     probe_.on_send_msg = [this](const uint8_t* data, size_t len) {
         std::lock_guard<std::mutex> lock(tx_mutex_);
-        if (ofdm_kiss_probing_) {
-            // OFDM-KISS: wrap probe result in AX.25 UI frame, send via AFSK.
-            // AFSK has TX priority (ax25_tx_queue_ checked before tx_queue_)
-            // and avoids queuing behind slow native data I-frames.
-            auto frame = ax25_build_u(
-                ax25_make_addr(ax25_session_.remote_callsign()),
-                ax25_make_addr(config_.callsign),
-                AX25_CTRL_UI, false, true);
-            frame.push_back(AX25_PID_NONE);
-            frame.insert(frame.end(), data, data + len);
-            ax25_tx_queue_.push(std::move(frame));
-        } else {
-            // Normal ARQ probe: send raw via forced AX.25 queue (AFSK)
-            ax25_tx_queue_.push(std::vector<uint8_t>(data, data + len));
-        }
+        // Wrap probe result in AX.25 UI frame, send via AFSK.
+        // Use session peer if available, else probe_peer_call_, else broadcast.
+        std::string dest = ax25_session_.remote_callsign();
+        if (dest.empty()) dest = probe_peer_call_;
+        if (dest.empty()) dest = "PROBE";
+        auto frame = ax25_build_u(
+            ax25_make_addr(dest),
+            ax25_make_addr(config_.callsign),
+            AX25_CTRL_UI, false, true);
+        frame.push_back(AX25_PID_NONE);
+        frame.insert(frame.end(), data, data + len);
+        ax25_tx_queue_.push(std::move(frame));
     };
 
     // Initialize simulated bandpass filter if configured
@@ -205,6 +208,7 @@ bool Modem::init(const IrisConfig& config) {
     // Wire ARQ session
     arq_.set_callsign(config_.callsign);
     arq_.set_local_capabilities(local_cap_.capabilities);
+    probe_.set_local_caps(local_cap_.capabilities);
     ArqCallbacks arq_cb;
     arq_cb.send_frame = [this](const uint8_t* data, size_t len) {
         // ARQ frames go directly to TX queue (not back through ARQ)
@@ -297,13 +301,11 @@ bool Modem::init(const IrisConfig& config) {
                 b2f_handler_.unroll_enabled = true;
             }
 
-            // Native hail: both sides are proven Iris-capable, skip XID
-            // and go straight to native mode.
+            // Native hail: both sides are proven Iris-capable, go native.
             if (config_.native_hail && !native_mode_) {
                 native_mode_ = true;
                 native_tx_ready_ = true;
-                xid_sent_ = true;  // Suppress XID handshake
-                IRIS_LOG("Native hail: skipping XID, native mode active");
+                IRIS_LOG("Native hail: native mode active");
                 // Cancel AX.25 session if it was still retrying SABM
                 if (ax25_session_.state() == Ax25SessionState::AWAITING_CONNECTION) {
                     ax25_session_.reset();
@@ -323,9 +325,9 @@ bool Modem::init(const IrisConfig& config) {
             if (config_.native_hail && !relisten_pending_) {
                 native_mode_ = false;
                 native_tx_ready_ = false;
-                xid_sent_ = false;
                 rx_overlap_buf_.clear();
                 pending_frame_start_ = -1;
+                pending_frame_timeout_ = 0;
                 // Defer return to LISTENING (can't call listen() from
                 // inside the state callback — would cause recursion).
                 relisten_pending_ = true;
@@ -338,8 +340,9 @@ bool Modem::init(const IrisConfig& config) {
 
     // Wire AX.25 connected mode session
     ax25_session_.set_local_callsign(config_.callsign);
+    ax25_session_.set_txdelay_ms(config_.ptt_pre_delay_ms);  // Set T1 floor from initial TXDELAY
     ax25_session_.set_send_callback([this](const uint8_t* data, size_t len) {
-        // Route session frames: native (OFDM) if SWITCH complete, else AFSK.
+        // Route session frames: native (OFDM) if upgrade complete, else AFSK.
         // Responder keeps ofdm_kiss_tx_=false until hearing first native frame,
         // so its session frames (RR etc) still go via AFSK during transition.
         // This is safe: the window is short (~1s) and AX.25 retry handles drops.
@@ -351,94 +354,106 @@ bool Modem::init(const IrisConfig& config) {
         }
     });
     ax25_session_.set_data_callback([this](const uint8_t* data, size_t len) {
-        // Check for Iris connection header in I-frame data
-        XidCapability remote_cap;
-        if (!config_.ax25_only && conn_header_decode(data, len, remote_cap)) {
-            IRIS_LOG("Connection header from peer: v%u caps=%04X mod=%u",
-                     remote_cap.version, remote_cap.capabilities, (unsigned)remote_cap.max_modulation);
-            auto agreed = negotiate(local_cap_, remote_cap);
-            if (agreed.capabilities != 0) {
-                int mod_level = std::min((int)agreed.max_modulation,
-                                        (int)config_.max_modulation);
-                phy_config_.modulation = (Modulation)mod_level;
-
-                if (!xid_sent_) {
-                    // Responder: reply with UI frame (no sequence numbers)
-                    std::string dest = ax25_session_.remote_callsign().empty()
-                        ? xid_peer_call_ : ax25_session_.remote_callsign();
-                    send_conn_header_ui(dest);
-                    xid_sent_ = true;
-                    IRIS_LOG("Connection header reply sent (responder, UI) to %s", dest.c_str());
-                } else {
-                    conn_hdr_retries_ = 0;
-                    conn_hdr_retry_cd_ = 0;  // Stop yielding
-                    IRIS_LOG("Connection header I-frame handshake complete (initiator)");
-                }
-                peer_is_iris_ = true;
-                // Don't activate ofdm_kiss_ — wait for SWITCH exchange (Phase 2)
-                if (ax25_session_.we_initiated() && !switch_sent_) {
-                    std::string dest = ax25_session_.remote_callsign().empty()
-                        ? xid_peer_call_ : ax25_session_.remote_callsign();
-                    send_switch_ui(dest);
-                    switch_sent_ = true;
-                    switch_fallback_ticks_ = 100;  // 10s total, retry at 5s
-                    IRIS_LOG("SWITCH sent (initiator, I-frame path)");
-                }
-            }
-            return;  // Don't forward header to KISS/AGW
-        }
-
-        // Normal I-frame data — deliver to KISS/AGW
         if (rx_callback_) rx_callback_(data, len);
     });
     ax25_session_.set_state_callback([this](Ax25SessionState state, const std::string& remote) {
         IRIS_LOG("AX25 state -> %d (remote=%s)", (int)state, remote.c_str());
 
-        // Connection header: only the INITIATOR (sent SABM) sends the header.
-        // The responder only replies after receiving the initiator's header.
-        // This prevents synchronized collisions on half-duplex.
-        // Queue immediately on CONNECTED — before AX.25 data starts flowing.
-        // Use a 1-tick delay so the header drains from ax25_tx_queue_ before
-        // the yield gate blocks all TX.
+        // Probe-after-connect: let SABM/UA complete first so Winlink is happy,
+        // then probe while holding I-frames. Only the connection initiator
+        // starts the probe; the responder waits for PROBE:START.
         if (state == Ax25SessionState::CONNECTED &&
             ax25_session_.we_initiated() &&
-            !config_.ax25_only && !native_mode_ && !xid_sent_) {
+            !config_.ax25_only && !ofdm_kiss_probing_ &&
+            ofdm_kiss_probe_cd_ == 0 && !ofdm_kiss_probe_done_) {
+            // Defer PROBE:START — this callback may fire from queue_tx_frame()
+            // which holds tx_mutex_. send_probe_start_ui() also needs tx_mutex_.
+            // Set flag and let tick() send it (outside the mutex).
             xid_peer_call_ = remote;
-            send_conn_header_ui(remote);
-            xid_sent_ = true;
-            xid_delay_ticks_ = 15;         // ~1.5s: header TX (880ms) + PTT release + settle
-            xid_fallback_ticks_ = 100;      // 10s total before giving up
-            IRIS_LOG("Connection header queued for %s (initiator)",
-                     remote.c_str());
+            probe_start_pending_ = true;
+            ofdm_kiss_probe_cd_ = 60;  // 3s countdown before tones
+            probe_connect_timeout_ = 700;  // 35s overall timeout (15s initiator + 12s responder captures)
+            IRIS_LOG("Probe-after-connect: probing %s, I-frames held until done", remote.c_str());
+            if (gui_log_) gui_log_("Probing " + remote + "...");
         }
 
-        // Reset XID state on disconnect so next connection can re-negotiate
+        // AWAITING_RELEASE (DISCONNECTING): immediately fall back to AX.25.
+        // Disable native/OFDM-KISS so DISC/UA exchange uses AFSK only.
+        // Start 30s timeout — if stuck, stop TX'ing entirely.
+        if (state == Ax25SessionState::AWAITING_RELEASE) {
+            IRIS_LOG("DISCONNECTING: falling back to AX.25 immediately");
+            ofdm_kiss_ = false;
+            ofdm_kiss_tx_ = false;
+            ofdm_kiss_confirmed_ = false;
+            ofdm_kiss_probing_ = false;
+            ofdm_kiss_probe_cd_ = 0;
+            probe_start_pending_ = false;
+            native_mode_ = false;
+            native_tx_ready_ = false;
+            disconnect_timeout_ticks_ = 600;  // 30s at 50ms/tick
+        }
+
         if (state == Ax25SessionState::DISCONNECTED) {
-            xid_sent_ = false;
-            xid_fallback_ticks_ = 0;
-            xid_delay_ticks_ = 0;
-            if (ofdm_kiss_ || ofdm_kiss_tx_) {
+            disconnect_timeout_ticks_ = 0;
+            pending_connect_call_.clear();
+            probe_connect_timeout_ = 0;
+            if (ofdm_kiss_ || ofdm_kiss_tx_ || ofdm_kiss_probe_done_) {
                 IRIS_LOG("KISS-over-OFDM disabled (AX.25 disconnected)");
                 ofdm_kiss_ = false;
                 ofdm_kiss_tx_ = false;
+                ofdm_kiss_confirmed_ = false;
                 ofdm_kiss_probing_ = false;
                 ofdm_kiss_probe_cd_ = 0;
                 ofdm_kiss_probe_done_ = false;
+                probe_manual_ = false;
+                probe_start_pending_ = false;
                 probe_.reset();
+                batch_airtime_s_ = BATCH_AIRTIME_MIN;
+                // Clean up OFDM-KISS compression and B2F proxy
+                if (ofdm_kiss_peer_caps_ & CAP_COMPRESSION) {
+                    ofdm_kiss_tx_compressor_.deinit();
+                    ofdm_kiss_rx_compressor_.deinit();
+                }
+                if (ofdm_kiss_peer_caps_ & CAP_B2F_UNROLL) {
+                    ofdm_kiss_b2f_.deinit();
+                    b2f_buffer_.clear();
+                    b2f_buffer_.shrink_to_fit();
+                }
+                ofdm_kiss_peer_caps_ = 0;
+                b2f_proxy_active_ = false;
+                b2f_proxy_rx_active_ = false;
             }
+
+            // Restore original band/baud/center if probe changed them
+            if (config_.band_low_hz != orig_band_low_hz_ ||
+                config_.band_high_hz != orig_band_high_hz_ ||
+                phy_config_.baud_rate != orig_phy_config_.baud_rate) {
+                IRIS_LOG("Restoring original PHY: band %.0f-%.0f Hz, baud %d (was %.0f-%.0f Hz, baud %d)",
+                         orig_band_low_hz_, orig_band_high_hz_, orig_phy_config_.baud_rate,
+                         config_.band_low_hz, config_.band_high_hz, phy_config_.baud_rate);
+                config_.band_low_hz = orig_band_low_hz_;
+                config_.band_high_hz = orig_band_high_hz_;
+                phy_config_ = orig_phy_config_;
+                if (use_upconvert_) {
+                    float center = (orig_band_low_hz_ + orig_band_high_hz_) / 2.0f;
+                    upconverter_ = Upconverter(center, config_.sample_rate);
+                    downconverter_ = Downconverter(center, config_.sample_rate);
+                }
+                native_mod_ = std::make_unique<NativeModulator>(phy_config_, config_.sample_rate);
+                native_demod_ = std::make_unique<NativeDemodulator>(phy_config_, config_.sample_rate);
+            }
+
             peer_is_iris_ = false;
-            switch_sent_ = false;
-            switch_received_ = false;
-            switch_fallback_ticks_ = 0;
-            conn_hdr_retries_ = 0;
-            conn_hdr_retry_cd_ = 0;
-            conn_hdr_yield_started_ = false;
             native_mode_ = false;
+            dcd_inverted_ = false;  // re-detect each connection
             native_tx_ready_ = false;
+            native_selfhear_guard_ = 0;  // Don't discard frames from next connection
             rx_overlap_buf_.clear();
             pending_frame_start_ = -1;
+            pending_frame_timeout_ = 0;
         }
 
+        // Forward all state changes immediately to the GUI/AGW layer.
         if (ax25_state_callback_)
             ax25_state_callback_(state, remote);
     });
@@ -466,6 +481,9 @@ void Modem::ptt_on() {
         ptt_->set_ptt(true);
         ptt_active_ = true;
         rx_muted_ = true;
+        // Pause AX.25 timers while we're transmitting (Direwolf pattern).
+        // We can't expect an ACK while PTT is keyed.
+        ax25_session_.set_channel_busy(true);
     }
 }
 
@@ -476,6 +494,22 @@ void Modem::ptt_off() {
         rx_mute_holdoff_ = RX_MUTE_HOLDOFF_SAMPLES;
         rx_raw_rms_ = 0;   // Clear stale DCD reading from our own TX
         dcd_holdoff_ = 0;
+
+        // Role-asymmetric post-TX listen window.
+        // After transmitting, yield to the peer's response.  Initiator yields
+        // longer so the responder can ACK/respond first.  Random jitter
+        // desynchronizes after any collision.
+        if (!loopback_mode_ && ax25_session_.is_active()) {
+            static thread_local std::minstd_rand rng(std::random_device{}());
+            int jitter = rng() % (config_.sample_rate / 2);  // 0-500ms random
+            int base = ax25_session_.we_initiated()
+                ? config_.sample_rate * 3 / 2      // initiator: 1.5s base (yield to response)
+                : config_.sample_rate;             // responder: 1.0s base (respond sooner)
+            csma_holdoff_ = std::max(csma_holdoff_.load(), base + jitter);
+        }
+
+        // Resume AX.25 timers now that channel is free
+        ax25_session_.set_channel_busy(false);
     }
 }
 
@@ -497,13 +531,6 @@ void Modem::process_rx(const float* rx_audio, int frame_count) {
         rx_raw_rms_ = std::sqrt(raw_sq / std::max(frame_count, 1));
     }
 
-    // Feed probe analyzer before TX early-return — the probe needs continuous
-    // audio capture on shared audio buses (VB-Cable, real radio).
-    // On half-duplex FM the capture device hears the remote station even during
-    // our TX (the radio squelch opens on their signal, not ours).
-    if (ofdm_kiss_probing_ && probe_.state() == ProbeState::LISTENING_PROBE)
-        probe_.feed_rx(rx_audio, frame_count);
-
     // In loopback mode, skip TX mute — the delay buffer handles timing
     if (!loopback_mode_) {
         if (state_ == ModemState::TX_AX25 || state_ == ModemState::TX_NATIVE)
@@ -518,12 +545,31 @@ void Modem::process_rx(const float* rx_audio, int frame_count) {
             rx_muted_ = false;
             rx_overlap_buf_.clear();
             pending_frame_start_ = -1;
+            pending_frame_timeout_ = 0;
         }
     }
 
     // Count down self-hear guard (continues even during mute)
     if (native_selfhear_guard_ > 0)
         native_selfhear_guard_ -= frame_count;
+
+    // Feed probe analyzer after mute guard — never capture our own TX.
+    if (ofdm_kiss_probing_ && probe_.state() == ProbeState::LISTENING_PROBE && !ptt_active_)
+        probe_.feed_rx(rx_audio, frame_count);
+
+    // Auto-DCD baseline calibration: measure noise floor for 2 seconds at startup.
+    // Once baseline is known, detect inverted squelch (signal < noise).
+    if (config_.dcd_auto && !dcd_baseline_done_ && !ptt_active_ && !rx_muted_) {
+        dcd_baseline_samples_ += frame_count;
+        // Exponential moving average of RMS
+        float alpha = (dcd_baseline_rms_ == 0) ? 1.0f : 0.1f;
+        dcd_baseline_rms_ = dcd_baseline_rms_ * (1.0f - alpha) + rx_raw_rms_ * alpha;
+        if (dcd_baseline_samples_ >= config_.sample_rate * 2) {  // 2 seconds
+            dcd_baseline_done_ = true;
+            IRIS_LOG("Auto-DCD: baseline RMS=%.4f (measured over 2s)", dcd_baseline_rms_);
+            if (gui_log_) gui_log_("Auto-DCD: baseline " + std::to_string(dcd_baseline_rms_));
+        }
+    }
 
     std::vector<float> audio(rx_audio, rx_audio + frame_count);
     // AGC for AX.25 mode only — native mode has preamble-based gain estimation
@@ -552,7 +598,8 @@ void Modem::process_rx(const float* rx_audio, int frame_count) {
                  rx_rms_, rx_overlap_buf_.size(), best, native_mode_ ? 1 : 0);
     }
 
-    compute_spectrum(audio.data(), frame_count);
+    if (!ptt_active_)
+        compute_spectrum(audio.data(), frame_count);
 
     if (state_ == ModemState::CALIBRATING) {
         process_calibration_rx(audio.data(), frame_count);
@@ -564,21 +611,12 @@ void Modem::process_rx(const float* rx_audio, int frame_count) {
     } else {
         process_rx_ax25(audio.data(), frame_count);
 
-        // KISS-over-OFDM: run native demod only after SWITCH handshake completes.
-        // Before SWITCH, both sides use AFSK exclusively. After SWITCH, native
-        // demod is the primary decoder (AFSK stays active for protocol frames).
-        if (ofdm_kiss_) {
+        // Always run native demod alongside AFSK — it's lightweight (just
+        // preamble correlation until a frame arrives) and lets us detect native
+        // frames at any point without waiting for the handshake to complete.
+        // Self-hear is handled by native_selfhear_guard_.
+        if (!config_.ax25_only && native_demod_) {
             process_rx_native(audio.data(), frame_count);
-            // Probe feed is handled earlier (before TX early-return) for continuous capture.
-        }
-        // Native hail: also run native demod during LISTENING/HAILING
-        // so we can detect native-mode HAIL frames from peers with native_hail enabled.
-        else if (config_.native_hail && !config_.ax25_only) {
-            auto arq_st = arq_.state();
-            if (arq_st == ArqState::LISTENING || arq_st == ArqState::HAILING ||
-                arq_st == ArqState::CONNECTING) {
-                process_rx_native(audio.data(), frame_count);
-            }
         }
     }
 }
@@ -602,10 +640,12 @@ void Modem::dispatch_rx_frame(const std::vector<uint8_t>& frame, bool from_fx25,
     last_rx_frame_ = frame;
     dedup_cooldown_ = config_.sample_rate * 3 / 2;  // 1.5s dedup window (FX.25 with heavy RS can arrive ~1s after HDLC)
 
-    // When OFDM-KISS is active, suppress AFSK-decoded session frames.
-    // Only OFDM-decoded frames should feed the AX.25 session and KISS client.
-    // Allow UI frames through from AFSK for connection header exchange.
-    if (ofdm_kiss_ && !from_ofdm) {
+    // When OFDM-KISS is fully bidirectional, suppress AFSK-decoded session
+    // frames — only OFDM-decoded frames should feed the AX.25 session.
+    // CRITICAL: require ofdm_kiss_confirmed_ (we've heard a native frame from the peer).
+    // Without this, the initiator goes deaf to the responder's AFSK frames
+    // before the responder has activated native TX.
+    if (ofdm_kiss_ && ofdm_kiss_confirmed_ && !from_ofdm) {
         // Check if it's a UI frame — those still need AFSK path for conn header
         bool is_ui = (frame.size() > 15 &&
                       (frame[14] & ~AX25_PF_MASK) == AX25_CTRL_UI);
@@ -615,12 +655,37 @@ void Modem::dispatch_rx_frame(const std::vector<uint8_t>& frame, bool from_fx25,
         }
     }
 
-    // CSMA: brief holdoff after frame decode to avoid stepping on a burst.
-    // Only set once per burst — don't stack on every frame in a batch.
-    if (csma_holdoff_ <= 0)
-        csma_holdoff_ = 25;  // ~250ms at 10ms tick rate
+    // CSMA: holdoff after frame decode to avoid stepping on a burst.
+    // Role-asymmetric: responder ACKs quickly, initiator yields longer.
+    // Creates ~800ms exclusive window where only the responder can TX,
+    // eliminating the post-decode race where both holdoffs expire together.
+    // Resets on each frame, so holdoff extends past the LAST frame in a burst.
+    {
+        int rx_holdoff;
+        if (ax25_session_.is_active()) {
+            rx_holdoff = ax25_session_.we_initiated()
+                ? config_.sample_rate * 6 / 5   // initiator: 1200ms (yield to response)
+                : config_.sample_rate * 2 / 5;  // responder: 400ms (ACK quickly)
+        } else {
+            rx_holdoff = config_.sample_rate * 4 / 5;  // no session: 800ms
+        }
+        csma_holdoff_ = std::max(csma_holdoff_.load(), rx_holdoff);
+    }
 
     frames_rx_++;
+
+    // Auto-DCD inverted squelch detection: when we successfully decode a frame,
+    // check if the current RMS is significantly below the baseline noise floor.
+    // If so, the radio has inverted squelch (signal present = less noise).
+    // Runs for ALL frame types (AFSK and native) so we detect before native upgrade.
+    if (config_.dcd_auto && dcd_baseline_done_ && !dcd_inverted_ && rx_raw_rms_ > 0) {
+        if (rx_raw_rms_ < dcd_baseline_rms_ * 0.5f) {
+            dcd_inverted_ = true;
+            IRIS_LOG("Auto-DCD: inverted squelch detected (signal RMS=%.4f < baseline=%.4f)",
+                     rx_raw_rms_.load(), dcd_baseline_rms_);
+            if (gui_log_) gui_log_("Auto-DCD: inverted squelch detected");
+        }
+    }
 
     // Log to packet viewer
     if (packet_log_ && frame.size() >= 14) {
@@ -643,6 +708,27 @@ void Modem::dispatch_rx_frame(const std::vector<uint8_t>& frame, bool from_fx25,
         }
     }
 
+    // Adaptive batch airtime: sniff S-frames before session consumes them.
+    // RR = peer ACK'd our batch → grow.  REJ = peer lost a frame → shrink.
+    if (ofdm_kiss_ && frame.size() > 14) {
+        uint8_t ctrl = frame[14];
+        if ((ctrl & 0x03) == 0x01) {  // S-frame
+            auto stype = (Ax25SType)((ctrl >> 2) & 0x03);
+            if (stype == Ax25SType::RR) {
+                float prev = batch_airtime_s_;
+                batch_airtime_s_ = std::min(batch_airtime_s_ + 1.0f, BATCH_AIRTIME_MAX);
+                if (batch_airtime_s_ != prev)
+                    IRIS_LOG("Batch airtime: %.0fs -> %.0fs (RR ACK)", prev, batch_airtime_s_);
+            } else if (stype == Ax25SType::REJ || stype == Ax25SType::RNR) {
+                float prev = batch_airtime_s_;
+                batch_airtime_s_ = std::max(batch_airtime_s_ / 2.0f, BATCH_AIRTIME_MIN);
+                if (batch_airtime_s_ != prev)
+                    IRIS_LOG("Batch airtime: %.0fs -> %.0fs (%s)", prev, batch_airtime_s_,
+                             stype == Ax25SType::REJ ? "REJ" : "RNR");
+            }
+        }
+    }
+
     // Try AX.25 connected mode session
     {
         bool native_active = (arq_.state() != ArqState::IDLE &&
@@ -656,52 +742,10 @@ void Modem::dispatch_rx_frame(const std::vector<uint8_t>& frame, bool from_fx25,
         }
     }
 
-    // Legacy XID U-frame support (backwards compat with older Iris peers)
-    bool is_xid = false;
-    if (frame.size() >= 24 && frame[15] == IRIS_PID) {
-        std::string src_call;
-        for (int ci = 7; ci < 13 && ci < (int)frame.size(); ci++) {
-            char c = (char)(frame[ci] >> 1);
-            if (c != ' ') src_call += c;
-        }
-        is_xid = true;
-        bool is_self = (src_call == config_.callsign);
-        XidCapability remote_cap;
-        IRIS_LOG("Legacy XID frame from '%s' (self=%d)", src_call.c_str(), is_self ? 1 : 0);
-        if (!is_self && xid_decode(&frame[16], frame.size() - 16, remote_cap)) {
-            if (!config_.ax25_only) {
-                auto agreed = negotiate(local_cap_, remote_cap);
-                if (agreed.capabilities != 0) {
-                    int mod_level = std::min((int)agreed.max_modulation,
-                                            (int)config_.max_modulation);
-                    phy_config_.modulation = (Modulation)mod_level;
-
-                    if (!xid_sent_) {
-                        // Reply with connection header I-frame (not XID)
-                        auto hdr = conn_header_encode(local_cap_);
-                        ax25_session_.send_data(hdr.data(), hdr.size());
-                        xid_sent_ = true;
-                        native_tx_holdoff_ = 10;
-                        IRIS_LOG("Legacy XID received, replying with connection header");
-                    } else {
-                        xid_fallback_ticks_ = 0;
-                        if (config_.mode == "A" || config_.mode == "a") {
-                            probe_.start_initiator(config_.sample_rate);
-                            IRIS_LOG("Legacy XID handshake complete (initiator), starting passband probe");
-                        } else {
-                            IRIS_LOG("Legacy XID handshake complete (initiator), mode %s — skipping probe", config_.mode.c_str());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     // Detect CAL: UI frames (ctrl=0x03, PID at offset 15, info at 16+)
     bool is_cal = false;
-    bool is_conn_hdr = false;
     bool is_probe = false;
-    if (!is_xid && frame.size() > 20) {
+    if (frame.size() > 20) {
         uint8_t ctrl = frame[14] & ~AX25_PF_MASK;
         if (ctrl == AX25_CTRL_UI && frame.size() > 16) {
             const uint8_t* info = frame.data() + 16;
@@ -711,84 +755,36 @@ void Modem::dispatch_rx_frame(const std::vector<uint8_t>& frame, bool from_fx25,
                 handle_cal_frame(info, info_len);
                 is_cal = true;
             }
-            // SWITCH UI frame: Phase 2 of OFDM-KISS upgrade handshake.
-            // Initiator sends SWITCH after IRIS header exchange; responder replies.
-            // Nobody switches to native unless both SWITCH messages are exchanged.
-            bool is_switch = false;
-            // Debug: log all non-CAL UI frames to diagnose SWITCH detection
-            if (!is_cal && info_len >= 1) {
-                IRIS_LOG("UI frame: info[0..5]=%02X %02X %02X %02X %02X %02X len=%zu ax25_only=%d peer_is_iris=%d",
-                         info_len >= 1 ? info[0] : 0, info_len >= 2 ? info[1] : 0,
-                         info_len >= 3 ? info[2] : 0, info_len >= 4 ? info[3] : 0,
-                         info_len >= 5 ? info[4] : 0, info_len >= 6 ? info[5] : 0,
-                         info_len, config_.ax25_only ? 1 : 0, peer_is_iris_ ? 1 : 0);
-            }
-            if (!is_cal && info_len >= 6 && !config_.ax25_only &&
-                info[0] == 'S' && info[1] == 'W' && info[2] == 'I' &&
-                info[3] == 'T' && info[4] == 'C' && info[5] == 'H') {
+            // PROBE:START UI frame — remote wants us to start probe responder.
+            if (!is_cal && info_len >= 11 &&
+                memcmp(info, "PROBE:START", 11) == 0) {
                 std::string ui_src;
                 for (int ci = 7; ci < 13 && ci < (int)frame.size(); ci++) {
                     char c = (char)(frame[ci] >> 1);
                     if (c != ' ') ui_src += c;
                 }
-                bool ui_is_self = (ui_src == config_.callsign);
-
-                if (!ui_is_self && peer_is_iris_) {
-                    switch_received_ = true;
-                    IRIS_LOG("SWITCH received from %s (we_initiated=%d, switch_sent=%d)",
-                             ui_src.c_str(), ax25_session_.we_initiated() ? 1 : 0,
-                             switch_sent_ ? 1 : 0);
-
-                    if (!ax25_session_.we_initiated()) {
-                        // Responder: reply with SWITCH, then activate native RX.
-                        // TX stays off until we hear initiator's first native frame.
-                        if (!switch_sent_) {
-                            send_switch_ui(ui_src);
-                            switch_sent_ = true;
-                        }
-                        ofdm_kiss_ = true;
-                        ax25_session_.set_t1_ticks(300);  // 15s at 50ms tick (native frames take 6s+)
-                        IRIS_LOG("SWITCH complete (responder): native RX active, waiting for native TX from initiator");
-                        if (gui_log_) gui_log_("OFDM-KISS: switched to native RX (responder)");
-                    } else {
-                        // Initiator: both SWITCH messages exchanged — activate native RX + TX.
-                        // Initiator transmits first. Brief holdoff for responder's SWITCH reply to clear.
-                        ofdm_kiss_ = true;
-                        ofdm_kiss_tx_ = true;
-                        switch_fallback_ticks_ = 0;
-                        csma_holdoff_ = std::max(csma_holdoff_, 100);  // ~1s settle
-                        // Native frames are much longer than AFSK — increase T1 to
-                        // prevent premature TIMER_RECOVERY during 6s+ native TX.
-                        ax25_session_.set_t1_ticks(300);  // 15s at 50ms tick (native frames take 6s+)
-                        IRIS_LOG("SWITCH complete (initiator): native RX+TX active");
-                        if (gui_log_) gui_log_("OFDM-KISS: switched to native mode (initiator)");
-
-                        // Probe deferred: wait until we receive a native frame from B
-                        // (confirming bidirectional comms) before starting probe countdown.
-                        // See deliver lambda in process_rx_native.
-
-                        // Proactive native ping: queue an RR so the responder hears
-                        // a native frame immediately and activates its own native TX.
-                        // Without this, responder waits for T3 idle timeout (~17s).
-                        {
-                            std::lock_guard<std::mutex> lock(tx_mutex_);
-                            auto ping = ax25_build_u(
-                                ax25_make_addr(ui_src),
-                                ax25_make_addr(config_.callsign),
-                                AX25_CTRL_UI, false, true);
-                            ping.push_back(AX25_PID_NONE);
-                            tx_queue_.push(std::move(ping));
-                            IRIS_LOG("Native ping queued to %s (responder activation)", ui_src.c_str());
-                        }
-                    }
-                    is_switch = true;
+                if (ui_src != config_.callsign && !ofdm_kiss_probing_ &&
+                    ofdm_kiss_probe_cd_ == 0) {
+                    IRIS_LOG("[PROBE] Received PROBE:START from %s — starting responder",
+                             ui_src.c_str());
+                    if (gui_log_) gui_log_("Probe: " + ui_src + " requested probe");
+                    probe_peer_call_ = ui_src;
+                    // PROBE:START from a peer is always an auto-probe
+                    // (apply PHY + enable native on completion).
+                    // Manual probe is only triggered by the local Probe button.
+                    probe_manual_ = false;
+                    ofdm_kiss_probing_ = true;
+                    ofdm_kiss_probe_done_ = false;
+                    // Start listening immediately — initiator sends tones ~3s
+                    // after PROBE:START.  12s window catches them with margin
+                    // even with probe-after-connect delay.
+                    probe_.start_responder(config_.sample_rate, 12.0f);
                 }
+                is_probe = true;
             }
-
-            // Probe RESULT in UI frame (OFDM-KISS: probe data wrapped in AX.25 UI).
-            // Sent via AFSK for priority (avoids native data queue backlog).
-            if (!is_cal && ofdm_kiss_ && !ofdm_kiss_probe_done_ && info_len >= 1 &&
-                info[0] == PROBE_MSG_RESULT) {
+            // Probe RESULT in UI frame (probe data wrapped in AX.25 UI).
+            if (!is_cal && ofdm_kiss_probing_ && !ofdm_kiss_probe_done_ &&
+                info_len >= 1 && info[0] == PROBE_MSG_RESULT) {
                 std::string ui_src;
                 for (int ci = 7; ci < 13 && ci < (int)frame.size(); ci++) {
                     char c = (char)(frame[ci] >> 1);
@@ -802,65 +798,12 @@ void Modem::dispatch_rx_frame(const std::vector<uint8_t>& frame, bool from_fx25,
                 }
             }
 
-            // Connection header in UI frame: "IRIS/..." (Phase 1 of upgrade)
-            if (!is_cal && !is_switch && info_len >= 5 && !config_.ax25_only) {
-                // Extract source callsign to filter self-heard frames
-                std::string ui_src;
-                for (int ci = 7; ci < 13 && ci < (int)frame.size(); ci++) {
-                    char c = (char)(frame[ci] >> 1);
-                    if (c != ' ') ui_src += c;
-                }
-                bool ui_is_self = (ui_src == config_.callsign);
-
-                XidCapability remote_cap;
-                if (!ui_is_self && conn_header_decode(info, info_len, remote_cap)) {
-                    IRIS_LOG("Connection header UI from %s: v%u caps=%04X mod=%u",
-                             ui_src.c_str(), remote_cap.version, remote_cap.capabilities,
-                             (unsigned)remote_cap.max_modulation);
-                    auto agreed = negotiate(local_cap_, remote_cap);
-                    if (agreed.capabilities != 0) {
-                        int mod_level = std::min((int)agreed.max_modulation,
-                                                (int)config_.max_modulation);
-                        phy_config_.modulation = (Modulation)mod_level;
-
-                        if (!ax25_session_.we_initiated()) {
-                            // Responder: reply with our header.
-                            // Always reply (even if xid_sent_) in case our previous reply was lost.
-                            xid_peer_call_ = ui_src;
-                            send_conn_header_ui(ui_src);
-                            xid_sent_ = true;
-                            IRIS_LOG("Connection header UI reply sent to %s (responder%s)",
-                                     ui_src.c_str(), peer_is_iris_ ? ", re-reply" : "");
-                        } else {
-                            // Initiator: IRIS handshake complete.
-                            // Now send SWITCH to propose native mode upgrade.
-                            xid_fallback_ticks_ = 0;
-                            conn_hdr_retries_ = 0;
-                            conn_hdr_retry_cd_ = 0;
-                            // Brief holdoff to let responder's IRIS reply finish TX
-                            csma_holdoff_ = std::max(csma_holdoff_, 50);  // ~500ms
-                            if (!switch_sent_) {
-                                send_switch_ui(ui_src);
-                                switch_sent_ = true;
-                                switch_fallback_ticks_ = 100;  // 10s total, retry at 5s for SWITCH reply
-                                IRIS_LOG("SWITCH sent to %s (initiator, Phase 2)", ui_src.c_str());
-                            }
-                        }
-
-                        // Mark peer as Iris (Phase 1 complete).
-                        // Don't activate ofdm_kiss_ — wait for SWITCH exchange (Phase 2).
-                        peer_is_iris_ = true;
-                        xid_peer_call_ = ui_src;
-                        IRIS_LOG("Peer %s confirmed as Iris", ui_src.c_str());
-                    }
-                    is_conn_hdr = true;
-                }
-            }
+            // (Connection header removed — probe-first replaces header exchange)
         }
     }
 
     // Legacy probe detection (raw probe messages, non-OFDM-KISS)
-    if (!is_probe && !is_xid && !is_cal && frame.size() >= 2) {
+    if (!is_probe && !is_cal && frame.size() >= 2) {
         uint8_t first = frame[0];
         if (first == PROBE_MSG_RESULT) {
             probe_.on_message(frame.data(), frame.size());
@@ -868,7 +811,7 @@ void Modem::dispatch_rx_frame(const std::vector<uint8_t>& frame, bool from_fx25,
         }
     }
 
-    if (!is_xid && !is_probe && !is_conn_hdr && frame.size() >= 14) {
+    if (!is_probe && frame.size() >= 14) {
         std::string rx_src;
         for (int ci = 7; ci < 13; ci++) {
             char c = (char)(frame[ci] >> 1);
@@ -877,15 +820,19 @@ void Modem::dispatch_rx_frame(const std::vector<uint8_t>& frame, bool from_fx25,
         if (rx_src != config_.callsign) {
             if (gui_log_)
                 gui_log_("[RX] " + describe_ax25(frame.data(), frame.size()));
-            // When AX.25 session is active, don't deliver raw frames to rx_callback_.
-            // The session's data callback already delivers I-frame user data.
-            // Stray frames (UI pings, etc.) must not leak as user data to AGW.
+
+            // When AX.25 session is active (AGW mode), don't deliver raw frames
+            // to rx_callback_ — the session's data callback delivers I-frame data.
+            // BUT when KISS-managed, the KISS client (e.g. Winlink) runs its own
+            // AX.25 state machine and needs ALL frames (UA, RR, I-frames, etc.).
+            // Blocking them causes the KISS client to never see responses, leading
+            // to infinite SABM retries and connection failure.
             auto ax_st = ax25_session_.state();
             bool session_active = (ax_st == Ax25SessionState::CONNECTED ||
                                    ax_st == Ax25SessionState::TIMER_RECOVERY ||
                                    ax_st == Ax25SessionState::AWAITING_CONNECTION ||
                                    ax_st == Ax25SessionState::AWAITING_RELEASE);
-            if (!session_active && rx_callback_)
+            if ((!session_active || ax25_session_.is_kiss_managed()) && rx_callback_)
                 rx_callback_(frame.data(), frame.size());
         }
     }
@@ -901,8 +848,9 @@ void Modem::process_rx_ax25(const float* audio, int count) {
     }
 
     // Feed raw audio to probe controller if it's listening
-    // Legacy probe feed (ARQ native mode only — OFDM-KISS feeds from process_rx)
-    if (!ofdm_kiss_ && probe_.state() == ProbeState::LISTENING_PROBE) {
+    // Legacy probe feed (ARQ native mode only — OFDM-KISS feeds from process_rx
+    // with !ptt_active_ guard to avoid capturing our own TX).
+    if (!ofdm_kiss_ && !ofdm_kiss_probing_ && probe_.state() == ProbeState::LISTENING_PROBE) {
         probe_.feed_rx(audio, count);
     }
 
@@ -913,6 +861,8 @@ void Modem::process_rx_ax25(const float* audio, int count) {
         rx_nrzi = afsk_demod_.demodulate(audio, count);
 
     auto rx_bits = nrzi_decoder_.decode(rx_nrzi);
+    if (config_.ax25_baud == 9600)
+        g3ruh_rx_scrambler_.descramble(rx_bits);
 
     for (uint8_t b : rx_bits) {
         // Feed to standard HDLC decoder (plain AX.25)
@@ -961,11 +911,19 @@ void Modem::process_rx_native(const float* audio, int count) {
 
     // If we have a pending frame waiting for more data, skip detection
     if (pending_frame_start_ >= 0) {
-        if (rx_overlap_buf_.size() < pending_need_floats_) {
+        if (pending_frame_timeout_ <= 0) {
+            // Timeout expired — abandon this frame (sender may have stopped)
+            IRIS_LOG("RX pending frame TIMEOUT at offset %d (needed %zu IQ, have %zu)",
+                     pending_frame_start_, pending_need_floats_ / 2,
+                     rx_overlap_buf_.size() / 2);
+            pending_frame_start_ = -1;
+            pending_frame_timeout_ = 0;
+        } else if (rx_overlap_buf_.size() < pending_need_floats_) {
             return;  // Still not enough data, skip expensive work
+        } else {
+            IRIS_LOG("RX pending retry: buf=%zu floats, need=%zu, start=%d",
+                     rx_overlap_buf_.size(), pending_need_floats_, pending_frame_start_);
         }
-        IRIS_LOG("RX pending retry: buf=%zu floats, need=%zu, start=%d",
-                 rx_overlap_buf_.size(), pending_need_floats_, pending_frame_start_);
     }
 
     int start;
@@ -975,6 +933,7 @@ void Modem::process_rx_native(const float* audio, int count) {
         start = pending_frame_start_;
         det_corr = 0.9f;  // Known good
         pending_frame_start_ = -1;
+        pending_frame_timeout_ = 0;
     } else {
         start = detect_frame_start(rx_overlap_buf_.data(), rx_overlap_buf_.size(),
                                         phy_config_.samples_per_symbol);
@@ -998,7 +957,7 @@ void Modem::process_rx_native(const float* audio, int count) {
             // Self-hear guard: discard frames decoded from our own TX echo
             if (native_selfhear_guard_ > 0) {
                 IRIS_LOG("RX native frame %zu bytes DISCARDED (self-hear guard, %d samples remaining)",
-                         payload.size(), native_selfhear_guard_);
+                         payload.size(), native_selfhear_guard_.load());
                 // Skip past this frame so we don't re-decode it
                 size_t skip = (size_t)(start + 100) * 2;
                 if (skip < rx_overlap_buf_.size())
@@ -1007,6 +966,7 @@ void Modem::process_rx_native(const float* audio, int count) {
                 else
                     rx_overlap_buf_.clear();
                 pending_frame_start_ = -1;
+                pending_frame_timeout_ = 0;
                 return;
             }
             frames_rx_++;
@@ -1043,42 +1003,38 @@ void Modem::process_rx_native(const float* audio, int count) {
                 if (ofdm_kiss_) {
                     // OFDM-KISS: payload is a raw AX.25 frame — dispatch through
                     // normal AX.25 path for session handling + KISS forwarding.
-                    // First native frame received → activate TX (responder) or
-                    // start probe countdown (initiator, now that bidir is confirmed).
+                    if (!ofdm_kiss_confirmed_) {
+                        ofdm_kiss_confirmed_ = true;
+                        IRIS_LOG("OFDM-KISS: native confirmed (heard native from peer)");
+                        if (gui_log_) gui_log_("OFDM-KISS: bidirectional confirmed");
+                    }
                     if (!ofdm_kiss_tx_) {
+                        // Responder: heard first native frame from initiator → promote TX
                         ofdm_kiss_tx_ = true;
-                        IRIS_LOG("OFDM-KISS TX enabled (responder heard first native frame)");
+                        IRIS_LOG("OFDM-KISS: TX promoted to native (responder)");
                         if (gui_log_) gui_log_("OFDM-KISS: native TX active (responder)");
-
-                        // Proactive ping: tell the initiator we're alive so it can
-                        // start its probe countdown immediately (not wait for T1 timer).
+                        // Migrate accumulated I-frames from AFSK to native queue
                         {
                             std::lock_guard<std::mutex> lock(tx_mutex_);
-                            auto ping = ax25_build_u(
-                                ax25_make_addr(ax25_session_.remote_callsign()),
-                                ax25_make_addr(config_.callsign),
-                                AX25_CTRL_UI, false, true);
-                            ping.push_back(AX25_PID_NONE);
-                            tx_queue_.push(std::move(ping));
-                            IRIS_LOG("Native ping queued (responder → initiator activation)");
+                            int migrated = 0;
+                            std::queue<std::vector<uint8_t>> keep;
+                            while (!ax25_tx_queue_.empty()) {
+                                auto fr = std::move(ax25_tx_queue_.front());
+                                ax25_tx_queue_.pop();
+                                bool is_iframe = fr.size() > 14 && (fr[14] & 0x01) == 0;
+                                if (is_iframe) {
+                                    tx_queue_.push(std::move(fr));
+                                    migrated++;
+                                } else {
+                                    keep.push(std::move(fr));
+                                }
+                            }
+                            ax25_tx_queue_ = std::move(keep);
+                            if (migrated > 0)
+                                IRIS_LOG("OFDM-KISS: migrated %d I-frames to native (responder)", migrated);
                         }
-
-                        // Start probe capture after a countdown — the initiator needs
-                        // to receive our ping, confirm bidir, and send tones (~3-5s).
-                        // Countdown 40 ticks (2s) then start 8s capture window.
-                        if (!ofdm_kiss_probe_done_) {
-                            ofdm_kiss_probe_cd_ = 40;
-                            IRIS_LOG("OFDM-KISS probe: responder countdown started (2s then 8s capture)");
-                        }
-                    } else if (!ofdm_kiss_probing_ && !ofdm_kiss_probe_done_ &&
-                               ofdm_kiss_probe_cd_ == 0 &&
-                               ax25_session_.we_initiated()) {
-                        // Initiator: first native frame from responder confirms bidir.
-                        // Short countdown (1s) then send tones. Responder started capture
-                        // 2s after first-native-heard, so our tones arrive ~1.5s into window.
-                        ofdm_kiss_probe_cd_ = 20;
-                        IRIS_LOG("OFDM-KISS probe: bidir confirmed, initiator countdown started");
                     }
+
                     std::vector<uint8_t> ax25_frame(data, data + len);
                     if (packet_log_ && len >= 14)
                         packet_log_(false, "OFDM-KISS", describe_ax25(data, len));
@@ -1102,6 +1058,28 @@ void Modem::process_rx_native(const float* audio, int count) {
                         rx_callback_(data, len);
                 }
             };
+
+            // OFDM-KISS batch decompression: if peer compressed, decompress first.
+            if (ofdm_kiss_ && payload.size() >= 2 &&
+                payload[0] == COMPRESSED_PAYLOAD_MAGIC &&
+                (ofdm_kiss_peer_caps_ & CAP_COMPRESSION)) {
+                std::vector<uint8_t> decomp_buf(payload.size() * 4 + 4096);
+                int dec_len = ofdm_kiss_rx_compressor_.decompress_block(
+                    payload.data() + 1, (int)(payload.size() - 1),
+                    decomp_buf.data(), (int)decomp_buf.size());
+                if (dec_len > 0) {
+                    IRIS_LOG("OFDM-KISS decompress: %zu -> %d bytes",
+                             payload.size() - 1, dec_len);
+                    payload.assign(decomp_buf.begin(), decomp_buf.begin() + dec_len);
+                } else {
+                    IRIS_LOG("OFDM-KISS: decompression failed (%zu bytes), dropping",
+                             payload.size());
+                    rx_overlap_buf_.clear();
+                    pending_frame_start_ = -1;
+                    pending_frame_timeout_ = 0;
+                    return;
+                }
+            }
 
             if (payload.size() >= 3 && payload[0] == MULTI_PAYLOAD_MAGIC) {
                 // Multi-payload frame: [magic][2-byte LE len][data]...
@@ -1143,7 +1121,10 @@ void Modem::process_rx_native(const float* audio, int count) {
             pending_need_floats_ = need_iq * 2;
             if (pending_need_floats_ > RX_OVERLAP_MAX)
                 pending_need_floats_ = RX_OVERLAP_MAX;
-            IRIS_LOG("RX decode: need more data at offset %d (buf=%zu IQ, need ~%zu)",
+            // Timeout: allow enough time for the full frame to arrive, plus margin.
+            // At SPS=60, 4949 symbols = 6.2s; use 10s to cover largest frames + radio delays.
+            pending_frame_timeout_ = config_.sample_rate * 10;
+            IRIS_LOG("RX decode: need more data at offset %d (buf=%zu IQ, need ~%zu, timeout=10s)",
                      start, rx_overlap_buf_.size() / 2, pending_need_floats_ / 2);
         } else {
             crc_errors_++;
@@ -1213,9 +1194,13 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                 native_selfhear_guard_ = config_.sample_rate * 4 / 5;  // 800ms
                 // Mandatory listen window: after native TX, defer next TX
                 // long enough for the peer to fully transmit its response.
-                // A 15-byte RR frame takes ~2.15s at BPSK r1/2. Wait 2.5s
-                // to cover response + decode + queue + start.
-                csma_holdoff_ = std::max(csma_holdoff_, 250);  // ~2.5s listen
+                // Role-asymmetric: responder responds sooner, initiator yields.
+                {
+                    int native_listen = (ax25_session_.is_active() && ax25_session_.we_initiated())
+                        ? config_.sample_rate * 3      // initiator: 3.0s (yield to response)
+                        : config_.sample_rate * 2;     // responder: 2.0s (respond sooner)
+                    csma_holdoff_ = std::max(csma_holdoff_.load(), native_listen);
+                }
             }
             tx_buffer_.clear();
             tx_pos_ = 0;
@@ -1232,54 +1217,119 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
     }
 
     // DCD (Data Carrier Detect): defer TX while channel is busy.
-    // On half-duplex FM, we must wait for the remote to finish transmitting.
-    // Tone-based DCD: detect AFSK 1200/2200 Hz tones via correlator energy.
-    // This works regardless of whether the radio's audio level goes up or down
-    // with received signal (some radios have inverted squelch audio behavior).
-    // Falls back to energy-based DCD in native OFDM mode.
+    // Tone-based DCD is disabled — on real radios the AFSK correlator can't
+    // distinguish signal (~30) from noise (~22), so any threshold either
+    // never fires or permanently locks TX.  AFSK turn-taking relies on
+    // post-TX holdoff (role-asymmetric) + post-RX burst guard instead.
+    // Energy-based DCD is still used in native/OFDM-KISS mode.
     bool dcd_busy = false;
-    if (!loopback_mode_ && config_.dcd_threshold > 0) {
-        if (!native_mode_ && !ofdm_kiss_) {
-            // AX.25 mode: use AFSK tone correlator energy
-            // Threshold is auto-scaled: dcd_threshold 0.05 maps to tone_energy ~50
-            // (correlator energy scales with signal amplitude² × window²)
-            float tone_thr = config_.dcd_threshold * 1000.0f;
-            dcd_busy = afsk_demod_.tone_energy() > tone_thr;
+    if (!loopback_mode_ && !ofdm_kiss_probing_ &&
+        config_.dcd_threshold > 0 && (native_mode_ || ofdm_kiss_)) {
+        if (dcd_inverted_) {
+            dcd_busy = rx_raw_rms_ < dcd_baseline_rms_ * 0.5f;
         } else {
-            // Native/OFDM mode (including OFDM-KISS): energy-based DCD.
-            // AFSK tone DCD would give false positives on native waveforms.
             dcd_busy = rx_raw_rms_ > config_.dcd_threshold;
         }
     }
     if (dcd_busy) {
-        dcd_holdoff_ = DCD_HOLDOFF_TICKS;  // wait after carrier drops
-        std::memset(tx_audio, 0, frame_count * sizeof(float));
-        return;
+        int holdoff_samples = config_.dcd_holdoff_ms * config_.sample_rate / 1000;
+        dcd_holdoff_ = holdoff_samples;
+        csma_slot_timer_ = 0;  // reset p-persist slot on new carrier
     }
     if (dcd_holdoff_ > 0) {
-        dcd_holdoff_--;
-        std::memset(tx_audio, 0, frame_count * sizeof(float));
-        return;
+        dcd_holdoff_ -= frame_count;
+        if (dcd_holdoff_ < 0) dcd_holdoff_ = 0;
     }
 
     // CSMA guard: wait after last frame decode before starting TX
+    // Counted in samples for deterministic timing regardless of audio buffer size.
     if (csma_holdoff_ > 0) {
-        csma_holdoff_--;
+        csma_holdoff_ -= frame_count;
+        if (csma_holdoff_ < 0) csma_holdoff_ = 0;
+    }
+
+    // Consolidated channel busy: pause AX.25 T1/T3 whenever TX is blocked.
+    // On half-duplex radio we can't expect an acknowledgment while we can't
+    // transmit (Direwolf pattern from ax25_link.c:7035-7084).
+    // Covers: DCD active, DCD holdoff, CSMA holdoff, PTT (in ptt_on/off),
+    // probing, and pending native frame (waiting for more data after preamble).
+    bool native_frame_pending = (pending_frame_start_ >= 0 && pending_frame_timeout_ > 0);
+    bool tx_blocked = dcd_busy || (dcd_holdoff_ > 0) || (csma_holdoff_ > 0)
+                      || ofdm_kiss_probing_ || native_frame_pending;
+    ax25_session_.set_channel_busy(tx_blocked);
+
+    if (dcd_busy || dcd_holdoff_ > 0) {
+        std::memset(tx_audio, 0, frame_count * sizeof(float));
+        return;
+    }
+    if (csma_holdoff_ > 0) {
+        std::memset(tx_audio, 0, frame_count * sizeof(float));
+        return;
+    }
+    // Suppress TX while waiting for a native frame to arrive.
+    // We detected a valid preamble and need more audio data to decode
+    // the full frame.  Keying PTT would destroy the incoming frame on
+    // a half-duplex radio.
+    if (native_frame_pending) {
+        pending_frame_timeout_ -= frame_count;
+        std::memset(tx_audio, 0, frame_count * sizeof(float));
+        return;
+    }
+    // Suppress non-probe TX during probe — stray AFSK/native frames
+    // would key PTT and prevent hearing the peer's tones.  But let pending
+    // probe audio through (it was just queued by start_*() and needs to TX).
+    // Also blocks when probe is DONE but tick() hasn't processed completion:
+    // prevents accumulated I-frames from blasting out as AFSK before native
+    // mode is activated (they'd bury the probe result in a long burst).
+    if (ofdm_kiss_probing_ && probe_.state() != ProbeState::IDLE
+        && probe_audio_pending_.empty()) {
         std::memset(tx_audio, 0, frame_count * sizeof(float));
         return;
     }
 
-    {
-        std::lock_guard<std::mutex> lock(tx_mutex_);
+    // p-persistent CSMA (AX.25 2.2 Section 6.4.2)
+    // Channel is clear (DCD off, holdoffs expired). Use slotted random access
+    // to avoid collisions when both sides detect channel-clear simultaneously.
+    // Each slottime period: if random < persist, transmit; else wait another slot.
+    // Bypass: In a connected AX.25 session (point-to-point), both sides already
+    // alternate TX/RX.  DCD + csma_holdoff_ provide sufficient collision avoidance.
+    // Random CSMA backoff just adds latency and increases T1 timeouts.
+    bool csma_bypass = ax25_session_.is_active();
+    if (config_.persist < 255 && config_.slottime_ms > 0 && !loopback_mode_ && !csma_bypass) {
+        if (csma_slot_timer_ > 0) {
+            csma_slot_timer_ -= frame_count;
+            if (csma_slot_timer_ > 0) {
+                std::memset(tx_audio, 0, frame_count * sizeof(float));
+                return;
+            }
+        }
+        // Slot expired or first entry — roll the dice
+        static thread_local std::minstd_rand csma_rng(std::random_device{}());
+        int r = csma_rng() % 256;
+        if (r >= config_.persist) {
+            // Lost the coin toss — wait another slottime
+            csma_slot_timer_ = config_.slottime_ms * config_.sample_rate / 1000;
+            std::memset(tx_audio, 0, frame_count * sizeof(float));
+            return;
+        }
+        // Won — fall through to transmit. Reset for next time.
+        csma_slot_timer_ = 0;
+    }
 
-        // Drain forced-AX.25 queue first (connection headers, probes),
+    {
+        // try_lock: avoid blocking the real-time audio callback.  If another
+        // thread is pushing a frame (brief), we output silence this round
+        // and encode on the next callback (~5-10ms later).
+        std::unique_lock<std::mutex> lock(tx_mutex_, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            std::memset(tx_audio, 0, frame_count * sizeof(float));
+            return;
+        }
+
+        // Drain forced-AX.25 queue first (probes, etc.),
         // then regular tx_queue_ (native or AX.25 depending on mode).
-        // During connection header yield, suppress ALL TX so the responder
-        // has a clear window to reply.
         bool have_frame = false;
-        if (conn_hdr_retry_cd_ > 0) {
-            // Yielding airtime — suppress everything so responder can reply
-        } else if (!ax25_tx_queue_.empty()) {
+        if (!ax25_tx_queue_.empty()) {
             // Batch all forced-AX.25 frames into one TX burst (same as tx_queue_)
             state_ = ModemState::TX_AX25;
             int preamble_flags = std::max(8, config_.ptt_pre_delay_ms * config_.ax25_baud / 8000);
@@ -1310,6 +1360,8 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
             }
 
             if (!raw_bits.empty()) {
+                if (config_.ax25_baud == 9600)
+                    g3ruh_tx_scrambler_.scramble(raw_bits);
                 auto nrzi_bits = nrzi_encode(raw_bits);
                 if (config_.ax25_baud == 9600)
                     tx_buffer_ = gfsk_mod_.modulate(nrzi_bits);
@@ -1329,13 +1381,13 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
             }
             if ((native_mode_ && native_tx_ready_) || native_hail_active || ofdm_kiss_tx_) {
                 // Batch multiple queued frames into one multi-payload frame.
-                // Limit total payload based on speed level to cap air time at ~3s.
+                // Limit total payload based on speed level to cap air time.
+                // Adaptive: grows from 3s toward 9s on success, halves on REJ.
                 int level = gearshift_.current_level();
                 // PHY bps already accounts for modulation and FEC
                 int phy_bps = net_throughput(level, phy_config_.baud_rate);
-                // 3 seconds of payload at PHY rate, minus overhead
                 size_t max_batch = std::min((size_t)NATIVE_MAX_PAYLOAD,
-                                             (size_t)(phy_bps * 3 / 8));
+                                             (size_t)(phy_bps * batch_airtime_s_ / 8));
                 if (max_batch < 200) max_batch = 200;  // at least one frame
 
                 std::vector<std::vector<uint8_t>> batch;
@@ -1380,6 +1432,26 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                 IRIS_LOG("TX frame %zu bytes (%zu sub-frames, %s)",
                          frame_data.size(), batch.size(),
                          ofdm_kiss_ ? "OFDM-KISS" : "native");
+
+                // OFDM-KISS batch compression: compress the assembled payload.
+                // Prepend COMPRESSED_PAYLOAD_MAGIC so RX knows to decompress.
+                if (ofdm_kiss_tx_ && (ofdm_kiss_peer_caps_ & CAP_COMPRESSION) &&
+                    frame_data.size() > 20) {  // Don't bother compressing tiny frames
+                    std::vector<uint8_t> comp_buf(frame_data.size() + COMPRESS_HEADER_SIZE + 256);
+                    int comp_len = ofdm_kiss_tx_compressor_.compress_block(
+                        frame_data.data(), (int)frame_data.size(),
+                        comp_buf.data(), (int)comp_buf.size());
+                    if (comp_len > 0 && comp_len + 1 < (int)frame_data.size()) {
+                        IRIS_LOG("OFDM-KISS compress: %zu -> %d bytes (%.0f%%)",
+                                 frame_data.size(), comp_len + 1,
+                                 100.0 * (comp_len + 1) / frame_data.size());
+                        frame_data.clear();
+                        frame_data.reserve(1 + comp_len);
+                        frame_data.push_back(COMPRESSED_PAYLOAD_MAGIC);
+                        frame_data.insert(frame_data.end(),
+                                          comp_buf.begin(), comp_buf.begin() + comp_len);
+                    }
+                }
 
                 state_ = ModemState::TX_NATIVE;
                 PhyConfig tx_config = phy_config_;
@@ -1441,6 +1513,8 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                 }
 
                 if (!raw_bits.empty()) {
+                    if (config_.ax25_baud == 9600)
+                        g3ruh_tx_scrambler_.scramble(raw_bits);
                     auto nrzi_bits = nrzi_encode(raw_bits);
                     if (config_.ax25_baud == 9600)
                         tx_buffer_ = gfsk_mod_.modulate(nrzi_bits);
@@ -1459,7 +1533,10 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                               probe_audio_pending_.begin(),
                               probe_audio_pending_.end());
             probe_audio_pending_.clear();
-            if (!have_frame) have_frame = true;
+            if (!have_frame) {
+                have_frame = true;
+                state_ = ModemState::TX_AX25;  // Ensure process_rx skips during probe tone TX
+            }
             IRIS_LOG("TX probe audio appended (%zu total samples)", tx_buffer_.size());
         }
 
@@ -1572,11 +1649,33 @@ void Modem::queue_tx_frame(const uint8_t* frame, size_t len) {
 }
 
 void Modem::ax25_connect(const std::string& remote_callsign) {
+    // Guard: reject if session already active (prevents SABM loop when AGW client
+    // retries connect before processing the CONNECTED notification).
+    if (ax25_session_.is_active()) {
+        IRIS_LOG("AX25 connect to %s REJECTED — session already active (state=%d)",
+                 remote_callsign.c_str(), (int)ax25_session_.state());
+        return;
+    }
+    // Reset state for fresh connection
+    peer_is_iris_ = false;
+    ofdm_kiss_probe_done_ = false;
+
+    // Connect immediately — probe starts after CONNECTED (state callback).
+    // This lets the SABM/UA handshake complete first so Winlink doesn't timeout.
     IRIS_LOG("AX25 connect to %s", remote_callsign.c_str());
     ax25_session_.connect(remote_callsign);
 }
 
 void Modem::ax25_disconnect() {
+    // Cancel probe if in progress
+    if (ofdm_kiss_probing_ || ofdm_kiss_probe_cd_ > 0) {
+        IRIS_LOG("AX25 disconnect: cancelling probe");
+        ofdm_kiss_probing_ = false;
+        ofdm_kiss_probe_cd_ = 0;
+        probe_connect_timeout_ = 0;
+        probe_start_pending_ = false;
+        probe_.reset();
+    }
     IRIS_LOG("AX25 disconnect");
     ax25_session_.disconnect();
 }
@@ -1624,6 +1723,50 @@ void Modem::tick() {
     ax25_session_.tick();
     probe_.tick();
 
+    // Deferred PROBE:START — queued from state callback (can't send there,
+    // callback fires inside tx_mutex_ via queue_tx_frame → notify_outgoing).
+    if (probe_start_pending_) {
+        probe_start_pending_ = false;
+        send_probe_start_ui();
+        send_probe_start_ui();
+    }
+
+    // 30-second disconnect timeout: if stuck in AWAITING_RELEASE, force reset.
+    // Winlink gets upset if we keep TX'ing DISC retries forever.
+    if (disconnect_timeout_ticks_ > 0) {
+        disconnect_timeout_ticks_--;
+        if (disconnect_timeout_ticks_ == 0 &&
+            ax25_session_.state() == Ax25SessionState::AWAITING_RELEASE) {
+            IRIS_LOG("DISCONNECT TIMEOUT: stuck in AWAITING_RELEASE for 30s, forcing reset");
+            if (gui_log_) gui_log_("Disconnect timeout — forcing reset");
+            ax25_session_.reset();  // Force to DISCONNECTED (triggers state callback → PHY restore)
+            ptt_off();
+        }
+    }
+
+    // DCD diagnostics: log state every 5s during active session.
+    dcd_diag_ticks_++;
+    if (ax25_session_.is_active() && dcd_diag_ticks_ >= 100) {  // 100 ticks = 5s
+        dcd_diag_ticks_ = 0;
+        IRIS_LOG("[DCD] rms=%.4f inv=%d dcd_hold=%d csma_hold=%d ptt=%d",
+                 rx_raw_rms_.load(), (int)dcd_inverted_,
+                 dcd_holdoff_.load(), csma_holdoff_.load(), (int)ptt_active_);
+    }
+
+    // Probe timeout: if probe doesn't complete in 25s, give up and stay AFSK.
+    // Connection is already established — just release held I-frames.
+    if (probe_connect_timeout_ > 0) {
+        probe_connect_timeout_--;
+        if (probe_connect_timeout_ == 0) {
+            ofdm_kiss_probing_ = false;
+            ofdm_kiss_probe_cd_ = 0;
+            probe_start_pending_ = false;
+            probe_.reset();
+            IRIS_LOG("Probe timeout: staying AFSK, releasing held I-frames");
+            if (gui_log_) gui_log_("Probe timeout — staying AFSK");
+        }
+    }
+
     // Native hail escalation: after a few AFSK SABM failures, switch to
     // native BPSK hailing. Cancel AFSK retries so native hail gets exclusive
     // TX time — interleaved AFSK+native leaves no RX window for the 717ms
@@ -1642,35 +1785,48 @@ void Modem::tick() {
         ax25_session_.reset();  // Stop AFSK retries
     }
 
-    // Count down native mode holdoff (set after queuing XID reply)
-    // During holdoff, stay in AX.25 mode to decode any remaining AX.25 frames.
-    // When holdoff expires, start passband probe (responder side).
-    if (native_tx_holdoff_ > 0) {
-        native_tx_holdoff_--;
-        if (native_tx_holdoff_ == 0) {
-            if (config_.mode == "A" || config_.mode == "a") {
-                // Don't go native yet — run passband probe first.
-                // In the 3-turn protocol the initiator sends tones immediately
-                // after XID completes. We (responder) start listening now.
-                probe_.start_responder(config_.sample_rate);
-                IRIS_LOG("Native holdoff expired, starting passband probe (responder)");
-                // Fallback: if probe doesn't complete within 10s,
-                // go native anyway (peer may be an older version without probe).
-                probe_fallback_ticks_ = 100;  // 10s at 100ms/tick
+    // Probe countdown (shared by manual and auto-probe initiator).
+    // Responder is started directly by PROBE:START reception, not by countdown.
+    // Resend PROBE:START every ~1s during countdown — the initial pair may be
+    // lost if the responder is TX'ing (half-duplex collision).  Spreading
+    // retransmissions over the 3s window gives 3 chances for delivery.
+    if (ofdm_kiss_probe_cd_ > 0) {
+        if (ofdm_kiss_probe_cd_ % 20 == 0 && !ofdm_kiss_probing_) {
+            send_probe_start_ui();
+            IRIS_LOG("[PROBE] Resending PROBE:START (countdown=%d)", ofdm_kiss_probe_cd_);
+        }
+        ofdm_kiss_probe_cd_--;
+        if (ofdm_kiss_probe_cd_ == 0) {
+            if (probe_manual_) {
+                // Manual probe button: always initiator, generous capture window.
+                probe_.start_initiator(config_.sample_rate, 15.0f);
+                ofdm_kiss_probing_ = true;
+                IRIS_LOG("[PROBE] Manual probe: sending tones now (15s capture)");
             } else {
-                IRIS_LOG("Native holdoff expired, mode %s — skipping probe, going native", config_.mode.c_str());
+                // Auto-probe initiator: 15s capture.  Responder's probe tones
+                // arrive ~10-12s after we start listening (our 2.25s TX +
+                // responder 8-12s capture + analysis + TX).  8s was too short.
+                probe_.start_initiator(config_.sample_rate, 15.0f);
+                ofdm_kiss_probing_ = true;
+                IRIS_LOG("OFDM-KISS probe: initiator sending tones (8s capture)");
             }
         }
     }
 
-    // Probe completion: activate native mode with negotiated band parameters
-    // Skip in OFDM-KISS mode — OFDM-KISS has its own probe completion handler below.
-    // Also skip if OFDM-KISS probe already completed (avoids post-disconnect re-fire).
-    if (probe_.is_done() && !native_mode_ && !ofdm_kiss_ && !ofdm_kiss_probe_done_) {
-        native_mode_ = true;
-        native_tx_ready_ = true;
-        // Apply negotiated passband and baud rate
-        if (probe_.has_results() && probe_.negotiated().valid) {
+    // OFDM-KISS probe completion: apply discovered passband and baud rate.
+    // Both sides run probe_negotiate() on the same two ProbeResults, so the
+    // negotiated band is deterministic — no protocol exchange needed.
+    if (ofdm_kiss_probing_ && probe_.is_done()) {
+        // NOTE: ofdm_kiss_probing_ stays true until the end of this block.
+        // The TX gate in process_tx checks ofdm_kiss_probing_ — keeping it
+        // true prevents process_tx from draining ax25_tx_queue_ as AFSK
+        // before migration moves I-frames to the native tx_queue_.
+        ofdm_kiss_probe_done_ = true;
+        // Clear DCD holdoff accumulated from probe tones so TX resumes immediately
+        dcd_holdoff_ = 0;
+
+        if (probe_.has_results() && probe_.negotiated().valid && !probe_manual_) {
+            // Auto-probe: apply negotiated band + baud rate
             float low = probe_.negotiated().low_hz;
             float high = probe_.negotiated().high_hz;
             float bandwidth = high - low;
@@ -1682,19 +1838,14 @@ void Modem::tick() {
                 upconverter_ = Upconverter(center, config_.sample_rate);
                 downconverter_ = Downconverter(center, config_.sample_rate);
 
-                // Auto-negotiate baud rate: pick highest that fits in passband.
-                // Signal BW = baud * (1 + alpha). Any integer SPS works.
+                // SPS sweep: highest baud rate that fits in discovered passband.
                 // Both sides compute the same answer from the same negotiated band.
-                // Sweep SPS from min (fastest) to max (slowest), pick first that fits.
-                // Regulatory cap: FCC Part 97 limits 2m to 19.6 kilobaud / 20 kHz BW,
-                // 70cm to 56 kilobaud / 100 kHz BW. We cap occupied BW at 20 kHz
-                // to stay safe for VHF use (Mode B/C). Mode A (HF) is well below.
                 constexpr float MAX_OCCUPIED_BW_HZ = 20000.0f;
-                float usable_bw = std::min(bandwidth - 200.0f, MAX_OCCUPIED_BW_HZ);  // 100 Hz margin each edge
-                constexpr int SPS_MIN = 6;    // 8000 baud max
-                constexpr int SPS_MAX = 80;   // 600 baud min (fits in AFSK-width passband)
-                int new_sps = 20;             // default: 2400 baud
-                int new_baud = config_.sample_rate / new_sps;
+                float usable_bw = std::min(bandwidth - 200.0f, MAX_OCCUPIED_BW_HZ);
+                constexpr int SPS_MIN = 6;
+                constexpr int SPS_MAX = 80;
+                int new_sps = -1;
+                int new_baud = 0;
                 for (int sps = SPS_MIN; sps <= SPS_MAX; sps++) {
                     int baud = config_.sample_rate / sps;
                     float sig_bw = baud * (1.0f + phy_config_.rrc_alpha);
@@ -1703,6 +1854,12 @@ void Modem::tick() {
                         new_baud = baud;
                         break;
                     }
+                }
+                if (new_sps < 0) {
+                    IRIS_LOG("WARNING: no valid SPS for usable BW %.0f Hz — keeping default SPS=%d baud=%d",
+                             usable_bw, phy_config_.samples_per_symbol, phy_config_.baud_rate);
+                    new_sps = phy_config_.samples_per_symbol;
+                    new_baud = phy_config_.baud_rate;
                 }
 
                 if (new_baud != phy_config_.baud_rate) {
@@ -1714,112 +1871,107 @@ void Modem::tick() {
                              new_baud, new_sps, new_baud * (1.0f + phy_config_.rrc_alpha));
                 }
             }
-            IRIS_LOG("Probe complete: band %.0f-%.0f Hz (%.0f Hz), center %.0f Hz, baud %d",
+
+            IRIS_LOG("Probe complete: band %.0f-%.0f Hz (%.0f Hz BW), center %.0f Hz, baud %d",
                      low, high, bandwidth, center, phy_config_.baud_rate);
-        }
-        IRIS_LOG("Native mode active (post-probe)");
-    }
-
-    // OFDM-KISS probe countdown (shared by initiator and responder).
-    // Initiator: 20-tick (1s) after bidir confirmed → send tones + 10s capture.
-    // Responder: 40-tick (2s) after first-native-heard → start 8s capture window.
-    if (ofdm_kiss_probe_cd_ > 0) {
-        ofdm_kiss_probe_cd_--;
-        if (ofdm_kiss_probe_cd_ == 0) {
-            ofdm_kiss_probing_ = true;
-            if (ax25_session_.we_initiated()) {
-                probe_.start_initiator(config_.sample_rate, 10.0f);
-                IRIS_LOG("OFDM-KISS probe: initiator sending tones (10s capture for Turn 2)");
-            } else {
-                probe_.start_responder(config_.sample_rate, 8.0f);
-                IRIS_LOG("OFDM-KISS probe: responder capture started (8s window)");
+            if (gui_log_) {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "Probe: %.0f-%.0f Hz (%.0f Hz BW) baud %d",
+                         low, high, bandwidth, phy_config_.baud_rate);
+                gui_log_(buf);
             }
-        }
-    }
 
-    // OFDM-KISS probe completion: log discovered passband.
-    // PHY reconfiguration deferred — both sides must agree on new baud rate
-    // via a protocol exchange before switching. For now, report results only.
-    if (ofdm_kiss_probing_ && probe_.is_done()) {
-        ofdm_kiss_probing_ = false;
-        ofdm_kiss_probe_done_ = true;
-        if (probe_.has_results() && probe_.negotiated().valid) {
+            // Probe confirms peer is Iris — enable native mode
+            peer_is_iris_ = true;
+            ofdm_kiss_ = true;
+            ofdm_kiss_tx_ = true;
+            IRIS_LOG("OFDM-KISS: native mode active (probe-first)");
+            if (gui_log_) gui_log_("OFDM-KISS: native mode active");
+
+            // Negotiate OFDM-KISS capabilities from probe result exchange.
+            // Each side embeds its local caps in the probe result message.
+            // my_tx_result = what THEY reported about OUR probe (contains THEIR caps).
+            // their_tx_result = what WE measured from THEIR probe (contains OUR caps).
+            {
+                uint16_t peer_caps = probe_.my_tx_result().capabilities;
+                ofdm_kiss_peer_caps_ = local_cap_.capabilities & peer_caps;
+                IRIS_LOG("OFDM-KISS caps: local=0x%04X peer=0x%04X negotiated=0x%04X",
+                         local_cap_.capabilities, peer_caps, ofdm_kiss_peer_caps_);
+                if (ofdm_kiss_peer_caps_ & CAP_COMPRESSION) {
+                    ofdm_kiss_tx_compressor_.init();
+                    ofdm_kiss_rx_compressor_.init();
+                    IRIS_LOG("OFDM-KISS: compression enabled (per-block, no streaming)");
+                }
+                if (ofdm_kiss_peer_caps_ & CAP_B2F_UNROLL) {
+                    ofdm_kiss_b2f_.init();
+                    b2f_buffer_.reserve(B2F_BUFFER_SIZE);
+                    IRIS_LOG("OFDM-KISS: B2F unroll/reroll enabled");
+                }
+            }
+
+            // Migrate I-frames from ax25_tx_queue_ (AFSK) to tx_queue_ (native).
+            // During the probe, ofdm_kiss_tx_ was false so the send_frame_
+            // callback routed I-frames to ax25_tx_queue_.  Now that native mode
+            // is active, move them so they go out as native frames — not as a
+            // long AFSK burst that would bury the probe result UI frame.
+            {
+                std::lock_guard<std::mutex> lock(tx_mutex_);
+                int migrated = 0;
+                std::queue<std::vector<uint8_t>> keep;
+                while (!ax25_tx_queue_.empty()) {
+                    auto frame = std::move(ax25_tx_queue_.front());
+                    ax25_tx_queue_.pop();
+                    bool is_iframe = frame.size() > 14 && (frame[14] & 0x01) == 0;
+                    if (is_iframe) {
+                        tx_queue_.push(std::move(frame));
+                        migrated++;
+                    } else {
+                        keep.push(std::move(frame));
+                    }
+                }
+                ax25_tx_queue_ = std::move(keep);
+                if (migrated > 0) {
+                    IRIS_LOG("OFDM-KISS: migrated %d I-frames from AFSK to native queue", migrated);
+                }
+            }
+
+            // Mandatory listen window after probe: don't TX immediately.
+            // The peer may be sending its response (UA, held frames) right now.
+            // Without this, our TX triggers a self-hear guard that discards the
+            // peer's native frame before we can decode it.
+            csma_holdoff_ = config_.sample_rate * 3;  // 3s listen before first TX
+
+            // Connection already established before probe.
+            // Held I-frames release via native after listen window expires.
+            ax25_session_.set_t1_ticks(300);
+            probe_connect_timeout_ = 0;
+            IRIS_LOG("Probe done — releasing held I-frames via native");
+        } else if (probe_.has_results() && probe_.negotiated().valid) {
+            // Manual probe: log only, no PHY change
             float low = probe_.negotiated().low_hz;
             float high = probe_.negotiated().high_hz;
             float bandwidth = high - low;
-            IRIS_LOG("OFDM-KISS probe complete: band %.0f-%.0f Hz (%.0f Hz BW), current baud %d",
-                     low, high, bandwidth, phy_config_.baud_rate);
+            IRIS_LOG("Probe complete (manual): band %.0f-%.0f Hz (%.0f Hz BW), no PHY change",
+                     low, high, bandwidth);
+            if (gui_log_) {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "Probe: %.0f-%.0f Hz (%.0f Hz BW)", low, high, bandwidth);
+                gui_log_(buf);
+            }
         } else {
-            IRIS_LOG("OFDM-KISS probe complete: no valid results, keeping defaults");
+            IRIS_LOG("Probe complete: no valid results — staying AX.25");
+            if (gui_log_) gui_log_("Probe: no valid results");
+            probe_connect_timeout_ = 0;
+            // Connection already established — I-frames release automatically
+            // (ofdm_kiss_probing_ goes false at end of block, TX gate opens)
         }
+        // NOW release the TX gate: ofdm_kiss_probing_=false allows process_tx
+        // to resume.  Migration (if applicable) already moved I-frames to
+        // tx_queue_, so they'll go out as native instead of AFSK.
+        ofdm_kiss_probing_ = false;
+        probe_manual_ = false;
     }
 
-    // Probe fallback: if probe didn't complete (old peer or stuck), go native anyway
-    if (probe_fallback_ticks_ > 0) {
-        probe_fallback_ticks_--;
-        if (probe_fallback_ticks_ == 0 && !native_mode_ && !probe_.is_done()) {
-            native_mode_ = true;
-            native_tx_ready_ = true;
-            IRIS_LOG("Probe fallback: no probe received, native mode active");
-        }
-    }
-
-    // Start yield after connection header has had time to drain from ax25_tx_queue_.
-    // On first call (from CONNECTED), set retry count once. On subsequent calls
-    // (from retry), retries are already decremented — just start the yield.
-    // conn_hdr_yield_started_ prevents resetting retries after they're exhausted.
-    if (xid_delay_ticks_ > 0) {
-        xid_delay_ticks_--;
-        if (xid_delay_ticks_ == 0 && xid_sent_ && !peer_is_iris_) {
-            if (!conn_hdr_yield_started_) {
-                conn_hdr_yield_started_ = true;
-                conn_hdr_retries_ = 2;
-            }
-            if (conn_hdr_retries_ > 0 || !conn_hdr_yield_started_) {
-                conn_hdr_retry_cd_ = 50;    // 5s yield: suppress ALL TX
-                IRIS_LOG("Yield started: suppressing all TX for 5s (%d retries remaining)",
-                         conn_hdr_retries_);
-            }
-        }
-    }
-
-    // Connection header yield + retry (initiator only)
-    // Yield airtime by suppressing ALL TX, giving responder a clear window.
-    // When yield expires, check for reply. If none, retry with another yield.
-    if (conn_hdr_retry_cd_ > 0) {
-        conn_hdr_retry_cd_--;
-        if (conn_hdr_retry_cd_ == 0 && !peer_is_iris_ && conn_hdr_retries_ > 0 &&
-            ax25_session_.is_active()) {
-            // No reply yet — queue retry header, let it drain 1 tick, then yield again
-            send_conn_header_ui(xid_peer_call_);
-            conn_hdr_retries_--;
-            xid_delay_ticks_ = 15;  // ~1.5s: header TX + PTT release + settle
-            IRIS_LOG("Connection header retry to %s (%d remaining)",
-                     xid_peer_call_.c_str(), conn_hdr_retries_);
-        }
-    }
-
-    // SWITCH fallback: peer acknowledged IRIS header but didn't reply to SWITCH.
-    // After 10s total (tick down from 100), give up and stay AX.25.
-    // A retry is sent at the halfway point (50 ticks = 5s).
-    if (switch_fallback_ticks_ > 0 && switch_sent_ && !switch_received_ && !ofdm_kiss_) {
-        switch_fallback_ticks_--;
-        if (switch_fallback_ticks_ == 50 && !xid_peer_call_.empty()) {
-            send_switch_ui(xid_peer_call_);
-            IRIS_LOG("SWITCH retry to %s (5s elapsed)", xid_peer_call_.c_str());
-        }
-        if (switch_fallback_ticks_ == 0) {
-            IRIS_LOG("SWITCH fallback: no reply after 10s, staying AX.25");
-        }
-    }
-
-    // Connection header fallback: peer didn't reply — stay AX.25
-    if (xid_fallback_ticks_ > 0) {
-        xid_fallback_ticks_--;
-        if (xid_fallback_ticks_ == 0 && !native_mode_ && !ofdm_kiss_ && !peer_is_iris_) {
-            IRIS_LOG("Connection header fallback: remote is not Iris, staying AX.25");
-        }
-    }
 }
 
 ModemDiag Modem::get_diagnostics() const {
@@ -1844,13 +1996,11 @@ ModemDiag Modem::get_diagnostics() const {
     diag.ax25_state = ax25_session_.state();
     {
         bool busy = false;
-        if (config_.dcd_threshold > 0) {
-            if (!native_mode_) {
-                float tone_thr = config_.dcd_threshold * 1000.0f;
-                busy = afsk_demod_.tone_energy() > tone_thr;
-            } else {
+        if (!ofdm_kiss_probing_ && config_.dcd_threshold > 0 && (native_mode_ || ofdm_kiss_)) {
+            if (dcd_inverted_)
+                busy = rx_raw_rms_ < dcd_baseline_rms_ * 0.5f;
+            else
                 busy = rx_raw_rms_ > config_.dcd_threshold;
-            }
             busy = busy || (dcd_holdoff_ > 0);
         }
         diag.dcd_busy = busy;
@@ -1886,35 +2036,56 @@ ModemDiag Modem::get_diagnostics() const {
     diag.band_low_hz = config_.band_low_hz;
     diag.band_high_hz = config_.band_high_hz;
     diag.baud_rate = phy_config_.baud_rate;
+    diag.spectrum_low_hz = spectrum_low_hz_;
+    diag.spectrum_high_hz = spectrum_high_hz_;
 
     return diag;
 }
 
 void Modem::compute_spectrum(const float* audio, int count) {
+    // Downsample 48k→8k then FFT. At 8 kHz, NFFT=512 gives:
+    //   15.6 Hz bins, 256 bins covering 0-4 kHz. DFT is 256×512 = 131k ops.
+    constexpr int DS_RATE = 8000;
     constexpr int NFFT = 512;
-    if (count < NFFT) return;
 
-    float bin_hz = (float)config_.sample_rate / NFFT;
-    int k_lo = std::max(1, (int)(config_.band_low_hz / bin_hz));
-    int k_hi = std::min(NFFT / 2, (int)(config_.band_high_hz / bin_hz) + 1);
-    if (k_hi <= k_lo) return;
+    int ratio = config_.sample_rate / DS_RATE;
+    int need = NFFT * ratio;  // 3072 samples at 48k
 
-    std::vector<float> spec(k_hi - k_lo, 0.0f);
-    const float* src = audio + count - NFFT;
-    for (int k = k_lo; k < k_hi; k++) {
+    // Accumulate raw audio
+    if ((int)spectrum_buf_.size() < spectrum_buf_pos_ + count)
+        spectrum_buf_.resize(spectrum_buf_pos_ + count);
+    memcpy(spectrum_buf_.data() + spectrum_buf_pos_, audio, count * sizeof(float));
+    spectrum_buf_pos_ += count;
+
+    if (spectrum_buf_pos_ < need) return;
+
+    // Decimate: pick every Nth sample (radio audio is already bandlimited)
+    float ds[NFFT];
+    const float* src = spectrum_buf_.data() + spectrum_buf_pos_ - need;
+    for (int i = 0; i < NFFT; i++)
+        ds[i] = src[i * ratio];
+
+    spectrum_buf_pos_ = 0;
+
+    // DFT — all 256 positive bins cover 0-4 kHz
+    int n_pos = NFFT / 2;
+    std::vector<float> spec(n_pos, 0.0f);
+    for (int k = 0; k < n_pos; k++) {
         float re = 0, im = 0;
         for (int n = 0; n < NFFT; n++) {
             float w = 0.5f * (1.0f - std::cos(2.0f * (float)M_PI * n / (NFFT - 1)));
             float angle = -2.0f * (float)M_PI * k * n / NFFT;
-            re += src[n] * w * std::cos(angle);
-            im += src[n] * w * std::sin(angle);
+            re += ds[n] * w * std::cos(angle);
+            im += ds[n] * w * std::sin(angle);
         }
         float pwr = (re * re + im * im) / (NFFT * NFFT);
-        spec[k - k_lo] = 10.0f * std::log10(std::max(pwr, 1e-12f));
+        spec[k] = 10.0f * std::log10(std::max(pwr, 1e-12f));
     }
 
     std::lock_guard<std::mutex> lock(diag_mutex_);
     last_spectrum_ = std::move(spec);
+    spectrum_low_hz_ = 0;
+    spectrum_high_hz_ = DS_RATE / 2.0f;
 }
 
 // --- Calibration ---
@@ -1922,32 +2093,6 @@ void Modem::compute_spectrum(const float* audio, int count) {
 //   Initiator: clicks Auto Cal → sends CAL:START UI frame → tone 1s → WAIT_REPORT
 //   Responder: auto-detects CAL:START → measures tone RMS → sends CAL:RMS=X.XXXX
 //   Initiator: receives report → adjusts TX level → DONE
-
-// Send connection header as a UI frame (no sequence numbers, no offsetter needed)
-void Modem::send_conn_header_ui(const std::string& dest_call) {
-    auto src = ax25_make_addr(config_.callsign);
-    auto dst = ax25_make_addr(dest_call);
-    auto frame = ax25_build_u(dst, src, AX25_CTRL_UI, false, true);
-    frame.push_back(AX25_PID_NONE);
-    auto hdr = conn_header_encode(local_cap_);
-    frame.insert(frame.end(), hdr.begin(), hdr.end());
-    IRIS_LOG("Connection header UI to %s (%zu bytes)", dest_call.c_str(), hdr.size());
-    std::lock_guard<std::mutex> lock(tx_mutex_);
-    ax25_tx_queue_.push(std::move(frame));
-}
-
-// Send SWITCH proposal as UI frame (Phase 2 of OFDM-KISS upgrade)
-void Modem::send_switch_ui(const std::string& dest_call) {
-    auto src = ax25_make_addr(config_.callsign);
-    auto dst = ax25_make_addr(dest_call);
-    auto frame = ax25_build_u(dst, src, AX25_CTRL_UI, false, true);
-    frame.push_back(AX25_PID_NONE);
-    const char* payload = "SWITCH\r";
-    frame.insert(frame.end(), (const uint8_t*)payload, (const uint8_t*)payload + 7);
-    IRIS_LOG("SWITCH UI sent to %s", dest_call.c_str());
-    std::lock_guard<std::mutex> lock(tx_mutex_);
-    ax25_tx_queue_.push(std::move(frame));
-}
 
 // Build and queue a UI frame with cal payload (e.g., "CAL:START" or "CAL:RMS=0.1234")
 void Modem::send_cal_ui(const char* payload) {
@@ -2000,6 +2145,34 @@ void Modem::handle_cal_frame(const uint8_t* info, size_t len) {
             state_ = ModemState::IDLE;
         }
     }
+}
+
+void Modem::start_probe() {
+    if (ofdm_kiss_probing_ || ofdm_kiss_probe_cd_ > 0) {
+        IRIS_LOG("[PROBE] Already probing, ignoring request");
+        return;
+    }
+    IRIS_LOG("[PROBE] Manual probe: sending PROBE:START, tones in 3s");
+    if (gui_log_) gui_log_("Probe: signaling remote, tones in 3s...");
+    ofdm_kiss_probe_done_ = false;
+    probe_manual_ = true;
+    // Send PROBE:START twice for reliability on noisy channel
+    send_probe_start_ui();
+    send_probe_start_ui();
+    // Countdown: 60 ticks = 3s at 50ms/tick.  Gives remote time to decode
+    // PROBE:START and start listening before we send tones.
+    ofdm_kiss_probe_cd_ = 60;
+}
+
+void Modem::send_probe_start_ui() {
+    auto src = ax25_make_addr(config_.callsign);
+    auto dst = ax25_make_addr("PROBE");
+    auto frame = ax25_build_u(dst, src, AX25_CTRL_UI, false, true);
+    frame.push_back(AX25_PID_NONE);
+    const char* payload = "PROBE:START";
+    frame.insert(frame.end(), (const uint8_t*)payload, (const uint8_t*)payload + 11);
+    std::lock_guard<std::mutex> lock(tx_mutex_);
+    ax25_tx_queue_.push(std::move(frame));
 }
 
 void Modem::start_calibration() {
@@ -2083,6 +2256,8 @@ void Modem::process_calibration_rx(const float* audio, int count) {
             rx_nrzi = afsk_demod_.demodulate(audio, count);
 
         auto rx_bits = nrzi_decoder_.decode(rx_nrzi);
+        if (config_.ax25_baud == 9600)
+            g3ruh_rx_scrambler_.descramble(rx_bits);
         for (uint8_t b : rx_bits) {
             if (hdlc_decoder_.push_bit(b)) {
                 const auto& frame = hdlc_decoder_.frame();

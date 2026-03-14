@@ -109,4 +109,24 @@ std::vector<uint8_t> GfskDemodulator::demodulate(const float* samples, size_t co
     return bits;
 }
 
+// --- G3RUH Scrambler ---
+
+void G3ruhScrambler::scramble(std::vector<uint8_t>& bits) {
+    for (auto& b : bits) {
+        // Feedback from taps at x^17 (bit 16) and x^12 (bit 11)
+        uint8_t feedback = ((reg_ >> 16) ^ (reg_ >> 11)) & 1;
+        b ^= feedback;
+        reg_ = ((reg_ << 1) | b) & 0x1FFFF;  // shift in scrambled bit, keep 17 bits
+    }
+}
+
+void G3ruhScrambler::descramble(std::vector<uint8_t>& bits) {
+    for (auto& b : bits) {
+        uint8_t feedback = ((reg_ >> 16) ^ (reg_ >> 11)) & 1;
+        uint8_t received = b;
+        b ^= feedback;
+        reg_ = ((reg_ << 1) | received) & 0x1FFFF;  // shift in received (scrambled) bit
+    }
+}
+
 } // namespace iris

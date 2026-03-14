@@ -33,9 +33,11 @@ void Ax25Session::reset_session() {
     last_received_ctrl_ = 0;
     kiss_managed_ = false;
     we_initiated_ = false;
-    kiss_ns_offset_ = 0;
-    kiss_inject_ns_ = 0;
-    kiss_inject_acked_ = false;
+    channel_busy_ = false;
+    t1_paused_remaining_ = 0;
+    t3_paused_remaining_ = 0;
+    measuring_rtt_ = false;
+    // Keep srt_ticks_ across reconnects — measured RTT is still valid for same path
     while (!tx_queue_.empty()) tx_queue_.pop();
     for (int i = 0; i < 8; i++) tx_window_[i] = TxIFrame{};
 }
@@ -107,7 +109,7 @@ void Ax25Session::notify_outgoing(const uint8_t* frame, size_t len) {
             we_initiated_ = false;  // We're the responder
             vs_ = vr_ = va_ = 0;
             t1_ = 0;
-            t3_ = T3_TICKS;
+            t3_ = t3_value_;
             set_state(Ax25SessionState::CONNECTED);
             IRIS_LOG("AX25 KISS UA to %s — tracking as responder", remote_call_.c_str());
         } else if (ut == Ax25UType::DISC &&
@@ -122,10 +124,7 @@ void Ax25Session::notify_outgoing(const uint8_t* frame, size_t len) {
 
     // Shadow V(S): track outgoing I-frames from KISS client
     if (f.type() == Ax25FrameType::I_FRAME && kiss_managed_) {
-        // The KISS client's N(S) doesn't include our injected frames,
-        // so the actual OTA N(S) = KISS N(S) + kiss_ns_offset_
-        uint8_t ns = f.ns();
-        vs_ = ((ns + kiss_ns_offset_) + 1) % 8;
+        vs_ = (f.ns() + 1) % 8;
     }
 }
 
@@ -199,6 +198,9 @@ void Ax25Session::send_sabm() {
     auto frame = ax25_build_u(remote_addr_, local_addr_, AX25_CTRL_SABM, true, true);
     IRIS_LOG("AX25 TX SABM to %s (P=1)", remote_call_.c_str());
     if (send_frame_) send_frame_(frame.data(), frame.size());
+    // Start RTT measurement (SABM → UA)
+    rtt_start_ = wall_ticks_;
+    measuring_rtt_ = true;
 }
 
 void Ax25Session::send_ua(bool pf) {
@@ -226,6 +228,11 @@ void Ax25Session::send_rr(bool pf, bool command) {
              command ? "P" : "F", pf ? 1 : 0,
              command ? "cmd" : "rsp");
     if (send_frame_) send_frame_(frame.data(), frame.size());
+    // Start RTT measurement on poll (P=1 command → expect F=1 response)
+    if (pf && command && !measuring_rtt_) {
+        rtt_start_ = wall_ticks_;
+        measuring_rtt_ = true;
+    }
 }
 
 void Ax25Session::send_rnr(bool pf, bool command) {
@@ -251,6 +258,21 @@ void Ax25Session::send_frmr(uint8_t rejected_ctrl, uint8_t vs, uint8_t vr, bool 
     IRIS_LOG("AX25 TX FRMR ctrl=0x%02X W=%d X=%d Y=%d Z=%d",
              rejected_ctrl, w_bit, x_bit, y_bit, z_bit);
     if (send_frame_) send_frame_(frame.data(), frame.size());
+}
+
+void Ax25Session::set_own_busy(bool busy) {
+    if (own_busy_ == busy) return;
+    own_busy_ = busy;
+    IRIS_LOG("AX25 own_busy=%d", busy ? 1 : 0);
+    // When becoming busy in connected state, send RNR immediately so the peer
+    // stops sending I-frames.  When clearing busy, send RR to resume.
+    if (state_ == Ax25SessionState::CONNECTED ||
+        state_ == Ax25SessionState::TIMER_RECOVERY) {
+        if (busy)
+            send_rnr(false, false);
+        else
+            send_rr(false, false);
+    }
 }
 
 void Ax25Session::send_next_iframe() {
@@ -304,7 +326,7 @@ void Ax25Session::ack_frames(uint8_t nr) {
 
     if (va_ == vs_) {
         t1_ = 0;           // All acknowledged — stop T1
-        t3_ = T3_TICKS;    // Start idle supervision
+        t3_ = t3_value_;    // Start idle supervision
     } else {
         t1_ = t1_value_;    // Restart T1 for remaining frames
     }
@@ -388,7 +410,21 @@ bool Ax25Session::on_frame_received(const Ax25Frame& frame) {
                 if (ut == Ax25UType::UA) {
                     IRIS_LOG("AX25 KISS RX UA from %s -> CONNECTED", frame.src.to_string().c_str());
                     t1_ = 0;
-                    t3_ = T3_TICKS;
+                    if (measuring_rtt_) {
+                        int rtt = wall_ticks_ - rtt_start_;
+                        IRIS_LOG("AX25 RTT measurement: %d ticks (%.1fs) [KISS SABM->UA]", rtt, rtt * 0.05);
+                        update_srt(rtt);
+                    }
+                    t3_ = t3_value_;
+                    vs_ = vr_ = va_ = 0;
+                    set_state(Ax25SessionState::CONNECTED);
+                } else if (ut == Ax25UType::SABM) {
+                    // Simultaneous connect: remote also sent SABM.
+                    // KISS client will generate UA — we just track the state.
+                    IRIS_LOG("AX25 KISS RX SABM from %s [simultaneous connect -> CONNECTED]",
+                             frame.src.to_string().c_str());
+                    t1_ = 0;
+                    t3_ = t3_value_;
                     vs_ = vr_ = va_ = 0;
                     set_state(Ax25SessionState::CONNECTED);
                 } else if (ut == Ax25UType::DM) {
@@ -427,7 +463,7 @@ bool Ax25Session::on_frame_received(const Ax25Frame& frame) {
                 }
             }
             // Reset idle timer on any received frame
-            t3_ = T3_TICKS;
+            t3_ = t3_value_;
         } else if (state_ == Ax25SessionState::AWAITING_RELEASE) {
             if (ft == Ax25FrameType::U_FRAME) {
                 Ax25UType ut = frame.u_type();
@@ -465,7 +501,7 @@ bool Ax25Session::on_frame_received(const Ax25Frame& frame) {
                 local_addr_ = ax25_make_addr(local_call_);
                 remote_addr_ = frame.src;
                 send_ua(frame.poll_final());
-                t3_ = T3_TICKS;
+                t3_ = t3_value_;
                 set_state(Ax25SessionState::CONNECTED);
                 return true;
             }
@@ -524,7 +560,14 @@ bool Ax25Session::on_frame_received(const Ax25Frame& frame) {
                 if (frame.poll_final()) {
                     // Expected UA with F=1
                     t1_ = 0;
-                    t3_ = T3_TICKS;
+                    // Complete RTT measurement (SABM → UA)
+                    if (measuring_rtt_) {
+                        int rtt = wall_ticks_ - rtt_start_;
+                        IRIS_LOG("AX25 RTT measurement: %d ticks (%.1fs) [SABM->UA]",
+                                 rtt, rtt * 0.05);
+                        update_srt(rtt);
+                    }
+                    t3_ = t3_value_;
                     vs_ = vr_ = va_ = 0;
                     clear_exception_conditions();
                     set_state(Ax25SessionState::CONNECTED);
@@ -550,9 +593,17 @@ bool Ax25Session::on_frame_received(const Ax25Frame& frame) {
 
             if (ut == Ax25UType::SABM) {
                 // Both sides sent SABM simultaneously — accept (collision case)
-                IRIS_LOG("AX25 RX SABM from %s [simultaneous connect]",
+                // AX.25 2.2 Section 4.3.4.5: send UA AND transition to CONNECTED.
+                // Without this, both sides stay in AWAITING_CONNECTION and the
+                // UA responses collide on half-duplex radio → infinite SABM loop.
+                IRIS_LOG("AX25 RX SABM from %s [simultaneous connect -> CONNECTED]",
                          frame.src.to_string().c_str());
                 send_ua(frame.poll_final());
+                t1_ = 0;
+                t3_ = t3_value_;
+                vs_ = vr_ = va_ = 0;
+                clear_exception_conditions();
+                set_state(Ax25SessionState::CONNECTED);
                 return true;
             }
 
@@ -640,7 +691,7 @@ bool Ax25Session::on_frame_received(const Ax25Frame& frame) {
             for (int i = 0; i < 8; i++) tx_window_[i] = TxIFrame{};
             vs_ = vr_ = va_ = 0;
             t1_ = 0;
-            t3_ = T3_TICKS;
+            t3_ = t3_value_;
             set_state(Ax25SessionState::CONNECTED);
             return true;
         }
@@ -657,12 +708,13 @@ bool Ax25Session::on_frame_received(const Ax25Frame& frame) {
             return true;
 
         case Ax25UType::UA:
-            // Unsolicited UA — error (AX.25 2.2 Section 4.3.4.5)
-            IRIS_LOG("AX25 RX unsolicited UA in %s -> establish data link",
+            // Unsolicited UA in CONNECTED/TIMER_RECOVERY.
+            // AX.25 2.2 says re-establish, but this creates an infinite SABM loop
+            // during simultaneous connect: both sides go CONNECTED via SABM,
+            // then each receives the other's stale UA → re-establish → loop.
+            // Direwolf and most implementations simply ignore unsolicited UA.
+            IRIS_LOG("AX25 RX unsolicited UA in %s -> ignored (harmless)",
                      in_timer_recovery ? "TIMER_RECOVERY" : "CONNECTED");
-            establish_data_link();
-            clear_exception_conditions();
-            set_state(Ax25SessionState::AWAITING_CONNECTION);
             return true;
 
         case Ax25UType::DM:
@@ -734,7 +786,7 @@ bool Ax25Session::on_frame_received(const Ax25Frame& frame) {
                     // If all acked, back to CONNECTED; else retransmit
                     if (va_ == vs_) {
                         set_state(Ax25SessionState::CONNECTED);
-                        t3_ = T3_TICKS;
+                        t3_ = t3_value_;
                     } else {
                         invoke_retransmission();
                         set_state(Ax25SessionState::CONNECTED);
@@ -779,7 +831,7 @@ bool Ax25Session::on_frame_received(const Ax25Frame& frame) {
                 if (t2_ == 0) t2_ = T2_TICKS;
             }
 
-            t3_ = T3_TICKS;  // Reset idle timer
+            t3_ = t3_value_;  // Reset idle timer
 
             // Try sending our own data (piggyback ack)
             send_next_iframe();
@@ -828,12 +880,17 @@ bool Ax25Session::on_frame_received(const Ax25Frame& frame) {
                 peer_busy_ = false;
                 ack_frames(nr);
                 if (pf) {
-                    // This is the response to our poll
+                    // This is the response to our poll — complete RTT measurement
                     t1_ = 0;
+                    if (measuring_rtt_) {
+                        int rtt = wall_ticks_ - rtt_start_;
+                        IRIS_LOG("AX25 RTT measurement: %d ticks (%.1fs) [poll->RR]", rtt, rtt * 0.05);
+                        update_srt(rtt);
+                    }
                     select_t1_value();
                     if (va_ == vs_) {
                         // All acknowledged — back to CONNECTED
-                        t3_ = T3_TICKS;
+                        t3_ = t3_value_;
                         set_state(Ax25SessionState::CONNECTED);
                     } else {
                         // Outstanding frames — retransmit and return to CONNECTED
@@ -852,10 +909,16 @@ bool Ax25Session::on_frame_received(const Ax25Frame& frame) {
                 ack_frames(nr);
                 if (pf) {
                     t1_ = 0;
+                    if (measuring_rtt_) {
+                        int rtt = wall_ticks_ - rtt_start_;
+                        IRIS_LOG("AX25 RTT measurement: %d ticks (%.1fs) [poll->RNR]", rtt, rtt * 0.05);
+                        update_srt(rtt);
+                    }
                     select_t1_value();
                     // Peer busy — go back to CONNECTED but don't retransmit
-                    t3_ = T3_TICKS;
+                    t3_ = t3_value_;
                     set_state(Ax25SessionState::CONNECTED);
+                    if (va_ != vs_) t1_ = t1_value_;
                 }
                 break;
 
@@ -866,6 +929,11 @@ bool Ax25Session::on_frame_received(const Ax25Frame& frame) {
                 ack_frames(nr);
                 if (pf) {
                     t1_ = 0;
+                    if (measuring_rtt_) {
+                        int rtt = wall_ticks_ - rtt_start_;
+                        IRIS_LOG("AX25 RTT measurement: %d ticks (%.1fs) [poll->REJ]", rtt, rtt * 0.05);
+                        update_srt(rtt);
+                    }
                     select_t1_value();
                     invoke_retransmission();
                     set_state(Ax25SessionState::CONNECTED);
@@ -886,7 +954,7 @@ bool Ax25Session::on_frame_received(const Ax25Frame& frame) {
                 }
                 break;
             }
-            t3_ = T3_TICKS;
+            t3_ = t3_value_;
             return true;
         }
 
@@ -934,7 +1002,7 @@ bool Ax25Session::on_frame_received(const Ax25Frame& frame) {
             retransmit_from(nr);
             break;
         }
-        t3_ = T3_TICKS;
+        t3_ = t3_value_;
         return true;
     }
 
@@ -946,7 +1014,10 @@ bool Ax25Session::on_frame_received(const Ax25Frame& frame) {
 // ---------------------------------------------------------------------------
 
 void Ax25Session::tick() {
+    wall_ticks_++;  // Always increment (not affected by channel_busy pause)
     if (state_ == Ax25SessionState::DISCONNECTED) return;
+
+    std::lock_guard<std::mutex> lock(timer_mutex_);
 
     // T2: response delay timer (triggers delayed ack)
     if (t2_ > 0 && (state_ == Ax25SessionState::CONNECTED ||
@@ -980,45 +1051,46 @@ void Ax25Session::tick() {
                     // KISS client handles SABM retries — just reset T1 and wait.
                     // The KISS client will re-send SABM if needed; each one
                     // resets our retry_count via notify_outgoing().
-                    t1_ = t1_value_;
+                    t1_ = t1_with_jitter();
                     IRIS_LOG("AX25 T1 (KISS-managed) — waiting for KISS client retry (%d/%d)", retry_count_, N2);
                 } else {
                     IRIS_LOG("AX25 T1 retry SABM (%d/%d)", retry_count_, N2);
                     send_sabm();
-                    t1_ = t1_value_;
+                    t1_ = t1_with_jitter();
                 }
             } else if (state_ == Ax25SessionState::AWAITING_RELEASE) {
                 if (kiss_managed_) {
-                    t1_ = t1_value_;
+                    t1_ = t1_with_jitter();
                     IRIS_LOG("AX25 T1 (KISS-managed) — waiting for KISS client DISC retry (%d/%d)", retry_count_, N2);
                 } else {
                     IRIS_LOG("AX25 T1 retry DISC (%d/%d)", retry_count_, N2);
                     send_disc();
-                    t1_ = t1_value_;
+                    t1_ = t1_with_jitter();
                 }
             } else if (state_ == Ax25SessionState::CONNECTED) {
                 if (kiss_managed_) {
                     // KISS client handles its own polling — don't send RR
-                    t1_ = t1_value_;
+                    t1_ = t1_with_jitter();
                     IRIS_LOG("AX25 T1 (KISS-managed) — skipping poll in CONNECTED (%d/%d)", retry_count_, N2);
                 } else {
                     // Enter Timer Recovery (State 4)
                     IRIS_LOG("AX25 T1 timeout -> TIMER_RECOVERY, poll (%d/%d)",
                              retry_count_, N2);
                     send_rr(true, true);  // Command with P=1
-                    t1_ = t1_value_;
+                    t1_ = t1_with_jitter();
+                    t3_ = 0;  // Stop T3 — T1 now supervises the link (AX.25 2.2 §6.4.4)
                     set_state(Ax25SessionState::TIMER_RECOVERY);
                 }
             } else if (state_ == Ax25SessionState::TIMER_RECOVERY) {
                 if (kiss_managed_) {
-                    t1_ = t1_value_;
+                    t1_ = t1_with_jitter();
                     IRIS_LOG("AX25 T1 (KISS-managed) — skipping re-poll in TIMER_RECOVERY (%d/%d)", retry_count_, N2);
                 } else {
                     // Already in timer recovery — re-poll
                     IRIS_LOG("AX25 T1 re-poll in TIMER_RECOVERY (%d/%d)",
                              retry_count_, N2);
                     send_rr(true, true);  // Command with P=1
-                    t1_ = t1_value_;
+                    t1_ = t1_with_jitter();
                 }
             }
         }
@@ -1030,7 +1102,7 @@ void Ax25Session::tick() {
         t3_--;
         if (t3_ == 0) {
             if (kiss_managed_) {
-                t3_ = T3_TICKS;  // Restart, don't send — KISS client handles idle polling
+                t3_ = t3_value_;  // Restart, don't send — KISS client handles idle polling
                 IRIS_LOG("AX25 T3 (KISS-managed) — skipping idle poll");
             } else {
                 IRIS_LOG("AX25 T3 idle timeout, entering timer recovery");
@@ -1043,11 +1115,80 @@ void Ax25Session::tick() {
     }
 }
 
+void Ax25Session::set_txdelay_ms(int ms) {
+    // Compute T1 floor from TXDELAY: round-trip = 2*TXDELAY + 2*frame_time + processing
+    // At 1200 baud, max frame ~256 bytes = ~1.7s TX time.  For T1 floor, assume
+    // short frames (ACK ~100ms) + generous processing margin.
+    // Floor = 2*TXDELAY + 1.5s (frame + turnaround + processing)
+    int floor_ms = 2 * ms + 1500;
+    int floor_ticks = (floor_ms + 49) / 50;  // Round up to 50ms ticks
+    t1_floor_ = std::max(T1_TICKS, floor_ticks);
+    // If current T1 value is below the new floor, raise it
+    if (t1_value_ < t1_floor_)
+        t1_value_ = t1_floor_;
+    IRIS_LOG("AX25 T1 floor adjusted for TXDELAY=%dms: floor=%d ticks (%.1fs), T1=%d ticks (%.1fs)",
+             ms, t1_floor_, t1_floor_ * 0.05, t1_value_, t1_value_ * 0.05);
+}
+
+void Ax25Session::set_channel_busy(bool busy) {
+    std::lock_guard<std::mutex> lock(timer_mutex_);
+    if (busy == channel_busy_) return;
+    channel_busy_ = busy;
+
+    if (busy) {
+        // Channel became busy — pause T1 and T3 by saving remaining ticks
+        if (t1_ > 0) {
+            t1_paused_remaining_ = t1_;
+            t1_ = 0;
+        }
+        if (t3_ > 0) {
+            t3_paused_remaining_ = t3_;
+            t3_ = 0;
+        }
+    } else {
+        // Channel became idle — resume T1 and T3 with saved remaining ticks
+        if (t1_paused_remaining_ > 0) {
+            t1_ = t1_paused_remaining_;
+            t1_paused_remaining_ = 0;
+        }
+        if (t3_paused_remaining_ > 0) {
+            t3_ = t3_paused_remaining_;
+            t3_paused_remaining_ = 0;
+        }
+    }
+}
+
 void Ax25Session::select_t1_value() {
-    // AX.25 2.2 Section 6.3.1: T1 should be adaptive based on RTT.
-    // For simplicity, we use a fixed value. A more sophisticated
-    // implementation could measure actual round-trip times.
-    // (Currently T1_TICKS is the fixed default.)
+    // AX.25 2.2 Section 6.3.1: T1 adaptive based on Smoothed RTT.
+    // Direwolf formula (ax25_link.c:6304-6397):
+    //   First measurement: SRT = RTT
+    //   Subsequent: SRT = 7/8 * SRT + 1/8 * RTT
+    //   T1 = 2 * SRT (generous margin for half-duplex variation)
+    // Floor from TXDELAY ensures T1 is never unreasonably short.
+    if (srt_ticks_ > 0) {
+        int new_t1 = srt_ticks_ * 2;
+        // Clamp to reasonable range: floor to 30s max
+        t1_value_ = std::max(t1_floor_, std::min(new_t1, 600));
+        IRIS_LOG("AX25 adaptive T1: SRT=%d ticks (%.1fs), T1=%d ticks (%.1fs)",
+                 srt_ticks_, srt_ticks_ * 0.05, t1_value_, t1_value_ * 0.05);
+    } else {
+        // No measurement yet — use floor
+        if (t1_value_ < t1_floor_)
+            t1_value_ = t1_floor_;
+    }
+}
+
+void Ax25Session::update_srt(int rtt) {
+    if (rtt <= 0) return;
+    if (srt_ticks_ == 0) {
+        // First measurement
+        srt_ticks_ = rtt;
+    } else {
+        // Exponential smoothing: SRT = 7/8 * SRT + 1/8 * RTT
+        srt_ticks_ = (7 * srt_ticks_ + rtt) / 8;
+    }
+    measuring_rtt_ = false;
+    select_t1_value();
 }
 
 // ---------------------------------------------------------------------------
@@ -1055,70 +1196,4 @@ void Ax25Session::select_t1_value() {
 // ---------------------------------------------------------------------------
 
 // Find control byte offset in raw AX.25 frame (after address field)
-static int find_ctrl_offset(const uint8_t* frame, size_t len) {
-    if (len < 15) return -1;
-    if (frame[13] & 0x01) return 14;  // No digipeaters
-    size_t pos = 14;
-    while (pos + 6 < len) {
-        if (frame[pos + 6] & 0x01) return (int)(pos + 7);
-        pos += 7;
-    }
-    return -1;
-}
-
-std::vector<uint8_t> Ax25Session::kiss_inject_iframe(const uint8_t* data, size_t len) {
-    // Build I-frame with current shadowed vs_/vr_
-    auto frame = ax25_build_i(remote_addr_, local_addr_,
-                              vs_, vr_, false, AX25_PID_NONE,
-                              data, len);
-    IRIS_LOG("AX25 KISS inject I N(S)=%d N(R)=%d (%zu bytes)", vs_, vr_, len);
-    kiss_inject_ns_ = vs_;
-    kiss_inject_acked_ = false;
-    vs_ = (vs_ + 1) % 8;
-    kiss_ns_offset_++;
-    return frame;
-}
-
-void Ax25Session::kiss_rewrite_outgoing(uint8_t* frame, size_t len) {
-    if (kiss_ns_offset_ == 0) return;
-    int co = find_ctrl_offset(frame, len);
-    if (co < 0) return;
-    uint8_t ctrl = frame[co];
-    if (ctrl & 0x01) return;  // Not an I-frame (bit0=0 for I-frames)
-    uint8_t ns = (ctrl >> 1) & 0x07;
-    uint8_t new_ns = (ns + kiss_ns_offset_) % 8;
-    frame[co] = (ctrl & 0xF1) | ((new_ns & 0x07) << 1);
-}
-
-void Ax25Session::kiss_rewrite_incoming(uint8_t* frame, size_t len) {
-    if (kiss_ns_offset_ == 0) return;
-    int co = find_ctrl_offset(frame, len);
-    if (co < 0) return;
-    uint8_t ctrl = frame[co];
-    // I-frames and S-frames both have N(R) in bits 7:5
-    // I-frame: bit0=0. S-frame: bit0=1, bit1=0 (0bXXXXXX01)
-    bool is_i = (ctrl & 0x01) == 0;
-    bool is_s = (ctrl & 0x03) == 0x01;
-    if (!is_i && !is_s) return;
-    uint8_t nr = (ctrl >> 5) & 0x07;
-
-    // Only adjust N(R) once the remote has acked past our injected frame.
-    // Before that, N(R) refers only to KISS client frames — no adjustment needed.
-    if (!kiss_inject_acked_) {
-        // N(R) acks all frames up to N(R)-1.  Our injection was at kiss_inject_ns_.
-        // Check if kiss_inject_ns_ is in the acked range: delta in [1,4] means
-        // nr is past our injection point (forward half of mod-8 circle).
-        int delta = (nr - kiss_inject_ns_ + 8) % 8;
-        if (delta >= 1 && delta <= 4) {
-            kiss_inject_acked_ = true;
-            IRIS_LOG("AX25 KISS inject acked (N(R)=%d, inject_ns=%d)", nr, kiss_inject_ns_);
-        }
-    }
-
-    if (kiss_inject_acked_) {
-        uint8_t new_nr = (nr - kiss_ns_offset_ + 8) % 8;
-        frame[co] = (ctrl & 0x1F) | ((new_nr & 0x07) << 5);
-    }
-}
-
 } // namespace iris

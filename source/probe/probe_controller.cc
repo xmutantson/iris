@@ -11,6 +11,7 @@ void ProbeController::reset() {
     capture_buf_.clear();
     capture_samples_ = 0;
     capture_skip_ = 0;
+    standalone_ = false;
     timeout_ = 0;
     has_results_ = false;
     analysis_done_ = false;
@@ -36,14 +37,15 @@ void ProbeController::start_initiator(int sample_rate, float capture_seconds) {
     capture_max_ = (int)(capture_seconds * sample_rate);
 
     // Turn 1: send probe tones, then start listening for Turn 2.
-    // Skip our own TX duration to avoid self-hearing on shared audio bus.
-    int probe_samples = (int)(PassbandProbeConfig::PROBE_DURATION_S * sample_rate);
+    // No capture_skip_ needed — modem's !ptt_active_ guard already prevents
+    // feeding our own TX into the capture buffer on real radio.  On VB-Cable
+    // loopback there's no PTT guard, but the sliding-window analyzer in
+    // analyze_captured() finds the best offset anyway.
     generate_and_send_probe();
 
     state_ = ProbeState::LISTENING_PROBE;
     capture_buf_.resize(capture_max_, 0.0f);
     capture_samples_ = 0;
-    capture_skip_ = probe_samples + sample_rate / 4;  // probe + 250ms margin
     timeout_ = std::max(TIMEOUT_TICKS, (int)(capture_seconds * 20) + 200);
     IRIS_LOG("[PROBE] Initiator: sent probe, listening for response (%.0fs window)", capture_seconds);
 }
@@ -63,6 +65,26 @@ void ProbeController::start_responder(int sample_rate, float capture_seconds) {
     // for result exchange after analysis.
     timeout_ = std::max(TIMEOUT_TICKS, (int)(capture_seconds * 20) + 200);
     IRIS_LOG("[PROBE] Responder: listening for probe tones (%.0fs window)", capture_seconds);
+}
+
+void ProbeController::start_standalone(int sample_rate, float capture_seconds) {
+    reset();
+    sample_rate_ = sample_rate;
+    is_initiator_ = true;
+    standalone_ = true;
+    capture_max_ = (int)(capture_seconds * sample_rate);
+
+    // Send probe tones, then listen for them through the audio path.
+    int probe_samples = (int)(PassbandProbeConfig::PROBE_DURATION_S * sample_rate);
+    generate_and_send_probe();
+
+    state_ = ProbeState::LISTENING_PROBE;
+    capture_buf_.resize(capture_max_, 0.0f);
+    capture_samples_ = 0;
+    // Skip our own TX audio (probe duration + 250ms PTT release margin)
+    capture_skip_ = probe_samples + sample_rate / 4;
+    timeout_ = (int)(capture_seconds * 20) + 200;
+    IRIS_LOG("[PROBE] Standalone: sent probe, listening for loopback (%.0fs window)", capture_seconds);
 }
 
 void ProbeController::feed_rx(const float* audio, int count) {
@@ -118,7 +140,14 @@ void ProbeController::analyze_captured() {
              their_tx_result_.tones_detected, their_tx_result_.low_hz,
              their_tx_result_.high_hz, their_tx_result_.valid ? 1 : 0);
 
-    if (is_initiator_) {
+    if (standalone_) {
+        // Standalone debug mode: no peer, just show what we captured.
+        // Use the captured result as both sides (self-loopback).
+        my_tx_result_ = their_tx_result_;
+        analysis_done_ = true;
+        got_peer_result_ = true;
+        try_finalize();
+    } else if (is_initiator_) {
         // Initiator: we've analyzed responder's probe from Turn 2.
         // Send our RESULT back (Turn 3). If we already got their RESULT
         // (from the AFSK message in Turn 2), try_finalize completes.
@@ -198,7 +227,9 @@ void ProbeController::generate_and_send_probe() {
 }
 
 void ProbeController::send_result(const ProbeResult& r) {
-    auto encoded = probe_result_encode(r);
+    ProbeResult r_with_caps = r;
+    r_with_caps.capabilities = local_caps_;
+    auto encoded = probe_result_encode(r_with_caps);
     std::vector<uint8_t> msg;
     msg.reserve(1 + encoded.size());
     msg.push_back(PROBE_MSG_RESULT);

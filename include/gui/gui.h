@@ -16,6 +16,7 @@ struct GuiCallbacks {
     std::function<void()> on_connect;
     std::function<void()> on_disconnect;
     std::function<void()> on_calibrate;
+    std::function<void()> on_probe;
     std::function<void(const IrisConfig&)> on_config_changed;
     std::function<void()> on_quit;
 };
