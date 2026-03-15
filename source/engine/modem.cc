@@ -460,7 +460,7 @@ bool Modem::init(const IrisConfig& config) {
             // Set flag and let tick() send it (outside the mutex).
             xid_peer_call_ = remote;
             probe_start_pending_ = true;
-            ofdm_kiss_probe_cd_ = 20;  // 1s countdown before tones
+            ofdm_kiss_probe_cd_ = 60;  // 3s countdown before tones (3 PROBE:START sends)
             probe_connect_timeout_ = 700;  // 35s overall timeout (15s initiator + 12s responder captures)
             IRIS_LOG("Probe-after-connect: probing %s, I-frames held until done", remote.c_str());
             if (gui_log_) gui_log_("Probing " + remote + "...");

@@ -1120,9 +1120,12 @@ void Ax25Session::tick() {
                 }
             } else if (state_ == Ax25SessionState::CONNECTED) {
                 if (kiss_managed_ && !native_active_) {
-                    // Pure KISS passthrough: client handles its own polling
+                    // Pure KISS passthrough: client handles its own polling.
+                    // Don't count towards N2 — the KISS client manages retries;
+                    // T3 idle supervision (5 min) is the safety net for dead links.
+                    retry_count_ = 0;
                     t1_ = t1_with_jitter();
-                    IRIS_LOG("AX25 T1 (KISS-managed) — skipping poll in CONNECTED (%d/%d)", retry_count_, N2);
+                    IRIS_LOG("AX25 T1 (KISS-managed) — skipping poll in CONNECTED");
                 } else {
                     // Enter Timer Recovery: send RR poll to probe the peer.
                     // In OFDM-KISS native mode, we MUST poll — the session layer
