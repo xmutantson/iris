@@ -855,61 +855,97 @@ bool decode_native_frame(const float* iq_samples, size_t count,
         }
     }
 
-    // --- Decision-directed second pass ---
-    // After the first Kalman+RTS pass, demodulate symbols tentatively, then
-    // use ALL symbols (pilots + data) as measurements for a second Kalman+RTS.
-    // This turns ~690 pilot measurements into ~11000, dramatically improving
-    // tracking of non-linear phase paths (S-curves, frequency acceleration).
-    // Only run on long frames where phase drift is a problem.
+    // --- Feedforward phase re-estimation (second pass) ---
+    // Viterbi-Viterbi M-th power for BPSK/QPSK: raises symbols to M-th
+    // power to strip data modulation blindly, then sliding-window averages
+    // to extract carrier phase.  No feedback, no circularity — the phase
+    // estimate cannot be poisoned by wrong symbol decisions.
+    // Falls back to decision-directed for QAM16+ where VV doesn't apply.
     if (payload_symbols > 512) {
-        // Step 1: tentative demodulation using first-pass smoothed phase
-        std::vector<float> dd_phase_meas(payload_symbols, 0.0f);
-        std::vector<bool> dd_valid(payload_symbols, false);
+        int vv_power = 0;
+        if (mod == Modulation::BPSK) vv_power = 2;
+        else if (mod == Modulation::QPSK) vv_power = 4;
 
-        for (int k = 0; k < payload_symbols; k++) {
-            float iv = raw_samples[k].iv;
-            float qv = raw_samples[k].qv;
-            float phase_corr = -smoothed_phase[k];
-            float cc = std::cos(phase_corr);
-            float ss = std::sin(phase_corr);
-            float re = iv * cc - qv * ss;
-            float im = iv * ss + qv * cc;
+        std::vector<float> pass2_meas(payload_symbols, 0.0f);
+        std::vector<bool> pass2_valid(payload_symbols, false);
+        float r_pass2 = r_dd;
 
-            if (raw_samples[k].is_pilot) {
-                // Pilots: use directly (known +1 BPSK)
-                dd_phase_meas[k] = std::atan2(qv, iv);  // true phase
-                dd_valid[k] = true;
-            } else {
-                // Data symbols: snap to nearest constellation point
-                float ref_phase = 0.0f;
-                if (mod == Modulation::BPSK) {
-                    ref_phase = (re >= 0) ? 0.0f : (float)M_PI;
-                } else if (mod == Modulation::QPSK) {
-                    // QPSK: 4 points at ±45°, ±135°
-                    ref_phase = std::atan2(im >= 0 ? 1.0f : -1.0f,
-                                           re >= 0 ? 1.0f : -1.0f);
+        if (vv_power > 0) {
+            // VV feedforward: raise each symbol to M-th power, sliding window
+            const int VV_W = 32;  // sliding window half-width
+            r_pass2 = 0.15f;     // VV noise (no circularity, tighter than DD)
+
+            std::vector<std::complex<float>> raised(payload_symbols);
+            for (int k = 0; k < payload_symbols; k++) {
+                std::complex<float> sym(raw_samples[k].iv, raw_samples[k].qv);
+                std::complex<float> r = sym;
+                for (int p = 1; p < vv_power; p++) r *= sym;
+                raised[k] = r;
+            }
+
+            for (int k = 0; k < payload_symbols; k++) {
+                if (raw_samples[k].is_pilot) {
+                    pass2_meas[k] = std::atan2(raw_samples[k].qv, raw_samples[k].iv);
+                    pass2_valid[k] = true;
                 } else {
-                    // QAM16+: use nearest constellation point phase
+                    int lo = std::max(0, k - VV_W);
+                    int hi = std::min(payload_symbols - 1, k + VV_W);
+                    std::complex<float> sum(0.0f, 0.0f);
+                    for (int j = lo; j <= hi; j++) sum += raised[j];
+
+                    if (std::abs(sum) > 1e-6f) {
+                        float raw_vv = std::arg(sum) / (float)vv_power;
+                        // Resolve M-fold ambiguity using first-pass smoothed phase
+                        float ref = smoothed_phase[k];
+                        float step = 2.0f * (float)M_PI / (float)vv_power;
+                        float best = raw_vv;
+                        float best_dist = 1e9f;
+                        for (int b = 0; b < vv_power; b++) {
+                            float cand = raw_vv + b * step;
+                            float d = cand - ref;
+                            while (d > (float)M_PI) d -= 2*(float)M_PI;
+                            while (d < -(float)M_PI) d += 2*(float)M_PI;
+                            if (std::abs(d) < best_dist) {
+                                best = cand;
+                                best_dist = std::abs(d);
+                            }
+                        }
+                        pass2_meas[k] = best;
+                        pass2_valid[k] = true;
+                    }
+                }
+            }
+        } else {
+            // QAM16+: decision-directed fallback (uses first-pass phase)
+            for (int k = 0; k < payload_symbols; k++) {
+                float iv = raw_samples[k].iv;
+                float qv = raw_samples[k].qv;
+                if (raw_samples[k].is_pilot) {
+                    pass2_meas[k] = std::atan2(qv, iv);
+                    pass2_valid[k] = true;
+                } else {
+                    float phase_corr = -smoothed_phase[k];
+                    float cc = std::cos(phase_corr);
+                    float ss = std::sin(phase_corr);
+                    float re = iv * cc - qv * ss;
+                    float im = iv * ss + qv * cc;
                     float snapped_re = (re >= 0) ? ((re > 0.6667f) ? 1.0f : 0.3333f)
                                                  : ((re < -0.6667f) ? -1.0f : -0.3333f);
                     float snapped_im = (im >= 0) ? ((im > 0.6667f) ? 1.0f : 0.3333f)
                                                  : ((im < -0.6667f) ? -1.0f : -0.3333f);
-                    ref_phase = std::atan2(snapped_im, snapped_re);
+                    float ref_phase = std::atan2(snapped_im, snapped_re);
+                    float raw_phase = std::atan2(qv, iv);
+                    pass2_meas[k] = raw_phase - ref_phase;
+                    while (pass2_meas[k] > (float)M_PI) pass2_meas[k] -= 2*(float)M_PI;
+                    while (pass2_meas[k] < -(float)M_PI) pass2_meas[k] += 2*(float)M_PI;
+                    float sym_mag = std::sqrt(re*re + im*im);
+                    pass2_valid[k] = (sym_mag > 0.3f);
                 }
-                // Measured phase = raw phase - constellation reference phase
-                float raw_phase = std::atan2(qv, iv);
-                dd_phase_meas[k] = raw_phase - ref_phase;
-                // Wrap to [-pi, pi]
-                while (dd_phase_meas[k] > (float)M_PI) dd_phase_meas[k] -= 2*(float)M_PI;
-                while (dd_phase_meas[k] < -(float)M_PI) dd_phase_meas[k] += 2*(float)M_PI;
-                // Only trust high-confidence decisions (symbol well inside boundary)
-                float sym_mag = std::sqrt(re*re + im*im);
-                dd_valid[k] = (sym_mag > 0.3f);
             }
         }
 
-        // Step 2: Forward Kalman with DD measurements (3-state)
-        std::vector<KalmanState> dd_fwd(payload_symbols);
+        // Step 2: Forward Kalman with VV/DD measurements (3-state)
+        std::vector<KalmanState> p2_fwd(payload_symbols);
         {
             KalmanState s;
             s.phase = smoothed_phase[0];
@@ -933,9 +969,9 @@ bool decode_native_frame(const float* iq_samples, size_t count,
                     s.P22 = p22 + q_accel;
                 }
 
-                if (dd_valid[k]) {
-                    float r = raw_samples[k].is_pilot ? r_meas : r_dd;
-                    float z = dd_phase_meas[k] - s.phase;
+                if (pass2_valid[k]) {
+                    float r = raw_samples[k].is_pilot ? r_meas : r_pass2;
+                    float z = pass2_meas[k] - s.phase;
                     while (z > (float)M_PI) z -= 2*(float)M_PI;
                     while (z < -(float)M_PI) z += 2*(float)M_PI;
 
@@ -956,19 +992,19 @@ bool decode_native_frame(const float* iq_samples, size_t count,
                     s.P11=np11; s.P12=np12; s.P22=np22;
                 }
 
-                dd_fwd[k] = s;
+                p2_fwd[k] = s;
             }
         }
 
-        // Step 3: RTS smoother on DD forward pass (3-state)
+        // Step 3: RTS smoother on pass-2 forward (3-state)
         {
-            smoothed_phase[payload_symbols-1] = dd_fwd[payload_symbols-1].phase;
-            smoothed_freq[payload_symbols-1] = dd_fwd[payload_symbols-1].freq;
-            smoothed_accel[payload_symbols-1] = dd_fwd[payload_symbols-1].accel;
+            smoothed_phase[payload_symbols-1] = p2_fwd[payload_symbols-1].phase;
+            smoothed_freq[payload_symbols-1] = p2_fwd[payload_symbols-1].freq;
+            smoothed_accel[payload_symbols-1] = p2_fwd[payload_symbols-1].accel;
 
             for (int k = payload_symbols - 2; k >= 0; k--) {
-                float p00=dd_fwd[k].P00, p01=dd_fwd[k].P01, p02=dd_fwd[k].P02;
-                float p11=dd_fwd[k].P11, p12=dd_fwd[k].P12, p22=dd_fwd[k].P22;
+                float p00=p2_fwd[k].P00, p01=p2_fwd[k].P01, p02=p2_fwd[k].P02;
+                float p11=p2_fwd[k].P11, p12=p2_fwd[k].P12, p22=p2_fwd[k].P22;
 
                 float pp00 = p00 + 2*p01 + 1.5f*p02 + p11 + 1.5f*p12 + 0.25f*p22 + q_phase;
                 float pp01 = p01 + p02 + p11 + 1.5f*p12 + 0.5f*p22;
@@ -994,7 +1030,7 @@ bool decode_native_frame(const float* iq_samples, size_t count,
                 float c10=pa10*i00+pa11*i01+pa12*i02, c11=pa10*i01+pa11*i11+pa12*i12, c12=pa10*i02+pa11*i12+pa12*i22;
                 float c20=pa20*i00+pa21*i01+pa22*i02, c21=pa20*i01+pa21*i11+pa22*i12, c22=pa20*i02+pa21*i12+pa22*i22;
 
-                float fp=dd_fwd[k].phase, ff=dd_fwd[k].freq, fa=dd_fwd[k].accel;
+                float fp=p2_fwd[k].phase, ff=p2_fwd[k].freq, fa=p2_fwd[k].accel;
                 float dp = smoothed_phase[k+1] - (fp + ff + 0.5f*fa);
                 float df = smoothed_freq[k+1]  - (ff + fa);
                 float da = smoothed_accel[k+1] - fa;
