@@ -419,11 +419,12 @@ bool Modem::init(const IrisConfig& config) {
             // Encoding: 1 byte, SNR * 4 (0.25 dB steps), 0 = no data.
             // Only appended on native PHY — old peers or AFSK ignore extra bytes.
             if (len == 15 && (data[14] & 0x03) == 0x01) {  // S-frame (15 bytes, ctrl bit 0 = 1)
-                // Use preamble-only SNR for peer feedback — DD estimate can
-                // read low on long frames (PLL drift) and poison peer's gearshift
+                // Use DD (post-Kalman) SNR for peer feedback — with RTS smoother,
+                // DD SNR accurately reflects decoded signal quality and is typically
+                // higher than preamble SNR on FM links (preamble biased low by ISI)
                 uint8_t snr_byte = 0;
-                if (snr_preamble_db_ > 0)
-                    snr_byte = (uint8_t)std::min(255.0f, std::max(1.0f, snr_preamble_db_ * 4.0f));
+                if (snr_db_ > 0)
+                    snr_byte = (uint8_t)std::min(255.0f, std::max(1.0f, snr_db_ * 4.0f));
                 frame.push_back(snr_byte);
             }
             tx_queue_.push(std::move(frame));
