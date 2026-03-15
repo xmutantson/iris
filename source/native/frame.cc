@@ -738,6 +738,12 @@ bool decode_native_frame(const float* iq_samples, size_t count,
         float P00, P01, P02, P11, P12, P22;  // 3x3 symmetric covariance
     };
 
+    // Strong Tracking Filter (STF): fading factor lambda scales A*P*A'
+    // when innovations exceed the model prediction, increasing Kalman gain
+    // during phase excursions without inflating noise in steady state.
+    const float stf_rho = 0.90f;   // forgetting factor (~10 pilot window)
+    const float stf_max = 20.0f;   // max fading factor clamp
+
     std::vector<KalmanState> fwd_state(payload_symbols);
     {
         KalmanState s;
@@ -747,24 +753,34 @@ bool decode_native_frame(const float* iq_samples, size_t count,
         s.P00 = 0.01f;  s.P01 = 0.0f;  s.P02 = 0.0f;
         s.P11 = 1e-6f;  s.P12 = 0.0f;
         s.P22 = 1e-8f;
+        float stf_Vk = r_meas + q_phase;  // innovation variance tracker
 
         for (int k = 0; k < payload_symbols; k++) {
-            // Predict: x = A*x,  P = A*P*A' + Q
-            // A = [[1,1,0.5],[0,1,1],[0,0,1]]
+            // Predict with STF: P = lambda * A*P*A' + Q
             if (k > 0) {
                 s.phase += s.freq + 0.5f * s.accel;
                 s.freq  += s.accel;
                 float p00=s.P00, p01=s.P01, p02=s.P02;
                 float p11=s.P11, p12=s.P12, p22=s.P22;
-                s.P00 = p00 + 2*p01 + 1.5f*p02 + p11 + 1.5f*p12 + 0.25f*p22 + q_phase;
-                s.P01 = p01 + p02 + p11 + 1.5f*p12 + 0.5f*p22;
-                s.P02 = p02 + p12 + 0.5f*p22;
-                s.P11 = p11 + 2*p12 + p22 + q_freq;
-                s.P12 = p12 + p22;
-                s.P22 = p22 + q_accel;
+                // A*P*A' components (before adding Q)
+                float a00 = p00 + 2*p01 + 1.5f*p02 + p11 + 1.5f*p12 + 0.25f*p22;
+                float a01 = p01 + p02 + p11 + 1.5f*p12 + 0.5f*p22;
+                float a02 = p02 + p12 + 0.5f*p22;
+                float a11 = p11 + 2*p12 + p22;
+                float a12 = p12 + p22;
+                float a22 = p22;
+                // STF fading factor: lambda >= 1
+                float Nk = stf_Vk - r_meas;
+                float lambda = (Nk > a00 && a00 > 1e-20f) ? (Nk / a00) : 1.0f;
+                if (lambda > stf_max) lambda = stf_max;
+                s.P00 = lambda*a00 + q_phase;
+                s.P01 = lambda*a01;
+                s.P02 = lambda*a02;
+                s.P11 = lambda*a11 + q_freq;
+                s.P12 = lambda*a12;
+                s.P22 = lambda*a22 + q_accel;
             }
 
-            // Measurement update at pilot symbols (H = [1,0,0])
             if (raw_samples[k].is_pilot) {
                 float iv = raw_samples[k].iv;
                 float qv = raw_samples[k].qv;
@@ -774,6 +790,9 @@ bool decode_native_frame(const float* iq_samples, size_t count,
                 float re = iv * cc - qv * ss;
                 float im = iv * ss + qv * cc;
                 float z = std::atan2(im, re);
+
+                // Update STF innovation variance tracker
+                stf_Vk = stf_rho * stf_Vk + (1.0f - stf_rho) * z * z;
 
                 float pmag = std::sqrt(iv * iv + qv * qv);
                 channel_gain = 0.85f * channel_gain + 0.15f * pmag;
@@ -944,7 +963,7 @@ bool decode_native_frame(const float* iq_samples, size_t count,
             }
         }
 
-        // Step 2: Forward Kalman with VV/DD measurements (3-state)
+        // Step 2: Forward Kalman with VV/DD measurements + STF (3-state)
         std::vector<KalmanState> p2_fwd(payload_symbols);
         {
             KalmanState s;
@@ -954,6 +973,7 @@ bool decode_native_frame(const float* iq_samples, size_t count,
             s.P00 = 0.01f;  s.P01 = 0.0f;  s.P02 = 0.0f;
             s.P11 = 1e-6f;  s.P12 = 0.0f;
             s.P22 = 1e-8f;
+            float stf_Vk2 = r_pass2 + q_phase;
 
             for (int k = 0; k < payload_symbols; k++) {
                 if (k > 0) {
@@ -961,12 +981,21 @@ bool decode_native_frame(const float* iq_samples, size_t count,
                     s.freq  += s.accel;
                     float p00=s.P00, p01=s.P01, p02=s.P02;
                     float p11=s.P11, p12=s.P12, p22=s.P22;
-                    s.P00 = p00 + 2*p01 + 1.5f*p02 + p11 + 1.5f*p12 + 0.25f*p22 + q_phase;
-                    s.P01 = p01 + p02 + p11 + 1.5f*p12 + 0.5f*p22;
-                    s.P02 = p02 + p12 + 0.5f*p22;
-                    s.P11 = p11 + 2*p12 + p22 + q_freq;
-                    s.P12 = p12 + p22;
-                    s.P22 = p22 + q_accel;
+                    float a00 = p00 + 2*p01 + 1.5f*p02 + p11 + 1.5f*p12 + 0.25f*p22;
+                    float a01 = p01 + p02 + p11 + 1.5f*p12 + 0.5f*p22;
+                    float a02 = p02 + p12 + 0.5f*p22;
+                    float a11 = p11 + 2*p12 + p22;
+                    float a12 = p12 + p22;
+                    float a22 = p22;
+                    float Nk = stf_Vk2 - r_pass2;
+                    float lambda = (Nk > a00 && a00 > 1e-20f) ? (Nk / a00) : 1.0f;
+                    if (lambda > stf_max) lambda = stf_max;
+                    s.P00 = lambda*a00 + q_phase;
+                    s.P01 = lambda*a01;
+                    s.P02 = lambda*a02;
+                    s.P11 = lambda*a11 + q_freq;
+                    s.P12 = lambda*a12;
+                    s.P22 = lambda*a22 + q_accel;
                 }
 
                 if (pass2_valid[k]) {
@@ -974,6 +1003,8 @@ bool decode_native_frame(const float* iq_samples, size_t count,
                     float z = pass2_meas[k] - s.phase;
                     while (z > (float)M_PI) z -= 2*(float)M_PI;
                     while (z < -(float)M_PI) z += 2*(float)M_PI;
+
+                    stf_Vk2 = stf_rho * stf_Vk2 + (1.0f - stf_rho) * z * z;
 
                     float S = s.P00 + r;
                     float K0 = s.P00 / S;
