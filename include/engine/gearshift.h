@@ -62,7 +62,7 @@ private:
     int cooldown_;         // Frames to suppress upshift after failure-driven downshift
     static constexpr int HOLD_FRAMES = 4;    // Hold this many frames before upshift
     static constexpr int FAIL_THRESHOLD = 2;  // Downshift after this many failures
-    static constexpr int COOLDOWN_FRAMES = 8; // Suppress upshift after failure downshift
+    static constexpr int COOLDOWN_FRAMES = 3; // Suppress upshift after failure downshift (was 8)
     static constexpr float SNR_ALPHA = 0.3f;  // Smoothing factor
 
     std::string cache_dir_;

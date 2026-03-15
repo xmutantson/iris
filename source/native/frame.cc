@@ -63,18 +63,29 @@ static void scramble_soft(std::vector<float>& llrs) {
     }
 }
 
-// Generate 63-symbol m-sequence using LFSR (x^6 + x + 1)
+// Generate m-sequence preamble using maximal-length LFSR.
+// 31 symbols: 5-bit LFSR, polynomial x^5 + x^2 + 1 (primitive).
+// 63 symbols: 6-bit LFSR, polynomial x^6 + x + 1 (primitive).
 std::vector<std::complex<float>> generate_preamble() {
     std::vector<std::complex<float>> preamble;
     preamble.reserve(IRIS_PREAMBLE_LEN);
 
-    uint8_t lfsr = 0x3F; // all ones initial state
-    for (int i = 0; i < IRIS_PREAMBLE_LEN; i++) {
-        int bit = lfsr & 1;
-        preamble.push_back({bit ? 1.0f : -1.0f, 0.0f});
-
-        int feedback = (lfsr & 1) ^ ((lfsr >> 5) & 1);
-        lfsr = (lfsr >> 1) | (feedback << 5);
+    if (IRIS_PREAMBLE_LEN == 31) {
+        uint8_t lfsr = 0x1F; // all ones initial state (5 bits)
+        for (int i = 0; i < IRIS_PREAMBLE_LEN; i++) {
+            int bit = lfsr & 1;
+            preamble.push_back({bit ? 1.0f : -1.0f, 0.0f});
+            int feedback = (lfsr & 1) ^ ((lfsr >> 2) & 1);  // x^5 + x^2 + 1
+            lfsr = (lfsr >> 1) | (feedback << 4);
+        }
+    } else {
+        uint8_t lfsr = 0x3F; // all ones initial state (6 bits)
+        for (int i = 0; i < IRIS_PREAMBLE_LEN; i++) {
+            int bit = lfsr & 1;
+            preamble.push_back({bit ? 1.0f : -1.0f, 0.0f});
+            int feedback = (lfsr & 1) ^ ((lfsr >> 5) & 1);  // x^6 + x + 1
+            lfsr = (lfsr >> 1) | (feedback << 5);
+        }
     }
     return preamble;
 }
@@ -266,7 +277,9 @@ static size_t g_decode_consumed_iq = 0;
 size_t decode_consumed_iq() { return g_decode_consumed_iq; }
 
 static float g_decode_snr = 0.0f;
+static float g_decode_snr_preamble = 0.0f;  // Preamble-only (no DD override)
 float decode_snr_db() { return g_decode_snr; }
+float decode_snr_preamble_db() { return g_decode_snr_preamble; }
 
 int detect_frame_start(const float* iq_samples, size_t count, int sps) {
     auto preamble = generate_preamble();
@@ -523,6 +536,7 @@ bool decode_native_frame(const float* iq_samples, size_t count,
             g_decode_snr = 60.0f;
         else
             g_decode_snr = 10.0f * std::log10(signal_power / noise_power);
+        g_decode_snr_preamble = g_decode_snr;  // Snapshot before DD override
     }
 
     int header_start = rx_frame_start + (IRIS_PREAMBLE_LEN + IRIS_SYNC_LEN) * sps;
@@ -640,104 +654,261 @@ bool decode_native_frame(const float* iq_samples, size_t count,
         IRIS_LOG("%s", ebuf);
     }
 
-    // Adaptive PLL bandwidth: tighten for high-order QAM (more noise-sensitive),
-    // widen for low-order (need to track faster without constellation ambiguity).
-    float payload_pll_alpha, payload_pll_beta;
-    if (mod == Modulation::BPSK || mod == Modulation::QPSK) {
-        payload_pll_alpha = 0.15f;  // Wide: FM discriminator phase noise extends to
-                                     // 50-100 Hz; previous 0.05 gave ~16 Hz BW at 2086
-                                     // baud, too narrow to track.  0.15 → ~50 Hz BW.
-                                     // Phase noise penalty: 5° vs 3° at 10 dB SNR,
-                                     // well within QPSK ±45° decision boundary.
-        payload_pll_beta = 0.001f;  // Increased from 0.0001: allows tracking slow
-                                     // frequency drift from FM discriminator.  Random-walk
-                                     // risk acceptable — QPSK tolerates ±45° phase error.
-    } else if (mod == Modulation::QAM16) {
-        payload_pll_alpha = 0.06f;
-        payload_pll_beta = 0.0005f; // Reduced: same random-walk concern for long frames
-    } else {
-        payload_pll_alpha = 0.03f;  // Tight: 64/128/256-QAM need stable phase
-        payload_pll_beta = 0.0002f; // Very low: short high-QAM frames, minimal drift
+    // ===================================================================
+    // 2-State Kalman Filter with Forward-Backward Smoother
+    //
+    // Replaces the fixed-gain PLL. Tracks state x = [phase, freq] where
+    // freq is rad/symbol. Optimal adaptive gains via Kalman equations:
+    //   - Prediction at every symbol (state transition)
+    //   - Measurement update at pilot symbols (known +1 BPSK)
+    //   - No decision-directed updates (avoids random-walk drift)
+    //
+    // Forward-backward combination (Rauch-Tung-Striebel smoother):
+    //   - Forward pass: causal Kalman filter
+    //   - Backward pass: anti-causal Kalman filter
+    //   - Smoothed estimate: optimal weighted combination
+    //
+    // This is mathematically equivalent to Wiener-optimal interpolation
+    // between pilots, with adaptive noise tracking.
+    // ===================================================================
+
+    // --- Pass 1: Extract raw IQ samples and identify pilot positions ---
+    struct RawSample {
+        float iv, qv;     // raw IQ from interpolator
+        float mag;        // pre-equalization magnitude
+        bool is_pilot;    // true if this is a pilot symbol
+    };
+    std::vector<RawSample> raw_samples(payload_symbols);
+    {
+        int since_pilot = 0;
+        char raw_diag[1024]; int rdp = 0;
+        rdp += snprintf(raw_diag+rdp, sizeof(raw_diag)-rdp, "[DECODE] raw_phase: ");
+        for (int k2 = 0; k2 < payload_symbols; k2++) {
+            float pos = payload_start + k2 * sps + timing_frac;
+            float iv = interp(i_filt, pos);
+            float qv = interp(q_filt, pos);
+            float mag = std::sqrt(iv * iv + qv * qv);
+
+            bool is_pilot = false;
+            if (use_pilots && since_pilot == ps) {
+                is_pilot = true;
+                since_pilot = 0;
+            } else {
+                since_pilot++;
+            }
+
+            raw_samples[k2] = {iv, qv, mag, is_pilot};
+
+            if (k2 < 10 || (k2 % 500 == 0) || k2 == payload_symbols - 1) {
+                float raw_phase_deg = std::atan2(qv, iv) * 180.0f / (float)M_PI;
+                if (rdp < 900)
+                    rdp += snprintf(raw_diag+rdp, sizeof(raw_diag)-rdp,
+                        "%d:(%.3f,%.3f,%.1f°) ", k2, iv, qv, raw_phase_deg);
+            }
+        }
+        IRIS_LOG("%s", raw_diag);
     }
 
-    std::vector<std::complex<float>> symbols;
-    std::vector<float> sym_reliability;  // per-symbol magnitude for LLR weighting
-    // Diagnostic: track raw IQ phase at sampled points
-    char raw_diag[1024]; int rdp = 0;
-    rdp += snprintf(raw_diag+rdp, sizeof(raw_diag)-rdp, "[DECODE] raw_phase: ");
-    int data_sym_count = 0;  // counts data symbols (excludes pilots)
-    int since_pilot = 0;     // symbols since last pilot (resets on pilot extraction)
-    for (int k2 = 0; k2 < payload_symbols; k2++) {
-        float pos = payload_start + k2 * sps + timing_frac;
-        float iv = interp(i_filt, pos);
-        float qv = interp(q_filt, pos);
+    // --- Kalman filter parameters ---
+    // Process noise: phase has random-walk component from FM discriminator
+    // jitter; frequency drifts slowly from oscillator instability.
+    float q_phase = 1e-4f;   // phase process noise variance (rad²/symbol)
+    float q_freq  = 1e-7f;   // frequency process noise variance (rad²/symbol³)
+    // Measurement noise: pilot phase error variance at typical SNR (~8 dB)
+    float r_meas  = 0.10f;   // measurement noise variance (rad²)
 
-        // Track pre-equalization magnitude for reliability weighting
-        float raw_mag = std::sqrt(iv * iv + qv * qv);
+    // --- Pass 2: Forward Kalman filter ---
+    // State: x = [phase, freq]  (phase in rad, freq in rad/symbol)
+    // Transition: x[k+1] = A * x[k] + w,  A = [[1,1],[0,1]]
+    // Measurement at pilots: z = H * x + v,  H = [1, 0]
+    struct KalmanState {
+        float phase;       // estimated phase (rad)
+        float freq;        // estimated frequency (rad/symbol)
+        float P00, P01, P11;  // covariance matrix (symmetric 2x2)
+    };
 
-        // Log raw IQ phase at sampled positions
-        if (k2 < 10 || (k2 % 500 == 0) || k2 == payload_symbols - 1) {
-            float raw_phase_deg = std::atan2(qv, iv) * 180.0f / (float)M_PI;
-            if (rdp < 900)
-                rdp += snprintf(raw_diag+rdp, sizeof(raw_diag)-rdp,
-                    "%d:(%.3f,%.3f,%.1f°) ", k2, iv, qv, raw_phase_deg);
+    std::vector<KalmanState> fwd_state(payload_symbols);
+    {
+        // Initialize from header PLL output
+        KalmanState s;
+        s.phase = running_phase;
+        s.freq = pll_freq;
+        // Initial covariance: moderate uncertainty
+        s.P00 = 0.01f;   // phase variance
+        s.P01 = 0.0f;
+        s.P11 = 1e-6f;   // freq variance
+
+        for (int k = 0; k < payload_symbols; k++) {
+            // Predict: x_pred = A * x,  P_pred = A*P*A' + Q
+            if (k > 0) {
+                s.phase += s.freq;  // phase += freq * 1
+                // P_pred = A*P*A' + Q:
+                // [P00+2*P01+P11+q_phase, P01+P11]
+                // [P01+P11,               P11+q_freq]
+                float new_P00 = s.P00 + 2*s.P01 + s.P11 + q_phase;
+                float new_P01 = s.P01 + s.P11;
+                float new_P11 = s.P11 + q_freq;
+                s.P00 = new_P00;
+                s.P01 = new_P01;
+                s.P11 = new_P11;
+            }
+
+            // Measurement update at pilot symbols
+            if (raw_samples[k].is_pilot) {
+                // Measure phase error: pilot is known +1 BPSK
+                float iv = raw_samples[k].iv;
+                float qv = raw_samples[k].qv;
+                float phase_corr = -s.phase;
+                float cc = std::cos(phase_corr);
+                float ss = std::sin(phase_corr);
+                float re = iv * cc - qv * ss;
+                float im = iv * ss + qv * cc;
+                float z = std::atan2(im, re);  // phase error (innovation)
+
+                // Update channel gain from pilot magnitude (use raw IQ magnitude)
+                float pmag = std::sqrt(iv * iv + qv * qv);
+                channel_gain = 0.85f * channel_gain + 0.15f * pmag;
+
+                // Kalman gain: K = P * H' * (H*P*H' + R)^-1
+                // H = [1, 0], so H*P*H' = P00
+                float S = s.P00 + r_meas;  // innovation covariance
+                float K0 = s.P00 / S;      // gain for phase
+                float K1 = s.P01 / S;      // gain for freq
+
+                // State update: x += K * z
+                s.phase += K0 * z;
+                s.freq  += K1 * z;
+
+                // Covariance update: P = (I - K*H) * P
+                float new_P00 = s.P00 - K0 * s.P00;
+                float new_P01 = s.P01 - K0 * s.P01;
+                float new_P11 = s.P11 - K1 * s.P01;
+                s.P00 = new_P00;
+                s.P01 = new_P01;
+                s.P11 = new_P11;
+            }
+
+            fwd_state[k] = s;
         }
+    }
 
-        // Recursive 2nd-order PLL: running_phase tracks cumulative phase
-        float phase_corr = -running_phase;
+    // --- Pass 3: Backward Kalman filter ---
+    std::vector<KalmanState> bwd_state(payload_symbols);
+    {
+        // Initialize from forward filter's final state
+        KalmanState s = fwd_state[payload_symbols - 1];
+        // Reset covariance for backward pass
+        s.P00 = 0.01f;
+        s.P01 = 0.0f;
+        s.P11 = 1e-6f;
+
+        for (int k = payload_symbols - 1; k >= 0; k--) {
+            // Predict backward: phase -= freq (reverse time)
+            if (k < payload_symbols - 1) {
+                s.phase -= s.freq;
+                float new_P00 = s.P00 + 2*s.P01 + s.P11 + q_phase;
+                float new_P01 = s.P01 + s.P11;
+                float new_P11 = s.P11 + q_freq;
+                s.P00 = new_P00;
+                s.P01 = new_P01;
+                s.P11 = new_P11;
+            }
+
+            // Measurement update at pilot symbols
+            if (raw_samples[k].is_pilot) {
+                float iv = raw_samples[k].iv;
+                float qv = raw_samples[k].qv;
+                float phase_corr = -s.phase;
+                float re = iv * std::cos(phase_corr) - qv * std::sin(phase_corr);
+                float im = iv * std::sin(phase_corr) + qv * std::cos(phase_corr);
+                float z = std::atan2(im, re);
+
+                float S = s.P00 + r_meas;
+                float K0 = s.P00 / S;
+                float K1 = s.P01 / S;
+
+                s.phase += K0 * z;
+                s.freq  += K1 * z;
+
+                float new_P00 = s.P00 - K0 * s.P00;
+                float new_P01 = s.P01 - K0 * s.P01;
+                float new_P11 = s.P11 - K1 * s.P01;
+                s.P00 = new_P00;
+                s.P01 = new_P01;
+                s.P11 = new_P11;
+            }
+
+            bwd_state[k] = s;
+        }
+    }
+
+    // --- Pass 4: Combine forward and backward estimates (RTS smoother) ---
+    // Smoothed phase = weighted average by inverse covariance:
+    //   P_smooth = 1 / (1/P_fwd + 1/P_bwd)
+    //   x_smooth = P_smooth * (x_fwd/P_fwd + x_bwd/P_bwd)
+    // We only need the phase component (index 0).
+    std::vector<float> smoothed_phase(payload_symbols);
+    for (int k = 0; k < payload_symbols; k++) {
+        float pf = fwd_state[k].P00;
+        float pb = bwd_state[k].P00;
+        // Clamp to prevent division by zero
+        if (pf < 1e-10f) pf = 1e-10f;
+        if (pb < 1e-10f) pb = 1e-10f;
+
+        float w_fwd = 1.0f / pf;
+        float w_bwd = 1.0f / pb;
+        float w_total = w_fwd + w_bwd;
+
+        // Weighted average with phase unwrapping
+        float diff = bwd_state[k].phase - fwd_state[k].phase;
+        // Wrap difference to [-pi, pi]
+        while (diff > (float)M_PI)  diff -= 2.0f * (float)M_PI;
+        while (diff < -(float)M_PI) diff += 2.0f * (float)M_PI;
+
+        smoothed_phase[k] = fwd_state[k].phase + (w_bwd / w_total) * diff;
+    }
+
+    // --- Pass 5: Apply smoothed phase corrections, extract symbols ---
+    std::vector<std::complex<float>> symbols;
+    std::vector<float> sym_reliability;
+    for (int k = 0; k < payload_symbols; k++) {
+        if (raw_samples[k].is_pilot) continue;  // skip pilots
+
+        float iv = raw_samples[k].iv;
+        float qv = raw_samples[k].qv;
+        float phase_corr = -smoothed_phase[k];
         float cc = std::cos(phase_corr) / channel_gain;
         float ss = std::sin(phase_corr) / channel_gain;
         float re = iv * cc - qv * ss;
         float im = iv * ss + qv * cc;
 
-        // Check if this position is a pilot symbol.
-        // TX inserts a pilot BEFORE every ps-th data symbol:
-        //   for (i=0..N) { if (i>0 && i%ps==0) insert_pilot; push data[i]; }
-        // RX mirrors: after ps data symbols, expect one pilot.
-        bool is_pilot = false;
-        if (use_pilots && since_pilot == ps) {
-            is_pilot = true;
-        }
-
-        if (is_pilot) {
-            // Pilot symbol: known +1 BPSK. Use for PLL update with known reference.
-            float phase_err = std::atan2(im, re);
-            running_phase += payload_pll_alpha * 2.0f * phase_err;
-            pll_freq += payload_pll_beta * 2.0f * phase_err;
-            // Update channel gain from pilot magnitude.
-            // Smooth tracking to avoid noise-induced gain oscillations.
-            // With pilots every 16 symbols at QAM16, we get frequent updates
-            // so we can afford to smooth more aggressively.
-            float pilot_mag = std::sqrt(re * re + im * im);
-            channel_gain = 0.85f * channel_gain + 0.15f * pilot_mag;
-            since_pilot = 0;  // reset counter after pilot consumed
-        } else {
-            symbols.push_back({re, im});
-            sym_reliability.push_back(raw_mag);
-            data_sym_count++;
-            since_pilot++;
-
-            // Decision-directed PLL for BPSK/QPSK (low symbol error rate).
-            // For QAM16+, skip DD updates — at ~8 dB SNR, the ~10% SER causes
-            // positive-feedback cycle-slips between pilots. With pilots every
-            // 16 symbols, pilot-only tracking is sufficient.
-            if (mod < Modulation::QAM16) {
-                uint8_t dec_bits[8];
-                demap_symbol({re, im}, dec_bits, mod);
-                auto decided = map_symbol(dec_bits, mod);
-                float phase_err = std::atan2(
-                    im * decided.real() - re * decided.imag(),
-                    re * decided.real() + im * decided.imag());
-                running_phase += payload_pll_alpha * phase_err;
-                pll_freq += payload_pll_beta * phase_err;
-            }
-            // QAM16+: phase tracks only on pilots (every 16 symbols).
-            // This eliminates DD cycle-slip at the cost of slower tracking,
-            // which is acceptable with the denser pilot grid.
-        }
-        running_phase += pll_freq;  // Advance phase by current frequency estimate
+        symbols.push_back({re, im});
+        sym_reliability.push_back(raw_samples[k].mag);
     }
-    IRIS_LOG("%s", raw_diag);
+
+    // Kalman smoother diagnostics
+    {
+        float phase_drift = smoothed_phase[payload_symbols-1] - smoothed_phase[0];
+        float fwd_drift = fwd_state[payload_symbols-1].phase - fwd_state[0].phase;
+        float bwd_drift = bwd_state[0].phase - bwd_state[payload_symbols-1].phase;
+        IRIS_LOG("[KALMAN] payload %d syms: smoothed_drift=%.3f rad (%.1f deg), "
+                 "fwd_drift=%.3f rad, bwd_drift=%.3f rad, "
+                 "fwd_P00_final=%.6f, bwd_P00_final=%.6f",
+                 payload_symbols, phase_drift, phase_drift * 180.0f / (float)M_PI,
+                 fwd_drift, bwd_drift,
+                 fwd_state[payload_symbols-1].P00, bwd_state[0].P00);
+        // Log phase at key positions
+        char pbuf[512]; int pp = 0;
+        pp += snprintf(pbuf+pp, sizeof(pbuf)-pp, "[KALMAN] phase@sym: ");
+        for (int k = 0; k < payload_symbols; k += payload_symbols/8) {
+            pp += snprintf(pbuf+pp, sizeof(pbuf)-pp, "%d:%.2f° ",
+                          k, smoothed_phase[k] * 180.0f / (float)M_PI);
+        }
+        pp += snprintf(pbuf+pp, sizeof(pbuf)-pp, "%d:%.2f°",
+                      payload_symbols-1,
+                      smoothed_phase[payload_symbols-1] * 180.0f / (float)M_PI);
+        IRIS_LOG("%s", pbuf);
+    }
 
     // Dump first and last equalized symbols for diagnostics
     {
@@ -850,9 +1021,13 @@ bool decode_native_frame(const float* iq_samples, size_t count,
             }
         }
 
-        // Clamp LLR magnitude to prevent decoder overflow
+        // Clamp LLR magnitude to prevent decoder overflow.
+        // QAM16+: tighter clamp (6) — sigma_sq scaling at moderate SNR
+        // produces over-confident LLRs that the min-sum decoder can't flip.
+        // BPSK/QPSK: wider clamp (10) — fixed scaling keeps LLRs moderate.
+        float llr_clamp = (mod >= Modulation::QAM16) ? 6.0f : 10.0f;
         for (auto& l : llrs) {
-            l = std::max(-10.0f, std::min(10.0f, l));
+            l = std::max(-llr_clamp, std::min(llr_clamp, l));
         }
 
         // LDPC tail hardening: bias padding bits toward known-zero value.
@@ -872,10 +1047,10 @@ bool decode_native_frame(const float* iq_samples, size_t count,
                 for (int i = 0; i < padding_bits; i++) {
                     int idx = pad_start + i;
                     if (idx < (int)llrs.size()) {
-                        // Bias toward +1 (bit=0 maps to LLR>0 after scramble/descramble)
-                        // Use soft bias (3.0) instead of hard override to let decoder
-                        // still correct if the channel flipped a bit
-                        llrs[idx] = std::max(llrs[idx], 3.0f);
+                        // Hard override: padding bits are deterministically zero,
+                        // not channel observations. Tell the decoder with certainty.
+                        // (LLR > 0 = bit 0, after descramble restores sign convention)
+                        llrs[idx] = 20.0f;
                     }
                 }
                 IRIS_LOG("[DECODE] tail hardening: %d padding bits biased in block %d",

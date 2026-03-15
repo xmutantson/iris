@@ -23,11 +23,12 @@ uint32_t crc32(const uint8_t* data, size_t len);
 
 // Mid-frame pilot spacing (symbols between pilots, 0 = disabled)
 // Pilots are known +1 BPSK symbols inserted after constellation mapping.
-// Active for 16QAM and above where phase drift is critical.
-// QAM16+ uses tighter spacing (16) for better phase/gain tracking;
-// BPSK/QPSK uses wider spacing (32) when pilots are needed (long frames).
+// All modulations use spacing 16 (~6% overhead).  BPSK/QPSK was previously
+// 32, but OTA testing showed cumulative PLL drift on long frames (16000 sym)
+// causing LDPC tail failures.  Tighter pilots give the PLL a ground-truth
+// phase reset every 7.7ms (at 2086 baud), preventing random-walk divergence.
 constexpr int PILOT_SPACING_QAM = 16;   // QAM16 and above: 1 pilot every 16 symbols (~6% overhead)
-constexpr int PILOT_SPACING_LOW = 32;   // BPSK/QPSK long frames: 1 pilot every 32 symbols
+constexpr int PILOT_SPACING_LOW = 16;   // BPSK/QPSK: 1 pilot every 16 symbols (was 32)
 
 // Returns the pilot spacing for the given modulation
 inline int pilot_spacing_for(int mod_int) {
@@ -76,6 +77,7 @@ size_t decode_consumed_iq();
 
 // Returns SNR (dB) estimated from last decoded frame's phase-corrected preamble
 float decode_snr_db();
+float decode_snr_preamble_db();  // Preamble-only SNR (for peer feedback)
 
 } // namespace iris
 

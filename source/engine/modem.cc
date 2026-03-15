@@ -419,9 +419,11 @@ bool Modem::init(const IrisConfig& config) {
             // Encoding: 1 byte, SNR * 4 (0.25 dB steps), 0 = no data.
             // Only appended on native PHY — old peers or AFSK ignore extra bytes.
             if (len == 15 && (data[14] & 0x03) == 0x01) {  // S-frame (15 bytes, ctrl bit 0 = 1)
+                // Use preamble-only SNR for peer feedback — DD estimate can
+                // read low on long frames (PLL drift) and poison peer's gearshift
                 uint8_t snr_byte = 0;
-                if (snr_db_ > 0)
-                    snr_byte = (uint8_t)std::min(255.0f, std::max(1.0f, snr_db_ * 4.0f));
+                if (snr_preamble_db_ > 0)
+                    snr_byte = (uint8_t)std::min(255.0f, std::max(1.0f, snr_preamble_db_ * 4.0f));
                 frame.push_back(snr_byte);
             }
             tx_queue_.push(std::move(frame));
@@ -1133,6 +1135,7 @@ void Modem::process_rx_native(const float* audio, int count) {
                 // This is much more accurate than external estimation.
                 float snr = decode_snr_db();
                 snr_db_ = snr;
+                snr_preamble_db_ = decode_snr_preamble_db();
                 int ldpc_iters = ldpc_last_max_iters();
                 gearshift_.feed_ldpc_iters(ldpc_iters, 50);
                 int old_level = gearshift_.current_level();

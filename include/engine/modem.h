@@ -248,6 +248,7 @@ private:
     Gearshift gearshift_;
     AGC agc_;
     float snr_db_ = 0;
+    float snr_preamble_db_ = 0;  // Preamble-only SNR (for peer feedback)
 
     // Peer SNR feedback: what the remote side measures from our TX signal.
     // Used to cap TX speed on asymmetric links where local RX SNR ≠ peer RX SNR.

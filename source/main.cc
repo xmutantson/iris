@@ -21,7 +21,49 @@
 #include <direct.h>
 #else
 #include <sys/stat.h>
+#include <unistd.h>
 #endif
+
+extern "C" {
+#include "monocypher.h"
+}
+
+// Compute blake2b hash of the running executable, return first 8 hex chars.
+static std::string compute_exe_hash() {
+    std::string path;
+#ifdef _WIN32
+    char buf[MAX_PATH];
+    if (GetModuleFileNameA(NULL, buf, MAX_PATH) > 0)
+        path = buf;
+#elif defined(__linux__)
+    char buf[4096];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n > 0) { buf[n] = 0; path = buf; }
+#elif defined(__APPLE__)
+    char buf[4096];
+    uint32_t sz = sizeof(buf);
+    if (_NSGetExecutablePath(buf, &sz) == 0) path = buf;
+#endif
+    if (path.empty()) return "????????";
+
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return "????????";
+
+    crypto_blake2b_ctx ctx;
+    crypto_blake2b_init(&ctx, 16);  // 128-bit hash (we only use first 4 bytes)
+    uint8_t chunk[65536];
+    size_t n;
+    while ((n = fread(chunk, 1, sizeof(chunk), f)) > 0)
+        crypto_blake2b_update(&ctx, chunk, n);
+    fclose(f);
+
+    uint8_t hash[16];
+    crypto_blake2b_final(&ctx, hash);
+
+    char hex[9];
+    snprintf(hex, sizeof(hex), "%02x%02x%02x%02x", hash[0], hash[1], hash[2], hash[3]);
+    return hex;
+}
 
 using namespace iris;
 
@@ -380,7 +422,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    printf("Iris FM Data Modem v0.2\n");
+    std::string exe_hash = compute_exe_hash();
+    printf("Iris FM Data Modem v0.2  [%s]\n", exe_hash.c_str());
+    IRIS_LOG("Iris FM Data Modem v0.2  build=%s", exe_hash.c_str());
     printf("  Callsign: %s\n", config.callsign.c_str());
     printf("  Mode: %s (%d baud)\n", config.mode.c_str(),
            mode_baud_rate(config.mode[0]));

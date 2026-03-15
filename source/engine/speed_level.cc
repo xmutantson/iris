@@ -11,7 +11,7 @@ const SpeedLevel SPEED_LEVELS[NUM_SPEED_LEVELS] = {
     {"A0",  Modulation::BPSK,    1, 2,   0.0f,  0},   // BPSK 1/2
     {"A1",  Modulation::QPSK,    1, 2,   3.0f,  0},   // QPSK 1/2
     {"A2",  Modulation::QPSK,    3, 4,   7.0f,  0},   // QPSK 3/4 (raised from 6.0: FM de-emphasis margin)
-    {"A3",  Modulation::QAM16,   1, 2,   9.0f,  0},   // 16QAM 1/2
+    {"A3",  Modulation::QAM16,   1, 2,  12.0f,  0},   // 16QAM 1/2 (raised from 9: needs real margin on FM)
     {"A4",  Modulation::QAM16,   3, 4,  12.0f,  0},   // 16QAM 3/4
     {"A5",  Modulation::QAM64,   3, 4,  17.0f,  0},   // 64QAM 3/4
     {"A6",  Modulation::QAM64,   7, 8,  20.0f,  0},   // 64QAM 7/8

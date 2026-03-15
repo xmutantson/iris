@@ -54,8 +54,13 @@ int Gearshift::update(float snr_db) {
     int target = snr_to_speed_level(snr_avg_ + ldpc_boost_);
     target = std::min(target, max_level_);
 
-    // Decrement cooldown on each update (each successfully decoded frame)
-    if (cooldown_ > 0) cooldown_--;
+    // Decrement cooldown on each update (each successfully decoded frame).
+    // At A1 (lowest non-base level), drain cooldown 2x faster so recovery
+    // from a brief glitch doesn't take 30+ seconds to re-upshift.
+    if (cooldown_ > 0) {
+        int drain = (current_level_ <= 1) ? 2 : 1;
+        cooldown_ = std::max(0, cooldown_ - drain);
+    }
     // Drain fail_count_ gradually: one success cancels one failure.
     // This allows alternating pass/fail patterns (marginal channel) to
     // accumulate and eventually trigger downshift, instead of the old
@@ -108,9 +113,9 @@ void Gearshift::feed_ldpc_iters(int iters, int max_iters) {
     // Grant up to 3 dB boost (smoothed to avoid oscillation).
     float target_boost = 0;
     if (ratio > 0.95f)       // 1-2 iters: huge margin
-        target_boost = 3.0f;
+        target_boost = 2.0f;  // capped at 2 dB (was 3: too aggressive for FM)
     else if (ratio > 0.85f)  // 3-7 iters: good margin
-        target_boost = 1.5f;
+        target_boost = 1.0f;
     // else: working hard, no boost
 
     // Smooth the boost (slow up, fast down)
