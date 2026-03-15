@@ -26,7 +26,8 @@ struct B2fProposal {
     char mid[13];
     uint32_t uncomp_size;
     uint32_t comp_size;
-    int accepted;           // 1=+, 0=-, -1==
+    int accepted;           // 1=accepted (+/Y/!/H), 0=rejected (-/N/R/E), -1=deferred (=/L)
+    uint32_t resume_offset; // byte offset for '!' resume (0 = full transfer)
 };
 
 // LZHUF buffer wrappers
@@ -60,6 +61,17 @@ public:
     }
     bool is_rx_payload_active() const {
         return state_ == B2F_PAYLOAD_TRANSFER && current_proposer_ == PROPOSER_REMOTE;
+    }
+    // True if payload bytes have actually been consumed (not just FS parsed).
+    // Used to distinguish "FS arrived but no data yet" from "data in flight".
+    bool has_payload_data_in_flight() const {
+        return state_ == B2F_PAYLOAD_TRANSFER && payload_buf_pos_ > 0;
+    }
+    // True if current proposal is a resume transfer (partial LZHUF, can't unroll).
+    bool is_resume_transfer() const {
+        return state_ == B2F_PAYLOAD_TRANSFER &&
+               current_payload_idx_ >= 0 &&
+               proposals_[current_payload_idx_].resume_offset > 0;
     }
 
     bool unroll_enabled;

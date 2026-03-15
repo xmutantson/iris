@@ -82,17 +82,40 @@ bool B2fHandler::parse_fc_line(const char* line, int len, B2fProposal* prop) {
         prop->comp_size = prop->comp_size * 10 + (line[pos++] - '0');
 
     prop->accepted = -1;
+    prop->resume_offset = 0;
     return true;
 }
 
 bool B2fHandler::parse_fs_line(const char* line, int len) {
     if (len < 3 || line[0] != 'F' || line[1] != 'S' || line[2] != ' ') return false;
-    int response_pos = 3;
-    for (int i = 0; i < num_proposals_ && response_pos < len; i++, response_pos++) {
-        switch (line[response_pos]) {
-            case '+': proposals_[i].accepted = 1; break;
-            case '-': proposals_[i].accepted = 0; break;
-            case '=': proposals_[i].accepted = -1; break;
+    int pos = 3;
+    for (int i = 0; i < num_proposals_ && pos < len; i++, pos++) {
+        // FBB protocol FS response codes:
+        //   +/Y = accepted, -/N/R/E = rejected, =/L = deferred, H = hold (accepted)
+        //   !offset = accepted with resume from byte offset
+        switch (line[pos]) {
+            case '+': case 'Y':
+                proposals_[i].accepted = 1; break;
+            case '-': case 'N': case 'R': case 'E':
+                proposals_[i].accepted = 0; break;
+            case '=': case 'L':
+                proposals_[i].accepted = -1; break;
+            case 'H':
+                proposals_[i].accepted = 1; break;
+            case '!': {
+                proposals_[i].accepted = 1;
+                // Parse trailing offset digits
+                uint32_t offset = 0;
+                pos++;
+                while (pos < len && line[pos] >= '0' && line[pos] <= '9')
+                    offset = offset * 10 + (line[pos++] - '0');
+                proposals_[i].resume_offset = offset;
+                pos--;  // loop will increment
+                printf("[B2F] FS: proposal %d accepted with resume offset %u\n",
+                       i, offset);
+                fflush(stdout);
+                break;
+            }
             default: break;
         }
     }
@@ -144,9 +167,13 @@ int B2fHandler::process_tx_line(const char* line, int len, char* out, int out_ca
             if (current_proposer_ == PROPOSER_REMOTE) {
                 current_payload_idx_ = find_next_accepted(0);
                 if (current_payload_idx_ >= 0) {
-                    payload_bytes_remaining_ = unroll_enabled ?
-                        proposals_[current_payload_idx_].uncomp_size :
-                        proposals_[current_payload_idx_].comp_size;
+                    auto& prop = proposals_[current_payload_idx_];
+                    // Resume transfers send partial LZHUF — can't unroll
+                    bool can_unroll = unroll_enabled && prop.resume_offset == 0;
+                    uint32_t data_size = can_unroll ?
+                        prop.uncomp_size :
+                        (prop.comp_size - prop.resume_offset);
+                    payload_bytes_remaining_ = data_size;
                     state_ = B2F_PAYLOAD_TRANSFER;
                     payload_buf_pos_ = 0;
                 } else {
@@ -207,7 +234,8 @@ int B2fHandler::process_rx_line(const char* line, int len, char* out, int out_ca
             if (current_proposer_ == PROPOSER_LOCAL) {
                 current_payload_idx_ = find_next_accepted(0);
                 if (current_payload_idx_ >= 0) {
-                    payload_bytes_remaining_ = proposals_[current_payload_idx_].comp_size;
+                    auto& prop = proposals_[current_payload_idx_];
+                    payload_bytes_remaining_ = prop.comp_size - prop.resume_offset;
                     state_ = B2F_PAYLOAD_TRANSFER;
                     payload_buf_pos_ = 0;
                 } else {
@@ -246,7 +274,10 @@ int B2fHandler::process_tx_payload(const char* in, int in_len, char* out, int ou
         int chunk = in_len - in_pos;
         if (chunk > payload_bytes_remaining_) chunk = payload_bytes_remaining_;
 
-        if (unroll_enabled && initialized_) {
+        // Can only unroll full transfers — resume sends partial LZHUF
+        bool can_unroll = unroll_enabled && initialized_ &&
+                          proposals_[current_payload_idx_].resume_offset == 0;
+        if (can_unroll) {
             if (payload_buf_pos_ + chunk <= B2F_PAYLOAD_BUF_SIZE) {
                 memcpy(payload_buf_ + payload_buf_pos_, in + in_pos, chunk);
                 payload_buf_pos_ += chunk;
@@ -291,10 +322,12 @@ int B2fHandler::process_tx_payload(const char* in, int in_len, char* out, int ou
 
                 payload_buf_pos_ = 0;
                 current_payload_idx_ = find_next_accepted(current_payload_idx_ + 1);
-                if (current_payload_idx_ >= 0)
-                    payload_bytes_remaining_ = proposals_[current_payload_idx_].comp_size;
-                else
+                if (current_payload_idx_ >= 0) {
+                    auto& np = proposals_[current_payload_idx_];
+                    payload_bytes_remaining_ = np.comp_size - np.resume_offset;
+                } else {
                     state_ = B2F_CHECKSUM;
+                }
             }
         } else {
             if (out_pos + chunk <= out_cap) {
@@ -305,10 +338,12 @@ int B2fHandler::process_tx_payload(const char* in, int in_len, char* out, int ou
             payload_bytes_remaining_ -= chunk;
             if (payload_bytes_remaining_ == 0) {
                 current_payload_idx_ = find_next_accepted(current_payload_idx_ + 1);
-                if (current_payload_idx_ >= 0)
-                    payload_bytes_remaining_ = proposals_[current_payload_idx_].comp_size;
-                else
+                if (current_payload_idx_ >= 0) {
+                    auto& np = proposals_[current_payload_idx_];
+                    payload_bytes_remaining_ = np.comp_size - np.resume_offset;
+                } else {
                     state_ = B2F_CHECKSUM;
+                }
             }
         }
     }
@@ -329,7 +364,10 @@ int B2fHandler::process_rx_payload(const char* in, int in_len, char* out, int ou
         int chunk = in_len - in_pos;
         if (chunk > payload_bytes_remaining_) chunk = payload_bytes_remaining_;
 
-        if (unroll_enabled && initialized_) {
+        // Can only reroll full transfers — resume sends partial LZHUF
+        bool can_unroll = unroll_enabled && initialized_ &&
+                          proposals_[current_payload_idx_].resume_offset == 0;
+        if (can_unroll) {
             if (payload_buf_pos_ + chunk <= B2F_PAYLOAD_BUF_SIZE) {
                 memcpy(payload_buf_ + payload_buf_pos_, in + in_pos, chunk);
                 payload_buf_pos_ += chunk;
@@ -375,9 +413,11 @@ int B2fHandler::process_rx_payload(const char* in, int in_len, char* out, int ou
                 payload_buf_pos_ = 0;
                 current_payload_idx_ = find_next_accepted(current_payload_idx_ + 1);
                 if (current_payload_idx_ >= 0) {
-                    payload_bytes_remaining_ = unroll_enabled ?
-                        proposals_[current_payload_idx_].uncomp_size :
-                        proposals_[current_payload_idx_].comp_size;
+                    auto& np = proposals_[current_payload_idx_];
+                    bool next_can_unroll = np.resume_offset == 0;
+                    payload_bytes_remaining_ = next_can_unroll ?
+                        np.uncomp_size :
+                        (np.comp_size - np.resume_offset);
                 } else {
                     state_ = B2F_CHECKSUM;
                 }
@@ -391,10 +431,12 @@ int B2fHandler::process_rx_payload(const char* in, int in_len, char* out, int ou
             payload_bytes_remaining_ -= chunk;
             if (payload_bytes_remaining_ == 0) {
                 current_payload_idx_ = find_next_accepted(current_payload_idx_ + 1);
-                if (current_payload_idx_ >= 0)
-                    payload_bytes_remaining_ = proposals_[current_payload_idx_].comp_size;
-                else
+                if (current_payload_idx_ >= 0) {
+                    auto& np = proposals_[current_payload_idx_];
+                    payload_bytes_remaining_ = np.comp_size - np.resume_offset;
+                } else {
                     state_ = B2F_CHECKSUM;
+                }
             }
         }
     }

@@ -498,6 +498,8 @@ bool Modem::init(const IrisConfig& config) {
                 probe_start_pending_ = false;
                 probe_.reset();
                 batch_airtime_s_ = BATCH_AIRTIME_MIN;
+                tx_no_ack_count_ = 0;
+                last_peer_nr_ = 0xFF;
                 // Clean up OFDM-KISS compression and B2F proxy
                 if (ofdm_kiss_peer_caps_ & CAP_COMPRESSION) {
                     ofdm_kiss_tx_compressor_.deinit();
@@ -752,15 +754,26 @@ void Modem::dispatch_rx_frame(const std::vector<uint8_t>& frame, bool from_fx25,
 
     // CSMA: holdoff after frame decode to avoid stepping on a burst.
     // Role-asymmetric: responder ACKs quickly, initiator yields longer.
-    // Creates ~800ms exclusive window where only the responder can TX,
-    // eliminating the post-decode race where both holdoffs expire together.
     // Resets on each frame, so holdoff extends past the LAST frame in a burst.
+    //
+    // Native data I-frames get a longer holdoff on the responder side:
+    // the sender's self-hear guard (300ms) plus FM turnaround (~200ms) means
+    // a premature RR arriving within ~500ms of sender's TX end gets discarded.
+    // 1500ms covers the inter-frame gap in a multi-frame burst and ensures
+    // the RR only goes out after the burst is truly done.
     {
         int rx_holdoff;
+        bool native_data = from_ofdm && frame.size() > 15 &&
+                           (frame[14] & 0x01) == 0;  // I-frame over native
         if (ax25_session_.is_active()) {
-            rx_holdoff = ax25_session_.we_initiated()
-                ? config_.sample_rate * 6 / 5   // initiator: 1200ms (yield to response)
-                : config_.sample_rate * 2 / 5;  // responder: 400ms (ACK quickly)
+            if (native_data && !ax25_session_.we_initiated()) {
+                // Responder receiving native I-frame: burst holdoff
+                rx_holdoff = config_.sample_rate * 3 / 2;  // 1500ms
+            } else {
+                rx_holdoff = ax25_session_.we_initiated()
+                    ? config_.sample_rate * 6 / 5   // initiator: 1200ms (yield to response)
+                    : config_.sample_rate * 2 / 5;  // responder: 400ms (ACK quickly)
+            }
         } else {
             rx_holdoff = config_.sample_rate * 4 / 5;  // no session: 800ms
         }
@@ -810,13 +823,22 @@ void Modem::dispatch_rx_frame(const std::vector<uint8_t>& frame, bool from_fx25,
         if ((ctrl & 0x03) == 0x01) {  // S-frame
             auto stype = (Ax25SType)((ctrl >> 2) & 0x03);
             if (stype == Ax25SType::RR) {
-                float prev = batch_airtime_s_;
-                batch_airtime_s_ = std::min(batch_airtime_s_ + 1.0f, BATCH_AIRTIME_MAX);
-                if (batch_airtime_s_ != prev)
-                    IRIS_LOG("Batch airtime: %.0fs -> %.0fs (RR ACK)", prev, batch_airtime_s_);
-                tx_no_ack_count_ = 0;  // peer acknowledged
-                // Cache proven speed level for this peer
-                gearshift_.save_cached_level(ax25_session_.remote_callsign());
+                // Only count as real ACK if N(R) advanced (new data acknowledged).
+                // Poll responses with unchanged N(R) mean the peer is alive but
+                // NOT decoding our data — don't reset the no-ack counter, so the
+                // gearshift eventually downshifts on asymmetric decode failures.
+                uint8_t nr = (ctrl >> 5) & 0x07;
+                if (nr != last_peer_nr_) {
+                    float prev = batch_airtime_s_;
+                    batch_airtime_s_ = std::min(batch_airtime_s_ + 1.0f, BATCH_AIRTIME_MAX);
+                    if (batch_airtime_s_ != prev)
+                        IRIS_LOG("Batch airtime: %.0fs -> %.0fs (RR ACK)", prev, batch_airtime_s_);
+                    tx_no_ack_count_ = 0;  // peer acknowledged NEW data
+                    last_peer_nr_ = nr;
+                    // Cache proven speed level for this peer
+                    gearshift_.save_cached_level(ax25_session_.remote_callsign());
+                }
+                // else: RR with same N(R) = poll response, don't reset no-ack counter
             } else if (stype == Ax25SType::REJ || stype == Ax25SType::RNR) {
                 float prev = batch_airtime_s_;
                 batch_airtime_s_ = std::max(batch_airtime_s_ / 2.0f, BATCH_AIRTIME_MIN);
@@ -1419,12 +1441,12 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
         }
 
         if (tx_pos_ >= tx_buffer_.size()) {
-            // Self-hear guard: after native TX, ignore native RX for 800ms
+            // Self-hear guard: after native TX, ignore native RX for 300ms
             // to filter self-heard frames from FM radio audio loopback.
-            // Pipeline latency is typically 50-200ms; 800ms covers worst case.
-            // Does NOT block RX — just discards native decode results.
+            // Pipeline latency is typically 50-200ms; 300ms covers worst case
+            // without blocking legitimate responses from the peer.
             if (state_ == ModemState::TX_NATIVE) {
-                native_selfhear_guard_ = config_.sample_rate * 4 / 5;  // 800ms
+                native_selfhear_guard_ = config_.sample_rate * 3 / 10;  // 300ms
                 // Mandatory listen window: after native TX, defer next TX
                 // long enough for the peer to fully transmit its response.
                 // Role-asymmetric: responder responds sooner, initiator yields.
@@ -1939,6 +1961,16 @@ void Modem::queue_tx_frame(const uint8_t* frame, size_t len) {
     // Must be under tx_mutex_ to synchronize with connection header injection.
     ax25_session_.notify_outgoing(frame, len);
 
+    // Buffer KISS client I-frame info fields during AFSK phase for B2F replay.
+    // The session send_callback only captures session-generated frames (RR etc),
+    // not KISS client data — but the B2F SID/FC/FS exchange comes from the client.
+    if (config_.b2f_unroll && !ofdm_kiss_tx_ && len > 16) {
+        uint8_t ctrl = frame[14];
+        if ((ctrl & 0x01) == 0) {  // I-frame
+            b2f_afsk_tx_history_.emplace_back(frame + 16, frame + len);
+        }
+    }
+
     // B2F proxy TX: sniff outgoing I-frame info fields through B2F handler.
     // During PAYLOAD_TRANSFER (local proposer): intercept LZHUF I-frames,
     // unroll via handler, compress plaintext, send as B2F_DATA over OFDM.
@@ -1955,7 +1987,9 @@ void Modem::queue_tx_frame(const uint8_t* frame, size_t len) {
             // Check BEFORE feeding: is handler already in TX payload mode?
             // Transition happens in filter_rx (when FS arrives from remote),
             // so by the time we see LZHUF I-frames here, it's already set.
-            bool intercepting = ofdm_kiss_b2f_.is_tx_payload_active();
+            // Don't intercept resume transfers — partial LZHUF can't be unrolled
+            bool intercepting = ofdm_kiss_b2f_.is_tx_payload_active() &&
+                                !ofdm_kiss_b2f_.is_resume_transfer();
 
             if (intercepting) {
                 // Feed LZHUF data to filter_tx for unrolling
@@ -2039,13 +2073,17 @@ void Modem::queue_tx_frame(const uint8_t* frame, size_t len) {
                 (char*)b2f_out.data(), (int)b2f_out.size());
 
             // Check if handler just transitioned to TX payload mode
-            if (ofdm_kiss_b2f_.is_tx_payload_active() && !b2f_proxy_active_) {
+            // Skip interception for resume transfers (partial LZHUF)
+            if (ofdm_kiss_b2f_.is_tx_payload_active() &&
+                !ofdm_kiss_b2f_.is_resume_transfer() && !b2f_proxy_active_) {
                 b2f_proxy_active_ = true;
                 b2f_proxy_vr_ = 0;
                 b2f_proxy_plaintext_.clear();
                 memcpy(b2f_proxy_addr_, frame, 14);
                 b2f_proxy_addr_valid_ = true;
                 IRIS_LOG("[B2F-PROXY] TX interception started (local proposer payload)");
+            } else if (ofdm_kiss_b2f_.is_resume_transfer() && !b2f_proxy_active_) {
+                IRIS_LOG("[B2F-PROXY] Resume transfer — skipping unroll (partial LZHUF)");
             }
             // Fall through: forward line protocol I-frame normally
         }
@@ -2452,14 +2490,19 @@ void Modem::tick() {
                         b2f_afsk_tx_history_.clear();
                         b2f_afsk_rx_history_.clear();
 
-                        // Safety: if payload transfer already started during AFSK,
-                        // some LZHUF bytes were sent as-is.  Can't partially unroll
+                        // Safety: if actual LZHUF payload bytes were already sent
+                        // as-is during AFSK, we can't start unrolling mid-stream
                         // (remote would get LZHUF + plaintext mix = corrupt).
-                        if (ofdm_kiss_b2f_.is_payload_transfer()) {
-                            IRIS_LOG("OFDM-KISS: B2F payload already in-flight from AFSK — "
+                        // But if only FS was parsed (no data bytes consumed yet),
+                        // it's safe to start intercepting from here.
+                        if (ofdm_kiss_b2f_.has_payload_data_in_flight()) {
+                            IRIS_LOG("OFDM-KISS: B2F payload bytes already sent during AFSK — "
                                      "disabling unroll for this session");
                             ofdm_kiss_b2f_.deinit();
                             ofdm_kiss_peer_caps_ &= ~CAP_B2F_UNROLL;
+                        } else if (ofdm_kiss_b2f_.is_payload_transfer()) {
+                            IRIS_LOG("OFDM-KISS: B2F in PAYLOAD_TRANSFER but no data consumed yet — "
+                                     "interception safe, keeping unroll enabled");
                         }
                     }
                 }

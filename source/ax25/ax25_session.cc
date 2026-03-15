@@ -122,9 +122,17 @@ void Ax25Session::notify_outgoing(const uint8_t* frame, size_t len) {
         }
     }
 
-    // Shadow V(S): track outgoing I-frames from KISS client
+    // Shadow V(S): track outgoing I-frames from KISS client.
+    // Only advance forward — KISS retransmissions (go-back-N) re-send lower
+    // N(S) values which would shrink the nr_valid() window backwards,
+    // allowing V(A) to decrement (bug: V(A) 0→7→6→5→...).
     if (f.type() == Ax25FrameType::I_FRAME && kiss_managed_) {
-        vs_ = (f.ns() + 1) % 8;
+        uint8_t next_vs = (f.ns() + 1) & 0x07;
+        uint8_t dist_new = (next_vs - va_) & 0x07;
+        uint8_t dist_old = (vs_ - va_) & 0x07;
+        if (dist_new > dist_old) {
+            vs_ = next_vs;
+        }
     }
 }
 
@@ -462,11 +470,18 @@ bool Ax25Session::on_frame_received(const Ax25Frame& frame) {
                 uint8_t ns = frame.ns();
                 if (ns == vr_)
                     vr_ = (vr_ + 1) % 8;
-                // Shadow V(A) from I-frame N(R) (peer piggyback ack)
-                uint8_t nr = frame.nr();
-                if (nr_valid(nr) && nr != va_) {
-                    IRIS_LOG("AX25 KISS shadow V(A) %d -> %d (I-frame N(R))", va_, nr);
-                    va_ = nr;
+                // Shadow V(A) from I-frame N(R) (peer piggyback ack).
+                // Only advance forward — stale/delayed N(R) can appear to go
+                // backwards in mod-8 when the V(S) forward-only fix creates a
+                // near-full window (V(A)≈V(S)), making nr_valid() accept everything.
+                {
+                    uint8_t nr = frame.nr();
+                    uint8_t fwd_dist = (nr - va_) & 0x07;
+                    uint8_t win_size = (vs_ - va_) & 0x07;
+                    if (nr_valid(nr) && nr != va_ && fwd_dist <= win_size && fwd_dist > 0) {
+                        IRIS_LOG("AX25 KISS shadow V(A) %d -> %d (I-frame N(R))", va_, nr);
+                        va_ = nr;
+                    }
                 }
                 // Check for connection header (but don't deliver normal data —
                 // KISS gets the raw frame via dispatch_rx_frame/rx_callback)
@@ -485,12 +500,17 @@ bool Ax25Session::on_frame_received(const Ax25Frame& frame) {
                 uint8_t nr = frame.nr();
                 bool pf = frame.poll_final();
                 Ax25SType st = frame.s_type();
-                if (nr_valid(nr) && nr != va_) {
-                    IRIS_LOG("AX25 KISS shadow V(A) %d -> %d (%s N(R))",
-                             va_, nr,
-                             st == Ax25SType::RR ? "RR" :
-                             st == Ax25SType::RNR ? "RNR" : "REJ");
-                    va_ = nr;
+                    // Only advance V(A) forward — same guard as I-frame path.
+                {
+                    uint8_t fwd_dist = (nr - va_) & 0x07;
+                    uint8_t win_size = (vs_ - va_) & 0x07;
+                    if (nr_valid(nr) && nr != va_ && fwd_dist <= win_size && fwd_dist > 0) {
+                        IRIS_LOG("AX25 KISS shadow V(A) %d -> %d (%s N(R))",
+                                 va_, nr,
+                                 st == Ax25SType::RR ? "RR" :
+                                 st == Ax25SType::RNR ? "RNR" : "REJ");
+                        va_ = nr;
+                    }
                 }
                 // Track peer busy state
                 if (st == Ax25SType::RNR)

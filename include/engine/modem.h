@@ -357,6 +357,7 @@ private:
     // If we TX 3+ frames without any peer acknowledgment, downshift — the peer
     // likely can't decode us (asymmetric link or interference).
     int tx_no_ack_count_ = 0;
+    uint8_t last_peer_nr_ = 0xFF;  // last N(R) from peer RR — 0xFF = no RR yet
 
     // OFDM-KISS transport-layer compression
     uint16_t ofdm_kiss_peer_caps_ = 0;         // Negotiated caps (intersection of local & peer)
