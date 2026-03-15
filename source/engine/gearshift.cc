@@ -1,5 +1,8 @@
 #include "engine/gearshift.h"
 #include <algorithm>
+#include <cstdio>
+#include <cstring>
+#include <ctime>
 
 namespace iris {
 
@@ -115,6 +118,96 @@ void Gearshift::feed_ldpc_iters(int iters, int max_iters) {
         ldpc_boost_ += 0.3f * (target_boost - ldpc_boost_);
     else
         ldpc_boost_ = target_boost;  // drop immediately on hard decode
+}
+
+// --- Speed level cache ---
+
+// Normalize callsign for filename: uppercase, strip SSID, remove invalid chars
+static std::string cache_key(const std::string& callsign) {
+    std::string key;
+    for (char c : callsign) {
+        if (c == '-') break;  // strip SSID
+        if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))
+            key += c;
+        else if (c >= 'a' && c <= 'z')
+            key += (c - 32);
+    }
+    return key;
+}
+
+static std::string cache_path(const std::string& dir, const std::string& callsign) {
+    return dir + "/speed_cache.txt";
+}
+
+int Gearshift::load_cached_level(const std::string& callsign) {
+    if (cache_dir_.empty() || callsign.empty()) return -1;
+    std::string key = cache_key(callsign);
+    if (key.empty()) return -1;
+
+    FILE* f = fopen(cache_path(cache_dir_, key).c_str(), "r");
+    if (!f) return -1;
+
+    int result = -1;
+    time_t now = time(nullptr);
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        char call[64];
+        int level;
+        long long timestamp;
+        if (sscanf(line, "%63s %d %lld", call, &level, &timestamp) == 3) {
+            if (cache_key(call) == key) {
+                // Check expiry
+                if (now - (time_t)timestamp < CACHE_EXPIRY_HOURS * 3600) {
+                    // Apply one-level safety margin (channel may have degraded)
+                    result = std::max(0, level - 1);
+                }
+            }
+        }
+    }
+    fclose(f);
+    return result;
+}
+
+void Gearshift::save_cached_level(const std::string& callsign) {
+    if (cache_dir_.empty() || callsign.empty()) return;
+    std::string key = cache_key(callsign);
+    if (key.empty()) return;
+    if (current_level_ <= 0) return;  // Don't cache A0 (no value)
+
+    std::string path = cache_path(cache_dir_, key);
+
+    // Read existing entries, update or append
+    struct Entry { std::string call; int level; long long ts; };
+    std::vector<Entry> entries;
+
+    FILE* f = fopen(path.c_str(), "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            Entry e;
+            char call[64];
+            if (sscanf(line, "%63s %d %lld", call, &e.level, &e.ts) == 3) {
+                e.call = call;
+                if (cache_key(call) != key)  // keep other entries
+                    entries.push_back(e);
+            }
+        }
+        fclose(f);
+    }
+
+    // Add/update our entry
+    entries.push_back({key, current_level_, (long long)time(nullptr)});
+
+    // Write back (keep max 50 entries, oldest first)
+    if (entries.size() > 50)
+        entries.erase(entries.begin(), entries.begin() + (entries.size() - 50));
+
+    f = fopen(path.c_str(), "w");
+    if (f) {
+        for (auto& e : entries)
+            fprintf(f, "%s %d %lld\n", e.call.c_str(), e.level, e.ts);
+        fclose(f);
+    }
 }
 
 } // namespace iris

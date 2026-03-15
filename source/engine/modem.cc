@@ -116,6 +116,10 @@ bool Modem::init(const IrisConfig& config) {
     native_mod_ = std::make_unique<NativeModulator>(phy_config_, config_.sample_rate);
     native_demod_ = std::make_unique<NativeDemodulator>(phy_config_, config_.sample_rate);
 
+    // Speed level cache: persist proven levels to disk
+    if (!config_.data_dir.empty())
+        gearshift_.set_cache_dir(config_.data_dir);
+
     afsk_demod_.set_preemph_alpha(config_.preemph_alpha);
 
     local_cap_.version = XID_VERSION;
@@ -808,6 +812,8 @@ void Modem::dispatch_rx_frame(const std::vector<uint8_t>& frame, bool from_fx25,
                 if (batch_airtime_s_ != prev)
                     IRIS_LOG("Batch airtime: %.0fs -> %.0fs (RR ACK)", prev, batch_airtime_s_);
                 tx_no_ack_count_ = 0;  // peer acknowledged
+                // Cache proven speed level for this peer
+                gearshift_.save_cached_level(ax25_session_.remote_callsign());
             } else if (stype == Ax25SType::REJ || stype == Ax25SType::RNR) {
                 float prev = batch_airtime_s_;
                 batch_airtime_s_ = std::max(batch_airtime_s_ / 2.0f, BATCH_AIRTIME_MIN);
@@ -1160,6 +1166,15 @@ void Modem::process_rx_native(const float* audio, int count) {
                         ax25_session_.set_native_active(true);
                         IRIS_LOG("OFDM-KISS: TX promoted to native (responder)");
                         if (gui_log_) gui_log_("OFDM-KISS: native TX active (responder)");
+                        // Speed level cache: start at cached level for this peer
+                        {
+                            int cached = gearshift_.load_cached_level(ax25_session_.remote_callsign());
+                            if (cached > 0) {
+                                gearshift_.force_level(cached);
+                                IRIS_LOG("Gearshift: cached level %d for %s",
+                                         cached, ax25_session_.remote_callsign().c_str());
+                            }
+                        }
                         // Migrate accumulated I-frames from AFSK to native queue
                         {
                             std::lock_guard<std::mutex> lock(tx_mutex_);
@@ -2368,6 +2383,16 @@ void Modem::tick() {
             ax25_session_.set_native_active(true);  // Enable T1 polls in native mode
             IRIS_LOG("OFDM-KISS: native mode active (probe-first)");
             if (gui_log_) gui_log_("OFDM-KISS: native mode active");
+
+            // Speed level cache: start at cached level for this peer (if available)
+            {
+                int cached = gearshift_.load_cached_level(ax25_session_.remote_callsign());
+                if (cached > 0) {
+                    gearshift_.force_level(cached);
+                    IRIS_LOG("Gearshift: cached level %d for %s",
+                             cached, ax25_session_.remote_callsign().c_str());
+                }
+            }
 
             // Negotiate OFDM-KISS capabilities from probe result exchange.
             // Each side embeds its local caps in the probe result message.

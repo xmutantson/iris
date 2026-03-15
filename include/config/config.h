@@ -102,6 +102,10 @@ struct IrisConfig {
     // When enabled, DCD measures the noise baseline at startup and adjusts polarity.
     bool dcd_auto = true;
 
+    // Data directory for caches (speed level cache, etc.)
+    // Set to %APPDATA%/Iris (Windows) or ~/.config/iris (Linux) by main.cc
+    std::string data_dir;
+
     // Logging
     bool log_enabled = false;    // Auto-log to AppData/Iris/logs/
 

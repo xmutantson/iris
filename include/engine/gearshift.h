@@ -2,6 +2,7 @@
 #define IRIS_GEARSHIFT_H
 
 #include "engine/speed_level.h"
+#include <string>
 
 namespace iris {
 
@@ -40,6 +41,15 @@ public:
 
     void reset();
 
+    // Speed level cache: persist proven speed levels to disk so reconnections
+    // to the same callsign start near the known-good level instead of A0.
+    // Cache dir is %APPDATA%/Iris (Windows) or ~/.config/iris (Linux).
+    void set_cache_dir(const std::string& dir) { cache_dir_ = dir; }
+    // Load cached level for callsign. Returns -1 if no cache or expired.
+    int load_cached_level(const std::string& callsign);
+    // Save current level for callsign (call on successful data transfer).
+    void save_cached_level(const std::string& callsign);
+
 private:
     int current_level_;
     int max_level_;
@@ -54,6 +64,9 @@ private:
     static constexpr int FAIL_THRESHOLD = 2;  // Downshift after this many failures
     static constexpr int COOLDOWN_FRAMES = 8; // Suppress upshift after failure downshift
     static constexpr float SNR_ALPHA = 0.3f;  // Smoothing factor
+
+    std::string cache_dir_;
+    static constexpr int CACHE_EXPIRY_HOURS = 24;  // Cache entries expire after 24h
 };
 
 } // namespace iris

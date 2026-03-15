@@ -318,6 +318,27 @@ int main(int argc, char** argv) {
     }
     if (!cli_psk.empty()) config.psk_hex = cli_psk;
 
+    // Set data directory for caches
+    {
+#ifdef _WIN32
+        char appdata[MAX_PATH];
+        if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, appdata))) {
+            char iris_dir[512];
+            snprintf(iris_dir, sizeof(iris_dir), "%s\\Iris", appdata);
+            _mkdir(iris_dir);
+            config.data_dir = iris_dir;
+        }
+#else
+        const char* home = getenv("HOME");
+        if (home) {
+            char iris_dir[512];
+            snprintf(iris_dir, sizeof(iris_dir), "%s/.config/iris", home);
+            mkdir(iris_dir, 0755);
+            config.data_dir = iris_dir;
+        }
+#endif
+    }
+
     // Set up logging
     if (!log_path.empty()) {
         // Explicit --log path

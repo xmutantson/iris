@@ -146,7 +146,7 @@ public:
 private:
     static constexpr int T2_TICKS = 6;      // 0.3s response delay timer
     static constexpr int T3_TICKS = 6000;   // 300s idle supervision (Direwolf default: 5 min)
-    static constexpr int MAX_INFO = 256;    // Max I-frame info field bytes (N1)
+    static constexpr int MAX_INFO = 1024;   // Max I-frame info field bytes (N1)
 
     Ax25SessionState state_ = Ax25SessionState::DISCONNECTED;
     std::string local_call_;
