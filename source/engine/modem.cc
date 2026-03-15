@@ -460,7 +460,7 @@ bool Modem::init(const IrisConfig& config) {
             // Set flag and let tick() send it (outside the mutex).
             xid_peer_call_ = remote;
             probe_start_pending_ = true;
-            ofdm_kiss_probe_cd_ = 60;  // 3s countdown before tones
+            ofdm_kiss_probe_cd_ = 20;  // 1s countdown before tones
             probe_connect_timeout_ = 700;  // 35s overall timeout (15s initiator + 12s responder captures)
             IRIS_LOG("Probe-after-connect: probing %s, I-frames held until done", remote.c_str());
             if (gui_log_) gui_log_("Probing " + remote + "...");
@@ -922,11 +922,11 @@ void Modem::dispatch_rx_frame(const std::vector<uint8_t>& frame, bool from_fx25,
                     // Responder capture window: must be long enough to catch
                     // initiator's ~2.25s probe tones (which arrive ~3-5s after
                     // PROBE:START), but short enough to reply while the initiator
-                    // is still listening (initiator has 25s capture).
-                    // 15s: catches tones arriving at t+3..5 with margin,
-                    // finishes by t+15, sends reply by t+18 — well within
-                    // initiator's 25s window.
-                    probe_.start_responder(config_.sample_rate, 15.0f);
+                    // is still listening (initiator has 12s capture).
+                    // 6s: catches tones arriving at t+3..5 with margin,
+                    // finishes by t+6, sends reply by t+9 — well within
+                    // initiator's 12s window.
+                    probe_.start_responder(config_.sample_rate, 6.0f);
                 }
                 is_probe = true;
             }
@@ -1736,6 +1736,11 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                 LdpcRate fec = fec_to_ldpc_rate(tx_fec_n, tx_fec_d);
                 auto iq = build_native_frame(frame_data.data(), frame_data.size(), tx_config, fec);
 
+                // Raise T1 floor to account for this frame's airtime.
+                // IQ samples / 2 = audio samples (interleaved I/Q), / sample_rate = seconds.
+                float frame_airtime_s = (float)(iq.size() / 2) / (float)config_.sample_rate;
+                ax25_session_.set_t1_floor_for_airtime(frame_airtime_s);
+
                 if (use_upconvert_) {
                     tx_buffer_ = upconverter_.iq_to_audio(iq.data(), iq.size());
                     // TX pre-equalization: compensate for peer's RX de-emphasis
@@ -2297,17 +2302,17 @@ void Modem::tick() {
         ofdm_kiss_probe_cd_--;
         if (ofdm_kiss_probe_cd_ == 0) {
             if (probe_manual_) {
-                // Manual probe button: always initiator, generous capture window.
-                probe_.start_initiator(config_.sample_rate, 25.0f);
+                // Manual probe button: always initiator.
+                probe_.start_initiator(config_.sample_rate, 12.0f);
                 ofdm_kiss_probing_ = true;
-                IRIS_LOG("[PROBE] Manual probe: sending tones now (25s capture)");
+                IRIS_LOG("[PROBE] Manual probe: sending tones now (12s capture)");
             } else {
-                // Auto-probe initiator: 25s capture. Responder needs 12s capture +
-                // ~2s analysis + ~4s TX (result + 2.25s probe). Total ~18s.
-                // 25s provides comfortable margin for radio latency.
-                probe_.start_initiator(config_.sample_rate, 25.0f);
+                // Auto-probe initiator: 12s capture. Responder needs 6s capture +
+                // ~0.5s analysis + ~3s TX (result + 2.25s probe). Total ~9.5s.
+                // 12s provides margin for radio latency.
+                probe_.start_initiator(config_.sample_rate, 12.0f);
                 ofdm_kiss_probing_ = true;
-                IRIS_LOG("OFDM-KISS probe: initiator sending tones (25s capture)");
+                IRIS_LOG("OFDM-KISS probe: initiator sending tones (12s capture)");
             }
         }
     }
@@ -2491,7 +2496,7 @@ void Modem::tick() {
             // The peer may be sending its response (UA, held frames) right now.
             // Without this, our TX triggers a self-hear guard that discards the
             // peer's native frame before we can decode it.
-            csma_holdoff_ = config_.sample_rate * 3;  // 3s listen before first TX
+            csma_holdoff_ = config_.sample_rate;  // 1s listen before first TX
 
             // Connection already established before probe.
             // Held I-frames release via native after listen window expires.

@@ -263,6 +263,15 @@ std::vector<float> build_native_frame(const uint8_t* payload, size_t len,
 
     for (auto& s : payload_symbols) all_symbols.push_back(s);
 
+    // TX tail guard: 16 known +1 BPSK symbols after the last data symbol.
+    // Protects the RRC filter ring-down (6×SPS samples) from radio unkeying.
+    // Without this, the last ~6 symbols of the frame can be corrupted if the
+    // radio drops PTT before the matched RRC filter tail is fully transmitted.
+    // The RX decoder ignores these (payload_symbols count is exact).
+    constexpr int TX_TAIL_SYMBOLS = 16;
+    for (int i = 0; i < TX_TAIL_SYMBOLS; i++)
+        all_symbols.push_back({1.0f, 0.0f});
+
     return mod.modulate_symbols(all_symbols);
 }
 

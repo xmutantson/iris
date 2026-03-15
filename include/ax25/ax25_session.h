@@ -87,6 +87,7 @@ public:
     // KISS-managed mode. In OFDM-KISS native mode, the session layer is
     // the actual transport and must actively poll on timeout.
     void set_native_active(bool v) { native_active_ = v; if (v) lower_t1_for_native(); }
+    void set_t1_floor_for_airtime(float airtime_s);  // Raise T1 floor for long native frames
     void set_kiss_passthrough(bool v) { kiss_passthrough_ = v; }
     bool is_kiss_passthrough() const { return kiss_passthrough_; }
     int retry_count() const { return retry_count_; }

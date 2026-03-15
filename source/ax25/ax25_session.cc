@@ -1263,6 +1263,22 @@ void Ax25Session::lower_t1_for_native() {
     }
 }
 
+void Ax25Session::set_t1_floor_for_airtime(float airtime_s) {
+    // Native data frames can be 5+ seconds of airtime. T1 must not expire
+    // during our own transmission. Set floor = airtime + 3s RTT margin.
+    // The adaptive SRT measures poll-to-response RTT (~1.5s for tiny frames),
+    // which is way too short for data frames. This floor prevents false
+    // TIMER_RECOVERY events that waste ~4 seconds each.
+    int floor_ticks = (int)((airtime_s + 3.0f) / 0.05f);  // 50ms per tick
+    if (floor_ticks > t1_floor_) {
+        t1_floor_ = floor_ticks;
+        if (t1_value_ < t1_floor_)
+            t1_value_ = t1_floor_;
+        IRIS_LOG("AX25 T1 floor raised for frame airtime %.1fs: floor=%d ticks (%.1fs), T1=%d ticks (%.1fs)",
+                 airtime_s, t1_floor_, t1_floor_ * 0.05f, t1_value_, t1_value_ * 0.05f);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // KISS injection helpers
 // ---------------------------------------------------------------------------
