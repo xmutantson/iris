@@ -86,7 +86,7 @@ public:
     // Native mode flag: when true, T1 polls are NOT suppressed even in
     // KISS-managed mode. In OFDM-KISS native mode, the session layer is
     // the actual transport and must actively poll on timeout.
-    void set_native_active(bool v) { native_active_ = v; }
+    void set_native_active(bool v) { native_active_ = v; if (v) lower_t1_for_native(); }
     void set_kiss_passthrough(bool v) { kiss_passthrough_ = v; }
     bool is_kiss_passthrough() const { return kiss_passthrough_; }
     int retry_count() const { return retry_count_; }
@@ -136,6 +136,7 @@ private:
     void check_need_for_response(bool pf);
     void select_t1_value();
     void update_srt(int rtt);
+    void lower_t1_for_native();
 
     // AX.25 2.2 system parameters (Section 6)
     // Tick rate: 50ms (main loop sleeps 50ms, modem.tick() calls ax25_session.tick())

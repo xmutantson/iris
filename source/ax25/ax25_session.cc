@@ -462,6 +462,12 @@ bool Ax25Session::on_frame_received(const Ax25Frame& frame) {
                 uint8_t ns = frame.ns();
                 if (ns == vr_)
                     vr_ = (vr_ + 1) % 8;
+                // Shadow V(A) from I-frame N(R) (peer piggyback ack)
+                uint8_t nr = frame.nr();
+                if (nr_valid(nr) && nr != va_) {
+                    IRIS_LOG("AX25 KISS shadow V(A) %d -> %d (I-frame N(R))", va_, nr);
+                    va_ = nr;
+                }
                 // Check for connection header (but don't deliver normal data —
                 // KISS gets the raw frame via dispatch_rx_frame/rx_callback)
                 if (!frame.info.empty() && data_received_ &&
@@ -470,6 +476,41 @@ bool Ax25Session::on_frame_received(const Ax25Frame& frame) {
                     frame.info[2] == 'I' && frame.info[3] == 'S' &&
                     frame.info[4] == '/') {
                     data_received_(frame.info.data(), frame.info.size());
+                }
+            }
+            // Shadow V(A): track peer acknowledgments via S-frame N(R).
+            // Without this, V(A) stays at 0 forever in KISS-managed mode,
+            // causing nr_valid() failures and permanent TIMER_RECOVERY.
+            if (ft == Ax25FrameType::S_FRAME) {
+                uint8_t nr = frame.nr();
+                bool pf = frame.poll_final();
+                Ax25SType st = frame.s_type();
+                if (nr_valid(nr) && nr != va_) {
+                    IRIS_LOG("AX25 KISS shadow V(A) %d -> %d (%s N(R))",
+                             va_, nr,
+                             st == Ax25SType::RR ? "RR" :
+                             st == Ax25SType::RNR ? "RNR" : "REJ");
+                    va_ = nr;
+                }
+                // Track peer busy state
+                if (st == Ax25SType::RNR)
+                    peer_busy_ = true;
+                else if (st == Ax25SType::RR || st == Ax25SType::REJ)
+                    peer_busy_ = false;
+                // F=1 response to our poll: exit TIMER_RECOVERY
+                if (pf && state_ == Ax25SessionState::TIMER_RECOVERY) {
+                    t1_ = 0;
+                    if (measuring_rtt_) {
+                        int rtt = wall_ticks_ - rtt_start_;
+                        IRIS_LOG("AX25 KISS RTT: %d ticks (%.1fs) [poll->%s]",
+                                 rtt, rtt * 0.05,
+                                 st == Ax25SType::RR ? "RR" : "RNR");
+                        update_srt(rtt);
+                    }
+                    select_t1_value();
+                    retry_count_ = 0;
+                    set_state(Ax25SessionState::CONNECTED);
+                    IRIS_LOG("AX25 KISS TIMER_RECOVERY -> CONNECTED (F=1 response)");
                 }
             }
             // Reset idle timer on any received frame
@@ -1201,6 +1242,25 @@ void Ax25Session::update_srt(int rtt) {
     }
     measuring_rtt_ = false;
     select_t1_value();
+}
+
+void Ax25Session::lower_t1_for_native() {
+    // Native mode frames are much shorter than 1200 baud AX.25 (~100ms vs ~1.7s).
+    // Lower T1 floor and value to reduce dead time from T1 waits.
+    // Native RTT: ~200-400ms (PTT delay + frame + turnaround + response).
+    // T1 = 2.0s gives generous margin while avoiding the 4.0s default stall.
+    int native_floor = 40;  // 2.0s (40 ticks × 50ms)
+    if (t1_floor_ > native_floor) {
+        t1_floor_ = native_floor;
+        IRIS_LOG("AX25 T1 floor lowered for native mode: %d ticks (%.1fs)",
+                 t1_floor_, t1_floor_ * 0.05);
+    }
+    if (t1_value_ > native_floor && srt_ticks_ == 0) {
+        // Only lower if no RTT measurement yet (adaptive T1 will take over)
+        t1_value_ = native_floor;
+        IRIS_LOG("AX25 T1 lowered for native mode: %d ticks (%.1fs)",
+                 t1_value_, t1_value_ * 0.05);
+    }
 }
 
 // ---------------------------------------------------------------------------

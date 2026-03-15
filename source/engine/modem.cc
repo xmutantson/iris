@@ -429,9 +429,9 @@ bool Modem::init(const IrisConfig& config) {
             ax25_tx_queue_.push(std::vector<uint8_t>(data, data + len));
             // Buffer I-frame info fields during AFSK phase for B2F replay.
             // The B2F handler isn't initialized until OFDM-KISS activates, but
-            // the SID/FC/FS exchange happens during AFSK.  Buffer the info so
-            // we can replay it when the handler initializes.
-            if (ofdm_kiss_ && len > 16) {
+            // the SID/FC/FS exchange happens during AFSK BEFORE the probe.
+            // Buffer unconditionally so replay works when handler initializes.
+            if (config_.b2f_unroll && len > 16) {
                 uint8_t ctrl = data[14];
                 if ((ctrl & 0x01) == 0) {  // I-frame
                     b2f_afsk_tx_history_.emplace_back(data + 16, data + len);
@@ -845,7 +845,8 @@ void Modem::dispatch_rx_frame(const std::vector<uint8_t>& frame, bool from_fx25,
 
     // Buffer RX I-frame info fields during AFSK phase for B2F replay.
     // Same reason as TX: SID/FC/FS exchange happens over AFSK before OFDM-KISS activates.
-    if (ofdm_kiss_ && !from_ofdm && !ofdm_kiss_b2f_.is_initialized() && frame.size() > 16) {
+    // Buffer unconditionally (config check only) — ofdm_kiss_ isn't set until after probe.
+    if (config_.b2f_unroll && !from_ofdm && !ofdm_kiss_b2f_.is_initialized() && frame.size() > 16) {
         uint8_t ctrl = frame[14];
         if ((ctrl & 0x01) == 0) {  // I-frame
             b2f_afsk_rx_history_.emplace_back(frame.data() + 16, frame.data() + frame.size());
@@ -1696,11 +1697,13 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                     tx_fec_d = 2;
                     IRIS_LOG("TX native hail frame %zu bytes (BPSK r1/2)", frame_data.size());
                 } else {
-                    // TX-without-ACK guard: if we've sent 3+ native frames with
+                    // TX-without-ACK guard: if we've sent 6+ native frames with
                     // no peer ACK/REJ, the peer likely can't decode at this speed.
-                    // Downshift before sending the next frame.
+                    // Threshold 6 (not 3): on FM links, turnaround delays and
+                    // KISS client processing can delay ACKs for several frames.
+                    // Too-aggressive downshift causes unnecessary speed drops.
                     tx_no_ack_count_++;
-                    if (tx_no_ack_count_ >= 3 && level > 0) {
+                    if (tx_no_ack_count_ >= 6 && level > 0) {
                         gearshift_.report_failure();
                         level = gearshift_.current_level();
                         IRIS_LOG("Gearshift: no peer ACK for %d TX frames -> report_failure (level=%d)",

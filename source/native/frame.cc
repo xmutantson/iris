@@ -644,10 +644,14 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     // widen for low-order (need to track faster without constellation ambiguity).
     float payload_pll_alpha, payload_pll_beta;
     if (mod == Modulation::BPSK || mod == Modulation::QPSK) {
-        payload_pll_alpha = 0.05f;  // Moderate: track phase, avoid noise amplification
-        payload_pll_beta = 0.0001f; // Near-zero: preamble freq estimate is accurate,
-                                     // integral gain causes random-walk divergence over
-                                     // 1600-symbol frames (phase drift ~ N^{3/2} * beta)
+        payload_pll_alpha = 0.15f;  // Wide: FM discriminator phase noise extends to
+                                     // 50-100 Hz; previous 0.05 gave ~16 Hz BW at 2086
+                                     // baud, too narrow to track.  0.15 → ~50 Hz BW.
+                                     // Phase noise penalty: 5° vs 3° at 10 dB SNR,
+                                     // well within QPSK ±45° decision boundary.
+        payload_pll_beta = 0.001f;  // Increased from 0.0001: allows tracking slow
+                                     // frequency drift from FM discriminator.  Random-walk
+                                     // risk acceptable — QPSK tolerates ±45° phase error.
     } else if (mod == Modulation::QAM16) {
         payload_pll_alpha = 0.06f;
         payload_pll_beta = 0.0005f; // Reduced: same random-walk concern for long frames
@@ -751,6 +755,39 @@ bool decode_native_frame(const float* iq_samples, size_t count,
         IRIS_LOG("[DECODE] %s", buf);
     }
 
+    // Post-equalization decision-directed SNR estimator.
+    // Measures |symbol - nearest_constellation_point|² across all decoded
+    // payload symbols.  Unlike the preamble estimator (g_decode_snr above),
+    // this captures the true SNR *after* PLL tracking and channel EQ —
+    // ISI and phase noise that the PLL successfully tracks are excluded.
+    // This is critical for gearshift: the preamble estimator biases low
+    // by 3-5 dB on FM links because it counts ISI/jitter as thermal noise.
+    {
+        float sig_pwr = 0, err_pwr = 0;
+        for (size_t si = 0; si < symbols.size(); si++) {
+            // Hard-decide, re-map to nearest constellation point
+            uint8_t dec_bits[8];
+            demap_symbol(symbols[si], dec_bits, mod);
+            auto ideal = map_symbol(dec_bits, mod);
+            float dr = symbols[si].real() - ideal.real();
+            float di = symbols[si].imag() - ideal.imag();
+            sig_pwr += ideal.real() * ideal.real() + ideal.imag() * ideal.imag();
+            err_pwr += dr * dr + di * di;
+        }
+        float dd_snr;
+        if (err_pwr < 1e-12f)
+            dd_snr = 60.0f;
+        else
+            dd_snr = 10.0f * std::log10(sig_pwr / err_pwr);
+        IRIS_LOG("[DECODE] SNR preamble=%.1f dB  post-EQ(DD)=%.1f dB  (%d symbols)",
+                 g_decode_snr, dd_snr, (int)symbols.size());
+        // Use the higher of preamble and DD estimates for gearshift.
+        // DD estimate is more accurate on FM (preamble biased low by ISI),
+        // but on clean channels both should agree within ~1 dB.
+        if (dd_snr > g_decode_snr)
+            g_decode_snr = dd_snr;
+    }
+
     std::vector<uint8_t> bits;
 
     if (fec != LdpcRate::NONE) {
@@ -816,6 +853,34 @@ bool decode_native_frame(const float* iq_samples, size_t count,
         // Clamp LLR magnitude to prevent decoder overflow
         for (auto& l : llrs) {
             l = std::max(-10.0f, std::min(10.0f, l));
+        }
+
+        // LDPC tail hardening: bias padding bits toward known-zero value.
+        // The encoder pads the last block with zeros, so the decoder can use
+        // this prior knowledge to improve convergence on the tail block.
+        // This is the #1 cause of OTA LDPC failures (block 12 systematic).
+        {
+            int k_fec = LdpcCodec::block_size(fec);
+            int n_fec = LdpcCodec::codeword_size(fec);
+            int total_data_bits = (payload_len + 4) * 8;  // payload + CRC32
+            int num_blocks = (total_data_bits + k_fec - 1) / k_fec;
+            int padding_bits = num_blocks * k_fec - total_data_bits;
+            if (padding_bits > 0 && num_blocks > 0) {
+                // Padding is in the systematic (first k) bits of the last block
+                int last_block_start = (num_blocks - 1) * n_fec;
+                int pad_start = last_block_start + (k_fec - padding_bits);
+                for (int i = 0; i < padding_bits; i++) {
+                    int idx = pad_start + i;
+                    if (idx < (int)llrs.size()) {
+                        // Bias toward +1 (bit=0 maps to LLR>0 after scramble/descramble)
+                        // Use soft bias (3.0) instead of hard override to let decoder
+                        // still correct if the channel flipped a bit
+                        llrs[idx] = std::max(llrs[idx], 3.0f);
+                    }
+                }
+                IRIS_LOG("[DECODE] tail hardening: %d padding bits biased in block %d",
+                         padding_bits, num_blocks - 1);
+            }
         }
 
         // LLR quality stats: mean |LLR| indicates channel confidence
