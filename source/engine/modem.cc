@@ -1828,29 +1828,36 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
 
             tx_pos_ = 0;
             frames_tx_++;
-            ptt_on();
-
-            size_t to_copy = std::min((size_t)frame_count, tx_buffer_.size());
-            std::memcpy(tx_audio, tx_buffer_.data(), to_copy * sizeof(float));
-            tx_pos_ = to_copy;
-            if (to_copy < (size_t)frame_count)
-                std::memset(tx_audio + to_copy, 0, (frame_count - to_copy) * sizeof(float));
-
-            // Apply simulated channel effects
-            if (sim_bp_enabled_) {
-                for (int i = 0; i < frame_count; i++) {
-                    float s = tx_audio[i];
-                    for (int j = 0; j < 4; j++) s = sim_bp_hi_[j].process(s);
-                    for (int j = 0; j < 4; j++) s = sim_bp_lo_[j].process(s);
-                    tx_audio[i] = s;
-                }
-            }
-            if (sim_deemph_enabled_) {
-                for (int i = 0; i < frame_count; i++)
-                    tx_audio[i] = sim_deemph_.process(tx_audio[i]);
-            }
-            return;
         }
+    }
+    // *** tx_mutex_ released here ***
+
+    // ptt_on() calls set_channel_busy() which acquires timer_mutex_.
+    // Must be called OUTSIDE tx_mutex_ to prevent ABBA deadlock with
+    // ax25_session_.tick() (holds timer_mutex_, then send_frame_ -> tx_mutex_).
+    if (tx_pos_ == 0 && !tx_buffer_.empty()) {
+        ptt_on();
+
+        size_t to_copy = std::min((size_t)frame_count, tx_buffer_.size());
+        std::memcpy(tx_audio, tx_buffer_.data(), to_copy * sizeof(float));
+        tx_pos_ = to_copy;
+        if (to_copy < (size_t)frame_count)
+            std::memset(tx_audio + to_copy, 0, (frame_count - to_copy) * sizeof(float));
+
+        // Apply simulated channel effects
+        if (sim_bp_enabled_) {
+            for (int i = 0; i < frame_count; i++) {
+                float s = tx_audio[i];
+                for (int j = 0; j < 4; j++) s = sim_bp_hi_[j].process(s);
+                for (int j = 0; j < 4; j++) s = sim_bp_lo_[j].process(s);
+                tx_audio[i] = s;
+            }
+        }
+        if (sim_deemph_enabled_) {
+            for (int i = 0; i < frame_count; i++)
+                tx_audio[i] = sim_deemph_.process(tx_audio[i]);
+        }
+        return;
     }
 
     std::memset(tx_audio, 0, frame_count * sizeof(float));
