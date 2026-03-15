@@ -922,12 +922,11 @@ void Modem::dispatch_rx_frame(const std::vector<uint8_t>& frame, bool from_fx25,
                     // Responder capture window: must be long enough to catch
                     // initiator's ~2.25s probe tones (which arrive ~3-5s after
                     // PROBE:START), but short enough to reply while the initiator
-                    // is still listening (initiator has 12s capture).
-                    // Tones arrive ~5-7s after PROBE:START (countdown + PROBE:START
-                    // TX + PTT delays). 10s window catches tones with margin,
-                    // finishes by t+10, sends reply by t+13 — within initiator's
-                    // 12s capture (which starts after tones, not after PROBE:START).
-                    probe_.start_responder(config_.sample_rate, 10.0f);
+                    // is still listening (initiator has 25s capture).
+                    // 15s: catches tones arriving at t+3..5 with margin,
+                    // finishes by t+15, sends reply by t+18 — well within
+                    // initiator's 25s window.
+                    probe_.start_responder(config_.sample_rate, 15.0f);
                 }
                 is_probe = true;
             }
@@ -2303,17 +2302,16 @@ void Modem::tick() {
         ofdm_kiss_probe_cd_--;
         if (ofdm_kiss_probe_cd_ == 0) {
             if (probe_manual_) {
-                // Manual probe button: always initiator.
-                probe_.start_initiator(config_.sample_rate, 12.0f);
+                // Manual probe button: always initiator, generous capture window.
+                probe_.start_initiator(config_.sample_rate, 25.0f);
                 ofdm_kiss_probing_ = true;
-                IRIS_LOG("[PROBE] Manual probe: sending tones now (12s capture)");
+                IRIS_LOG("[PROBE] Manual probe: sending tones now (25s capture)");
             } else {
-                // Auto-probe initiator: 12s capture. Responder needs 6s capture +
-                // ~0.5s analysis + ~3s TX (result + 2.25s probe). Total ~9.5s.
-                // 12s provides margin for radio latency.
-                probe_.start_initiator(config_.sample_rate, 12.0f);
+                // Auto-probe initiator: 25s capture. Responder needs 12s capture +
+                // ~2s analysis + ~4s TX (result + 2.25s probe). Total ~18s.
+                probe_.start_initiator(config_.sample_rate, 25.0f);
                 ofdm_kiss_probing_ = true;
-                IRIS_LOG("OFDM-KISS probe: initiator sending tones (12s capture)");
+                IRIS_LOG("OFDM-KISS probe: initiator sending tones (25s capture)");
             }
         }
     }
@@ -2497,7 +2495,7 @@ void Modem::tick() {
             // The peer may be sending its response (UA, held frames) right now.
             // Without this, our TX triggers a self-hear guard that discards the
             // peer's native frame before we can decode it.
-            csma_holdoff_ = config_.sample_rate;  // 1s listen before first TX
+            csma_holdoff_ = config_.sample_rate * 3;  // 3s listen before first TX
 
             // Connection already established before probe.
             // Held I-frames release via native after listen window expires.
