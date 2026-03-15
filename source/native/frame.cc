@@ -744,6 +744,8 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     const float stf_rho = 0.90f;   // forgetting factor (~10 pilot window)
     const float stf_max = 20.0f;   // max fading factor clamp
 
+    float max_lambda_p1 = 1.0f, max_lambda_p2 = 1.0f;  // STF peak trackers
+
     std::vector<KalmanState> fwd_state(payload_symbols);
     {
         KalmanState s;
@@ -773,6 +775,7 @@ bool decode_native_frame(const float* iq_samples, size_t count,
                 float Nk = stf_Vk - r_meas;
                 float lambda = (Nk > a00 && a00 > 1e-20f) ? (Nk / a00) : 1.0f;
                 if (lambda > stf_max) lambda = stf_max;
+                if (lambda > max_lambda_p1) max_lambda_p1 = lambda;
                 s.P00 = lambda*a00 + q_phase;
                 s.P01 = lambda*a01;
                 s.P02 = lambda*a02;
@@ -880,6 +883,7 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     // to extract carrier phase.  No feedback, no circularity — the phase
     // estimate cannot be poisoned by wrong symbol decisions.
     // Falls back to decision-directed for QAM16+ where VV doesn't apply.
+    const char* pass2_mode = "none";  // for diagnostics
     if (payload_symbols > 512) {
         int vv_power = 0;
         if (mod == Modulation::BPSK) vv_power = 2;
@@ -893,6 +897,7 @@ bool decode_native_frame(const float* iq_samples, size_t count,
             // VV feedforward: raise each symbol to M-th power, sliding window
             const int VV_W = 32;  // sliding window half-width
             r_pass2 = 0.15f;     // VV noise (no circularity, tighter than DD)
+            pass2_mode = (vv_power == 4) ? "VV4" : "VV2";
 
             std::vector<std::complex<float>> raised(payload_symbols);
             for (int k = 0; k < payload_symbols; k++) {
@@ -936,6 +941,7 @@ bool decode_native_frame(const float* iq_samples, size_t count,
             }
         } else {
             // QAM16+: decision-directed fallback (uses first-pass phase)
+            pass2_mode = "DD";
             for (int k = 0; k < payload_symbols; k++) {
                 float iv = raw_samples[k].iv;
                 float qv = raw_samples[k].qv;
@@ -990,6 +996,7 @@ bool decode_native_frame(const float* iq_samples, size_t count,
                     float Nk = stf_Vk2 - r_pass2;
                     float lambda = (Nk > a00 && a00 > 1e-20f) ? (Nk / a00) : 1.0f;
                     if (lambda > stf_max) lambda = stf_max;
+                    if (lambda > max_lambda_p2) max_lambda_p2 = lambda;
                     s.P00 = lambda*a00 + q_phase;
                     s.P01 = lambda*a01;
                     s.P02 = lambda*a02;
@@ -1095,12 +1102,23 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     {
         float fwd_drift = fwd_state[payload_symbols-1].phase - fwd_state[0].phase;
         float smooth_drift = smoothed_phase[payload_symbols-1] - smoothed_phase[0];
-        IRIS_LOG("[KALMAN] payload %d syms: fwd_drift=%.3f rad (%.1f deg), "
-                 "smoothed_drift=%.3f rad (%.1f deg), fwd_P00=%.6f",
+        float accel_start = smoothed_accel.empty() ? 0.0f : smoothed_accel[0];
+        float accel_end = smoothed_accel.empty() ? 0.0f : smoothed_accel[payload_symbols-1];
+        float freq_start = smoothed_freq[0];
+        float freq_end = smoothed_freq[payload_symbols-1];
+        // Convert freq from rad/symbol to Hz (baud_rate * freq / 2pi)
+        // Not available here, so report in rad/symbol and deg/symbol
+        IRIS_LOG("[KALMAN] payload %d syms: fwd_drift=%.1f° smooth_drift=%.1f° "
+                 "pass2=%s STF_peak=%.1f/%.1f",
                  payload_symbols,
-                 fwd_drift, fwd_drift * 180.0f / (float)M_PI,
-                 smooth_drift, smooth_drift * 180.0f / (float)M_PI,
-                 fwd_state[payload_symbols-1].P00);
+                 fwd_drift * 180.0f / (float)M_PI,
+                 smooth_drift * 180.0f / (float)M_PI,
+                 pass2_mode, max_lambda_p1, max_lambda_p2);
+        IRIS_LOG("[KALMAN] freq: start=%.4f end=%.4f (%.2f°/sym) "
+                 "accel: start=%.2e end=%.2e (rad/sym²)",
+                 freq_start, freq_end,
+                 (freq_end - freq_start) * 180.0f / (float)M_PI,
+                 accel_start, accel_end);
         // Log smoothed phase at key positions
         char pbuf[512]; int pp = 0;
         pp += snprintf(pbuf+pp, sizeof(pbuf)-pp, "[KALMAN] phase@sym: ");
@@ -1156,8 +1174,8 @@ bool decode_native_frame(const float* iq_samples, size_t count,
             dd_snr = 60.0f;
         else
             dd_snr = 10.0f * std::log10(sig_pwr / err_pwr);
-        IRIS_LOG("[DECODE] SNR preamble=%.1f dB  post-EQ(DD)=%.1f dB  (%d symbols)",
-                 g_decode_snr, dd_snr, (int)symbols.size());
+        IRIS_LOG("[DECODE] SNR preamble=%.1f dB  post-EQ(%s)=%.1f dB  (%d symbols)",
+                 g_decode_snr, pass2_mode, dd_snr, (int)symbols.size());
         // Use the higher of preamble and DD estimates for gearshift.
         // DD estimate is more accurate on FM (preamble biased low by ISI),
         // but on clean channels both should agree within ~1 dB.
