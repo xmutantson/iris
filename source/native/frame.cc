@@ -720,11 +720,16 @@ bool decode_native_frame(const float* iq_samples, size_t count,
 
     // --- Kalman filter parameters ---
     // Process noise: phase has random-walk component from FM discriminator
-    // jitter; frequency drifts slowly from oscillator instability.
+    // jitter; frequency drifts from oscillator instability + de-emphasis.
+    // OTA data shows non-linear phase paths (S-curves, 90°+ excursion over
+    // 11K symbols).  Q_freq must be high enough to track frequency CHANGES,
+    // not just constant offsets.  1e-5 allows ~4 Hz/s frequency slew.
     float q_phase = 1e-4f;   // phase process noise variance (rad²/symbol)
-    float q_freq  = 1e-7f;   // frequency process noise variance (rad²/symbol³)
+    float q_freq  = 1e-5f;   // frequency process noise variance (rad²/symbol³)
     // Measurement noise: pilot phase error variance at typical SNR (~8 dB)
     float r_meas  = 0.10f;   // measurement noise variance (rad²)
+    // Decision-directed measurement noise (higher — hard decisions may be wrong)
+    float r_dd    = 0.25f;   // DD measurement noise variance (rad²)
 
     // --- Pass 2: Forward Kalman filter ---
     // State: x = [phase, freq]  (phase in rad, freq in rad/symbol)
@@ -855,6 +860,133 @@ bool decode_native_frame(const float* iq_samples, size_t count,
             // x_smooth[k] = x_fwd[k] + C * innovation
             smoothed_phase[k] = fwd_state[k].phase + C00 * innov_phase + C01 * innov_freq;
             smoothed_freq[k] = fwd_state[k].freq + C10 * innov_phase + C11 * innov_freq;
+        }
+    }
+
+    // --- Decision-directed second pass ---
+    // After the first Kalman+RTS pass, demodulate symbols tentatively, then
+    // use ALL symbols (pilots + data) as measurements for a second Kalman+RTS.
+    // This turns ~690 pilot measurements into ~11000, dramatically improving
+    // tracking of non-linear phase paths (S-curves, frequency acceleration).
+    // Only run on long frames where phase drift is a problem.
+    if (payload_symbols > 512) {
+        // Step 1: tentative demodulation using first-pass smoothed phase
+        std::vector<float> dd_phase_meas(payload_symbols, 0.0f);
+        std::vector<bool> dd_valid(payload_symbols, false);
+
+        for (int k = 0; k < payload_symbols; k++) {
+            float iv = raw_samples[k].iv;
+            float qv = raw_samples[k].qv;
+            float phase_corr = -smoothed_phase[k];
+            float cc = std::cos(phase_corr);
+            float ss = std::sin(phase_corr);
+            float re = iv * cc - qv * ss;
+            float im = iv * ss + qv * cc;
+
+            if (raw_samples[k].is_pilot) {
+                // Pilots: use directly (known +1 BPSK)
+                dd_phase_meas[k] = std::atan2(qv, iv);  // true phase
+                dd_valid[k] = true;
+            } else {
+                // Data symbols: snap to nearest constellation point
+                float ref_phase = 0.0f;
+                if (mod == Modulation::BPSK) {
+                    ref_phase = (re >= 0) ? 0.0f : (float)M_PI;
+                } else if (mod == Modulation::QPSK) {
+                    // QPSK: 4 points at ±45°, ±135°
+                    ref_phase = std::atan2(im >= 0 ? 1.0f : -1.0f,
+                                           re >= 0 ? 1.0f : -1.0f);
+                } else {
+                    // QAM16+: use nearest constellation point phase
+                    float snapped_re = (re >= 0) ? ((re > 0.6667f) ? 1.0f : 0.3333f)
+                                                 : ((re < -0.6667f) ? -1.0f : -0.3333f);
+                    float snapped_im = (im >= 0) ? ((im > 0.6667f) ? 1.0f : 0.3333f)
+                                                 : ((im < -0.6667f) ? -1.0f : -0.3333f);
+                    ref_phase = std::atan2(snapped_im, snapped_re);
+                }
+                // Measured phase = raw phase - constellation reference phase
+                float raw_phase = std::atan2(qv, iv);
+                dd_phase_meas[k] = raw_phase - ref_phase;
+                // Wrap to [-pi, pi]
+                while (dd_phase_meas[k] > (float)M_PI) dd_phase_meas[k] -= 2*(float)M_PI;
+                while (dd_phase_meas[k] < -(float)M_PI) dd_phase_meas[k] += 2*(float)M_PI;
+                // Only trust high-confidence decisions (symbol well inside boundary)
+                float sym_mag = std::sqrt(re*re + im*im);
+                dd_valid[k] = (sym_mag > 0.3f);
+            }
+        }
+
+        // Step 2: Forward Kalman with DD measurements at every symbol
+        std::vector<KalmanState> dd_fwd(payload_symbols);
+        {
+            KalmanState s;
+            s.phase = smoothed_phase[0];
+            s.freq = smoothed_freq[0];
+            s.P00 = 0.01f;
+            s.P01 = 0.0f;
+            s.P11 = 1e-6f;
+
+            for (int k = 0; k < payload_symbols; k++) {
+                if (k > 0) {
+                    s.phase += s.freq;
+                    float new_P00 = s.P00 + 2*s.P01 + s.P11 + q_phase;
+                    float new_P01 = s.P01 + s.P11;
+                    float new_P11 = s.P11 + q_freq;
+                    s.P00 = new_P00;
+                    s.P01 = new_P01;
+                    s.P11 = new_P11;
+                }
+
+                if (dd_valid[k]) {
+                    float r = raw_samples[k].is_pilot ? r_meas : r_dd;
+                    // Innovation: difference between measured phase and predicted
+                    float z = dd_phase_meas[k] - s.phase;
+                    // Wrap to [-pi, pi]
+                    while (z > (float)M_PI) z -= 2*(float)M_PI;
+                    while (z < -(float)M_PI) z += 2*(float)M_PI;
+
+                    float S = s.P00 + r;
+                    float K0 = s.P00 / S;
+                    float K1 = s.P01 / S;
+                    s.phase += K0 * z;
+                    s.freq  += K1 * z;
+                    s.P00 -= K0 * s.P00;
+                    s.P01 -= K0 * s.P01;
+                    s.P11 -= K1 * s.P01;
+                }
+
+                dd_fwd[k] = s;
+            }
+        }
+
+        // Step 3: RTS smoother on DD forward pass
+        {
+            smoothed_phase[payload_symbols-1] = dd_fwd[payload_symbols-1].phase;
+            smoothed_freq[payload_symbols-1] = dd_fwd[payload_symbols-1].freq;
+
+            for (int k = payload_symbols - 2; k >= 0; k--) {
+                float P00 = dd_fwd[k].P00;
+                float P01 = dd_fwd[k].P01;
+                float P11 = dd_fwd[k].P11;
+                float pp00 = P00 + 2*P01 + P11 + q_phase;
+                float pp01 = P01 + P11;
+                float pp11 = P11 + q_freq;
+                float PA00 = P00 + P01, PA01 = P01;
+                float PA10 = P01 + P11, PA11 = P11;
+                float det = pp00 * pp11 - pp01 * pp01;
+                if (std::abs(det) < 1e-20f) det = 1e-20f;
+                float inv_det = 1.0f / det;
+                float C00 = (PA00 * pp11 - PA01 * pp01) * inv_det;
+                float C01 = (-PA00 * pp01 + PA01 * pp00) * inv_det;
+                float C10 = (PA10 * pp11 - PA11 * pp01) * inv_det;
+                float C11 = (-PA10 * pp01 + PA11 * pp00) * inv_det;
+                float pred_phase = dd_fwd[k].phase + dd_fwd[k].freq;
+                float pred_freq = dd_fwd[k].freq;
+                float innov_phase = smoothed_phase[k+1] - pred_phase;
+                float innov_freq = smoothed_freq[k+1] - pred_freq;
+                smoothed_phase[k] = dd_fwd[k].phase + C00 * innov_phase + C01 * innov_freq;
+                smoothed_freq[k] = dd_fwd[k].freq + C10 * innov_phase + C11 * innov_freq;
+            }
         }
     }
 
