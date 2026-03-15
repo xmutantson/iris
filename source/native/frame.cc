@@ -792,80 +792,61 @@ bool decode_native_frame(const float* iq_samples, size_t count,
         }
     }
 
-    // --- Pass 3: Backward Kalman filter ---
-    std::vector<KalmanState> bwd_state(payload_symbols);
-    {
-        // Initialize from forward filter's final state
-        KalmanState s = fwd_state[payload_symbols - 1];
-        // Reset covariance for backward pass
-        s.P00 = 0.01f;
-        s.P01 = 0.0f;
-        s.P11 = 1e-6f;
-
-        for (int k = payload_symbols - 1; k >= 0; k--) {
-            // Predict backward: phase -= freq (reverse time)
-            if (k < payload_symbols - 1) {
-                s.phase -= s.freq;
-                float new_P00 = s.P00 + 2*s.P01 + s.P11 + q_phase;
-                float new_P01 = s.P01 + s.P11;
-                float new_P11 = s.P11 + q_freq;
-                s.P00 = new_P00;
-                s.P01 = new_P01;
-                s.P11 = new_P11;
-            }
-
-            // Measurement update at pilot symbols
-            if (raw_samples[k].is_pilot) {
-                float iv = raw_samples[k].iv;
-                float qv = raw_samples[k].qv;
-                float phase_corr = -s.phase;
-                float re = iv * std::cos(phase_corr) - qv * std::sin(phase_corr);
-                float im = iv * std::sin(phase_corr) + qv * std::cos(phase_corr);
-                float z = std::atan2(im, re);
-
-                float S = s.P00 + r_meas;
-                float K0 = s.P00 / S;
-                float K1 = s.P01 / S;
-
-                s.phase += K0 * z;
-                s.freq  += K1 * z;
-
-                float new_P00 = s.P00 - K0 * s.P00;
-                float new_P01 = s.P01 - K0 * s.P01;
-                float new_P11 = s.P11 - K1 * s.P01;
-                s.P00 = new_P00;
-                s.P01 = new_P01;
-                s.P11 = new_P11;
-            }
-
-            bwd_state[k] = s;
-        }
-    }
-
-    // --- Pass 4: Combine forward and backward estimates (RTS smoother) ---
-    // Smoothed phase = weighted average by inverse covariance:
-    //   P_smooth = 1 / (1/P_fwd + 1/P_bwd)
-    //   x_smooth = P_smooth * (x_fwd/P_fwd + x_bwd/P_bwd)
-    // We only need the phase component (index 0).
+    // --- Pass 3: RTS (Rauch-Tung-Striebel) backward smoother ---
+    // Unlike the two-filter approach (which requires an independent backward
+    // Kalman filter with A^{-1} transition), the RTS smoother works directly
+    // from the forward pass results. It's numerically stable and correct.
+    //
+    // For each k from N-2 down to 0:
+    //   P_pred = A * P_fwd[k] * A' + Q       (one-step prediction covariance)
+    //   C = P_fwd[k] * A' * P_pred^{-1}      (smoother gain)
+    //   x_smooth[k] = x_fwd[k] + C * (x_smooth[k+1] - A * x_fwd[k])
+    //
+    // A = [[1,1],[0,1]]  (phase += freq, freq constant)
     std::vector<float> smoothed_phase(payload_symbols);
-    for (int k = 0; k < payload_symbols; k++) {
-        float pf = fwd_state[k].P00;
-        float pb = bwd_state[k].P00;
-        // Clamp to prevent division by zero
-        if (pf < 1e-10f) pf = 1e-10f;
-        if (pb < 1e-10f) pb = 1e-10f;
+    std::vector<float> smoothed_freq(payload_symbols);
+    {
+        // Last symbol: smoothed = forward (no future information)
+        smoothed_phase[payload_symbols-1] = fwd_state[payload_symbols-1].phase;
+        smoothed_freq[payload_symbols-1] = fwd_state[payload_symbols-1].freq;
 
-        float w_fwd = 1.0f / pf;
-        float w_bwd = 1.0f / pb;
-        float w_total = w_fwd + w_bwd;
+        for (int k = payload_symbols - 2; k >= 0; k--) {
+            float P00 = fwd_state[k].P00;
+            float P01 = fwd_state[k].P01;
+            float P11 = fwd_state[k].P11;
 
-        // Weighted average with phase unwrapping
-        float diff = bwd_state[k].phase - fwd_state[k].phase;
-        // Wrap difference to [-pi, pi]
-        while (diff > (float)M_PI)  diff -= 2.0f * (float)M_PI;
-        while (diff < -(float)M_PI) diff += 2.0f * (float)M_PI;
+            // Predicted covariance at k+1 from forward state at k
+            // P_pred = A * P * A' + Q
+            float pp00 = P00 + 2*P01 + P11 + q_phase;
+            float pp01 = P01 + P11;
+            float pp11 = P11 + q_freq;
 
-        smoothed_phase[k] = fwd_state[k].phase + (w_bwd / w_total) * diff;
+            // P_fwd[k] * A' = [[P00+P01, P01], [P01+P11, P11]]
+            float PA00 = P00 + P01, PA01 = P01;
+            float PA10 = P01 + P11, PA11 = P11;
+
+            // C = (P*A') * P_pred^{-1}  (2x2 matrix inverse)
+            float det = pp00 * pp11 - pp01 * pp01;
+            if (std::abs(det) < 1e-20f) det = 1e-20f;  // prevent division by zero
+            float inv_det = 1.0f / det;
+
+            float C00 = (PA00 * pp11 - PA01 * pp01) * inv_det;
+            float C01 = (-PA00 * pp01 + PA01 * pp00) * inv_det;
+            float C10 = (PA10 * pp11 - PA11 * pp01) * inv_det;
+            float C11 = (-PA10 * pp01 + PA11 * pp00) * inv_det;
+
+            // Innovation: x_smooth[k+1] - A * x_fwd[k]
+            // A * x_fwd[k] = [phase + freq, freq]
+            float pred_phase = fwd_state[k].phase + fwd_state[k].freq;
+            float pred_freq = fwd_state[k].freq;
+
+            float innov_phase = smoothed_phase[k+1] - pred_phase;
+            float innov_freq = smoothed_freq[k+1] - pred_freq;
+
+            // x_smooth[k] = x_fwd[k] + C * innovation
+            smoothed_phase[k] = fwd_state[k].phase + C00 * innov_phase + C01 * innov_freq;
+            smoothed_freq[k] = fwd_state[k].freq + C10 * innov_phase + C11 * innov_freq;
+        }
     }
 
     // --- Pass 5: Apply smoothed phase corrections, extract symbols ---
@@ -886,23 +867,24 @@ bool decode_native_frame(const float* iq_samples, size_t count,
         sym_reliability.push_back(raw_samples[k].mag);
     }
 
-    // Kalman smoother diagnostics
+    // Kalman RTS smoother diagnostics
     {
-        float phase_drift = smoothed_phase[payload_symbols-1] - smoothed_phase[0];
         float fwd_drift = fwd_state[payload_symbols-1].phase - fwd_state[0].phase;
-        float bwd_drift = bwd_state[0].phase - bwd_state[payload_symbols-1].phase;
-        IRIS_LOG("[KALMAN] payload %d syms: smoothed_drift=%.3f rad (%.1f deg), "
-                 "fwd_drift=%.3f rad, bwd_drift=%.3f rad, "
-                 "fwd_P00_final=%.6f, bwd_P00_final=%.6f",
-                 payload_symbols, phase_drift, phase_drift * 180.0f / (float)M_PI,
-                 fwd_drift, bwd_drift,
-                 fwd_state[payload_symbols-1].P00, bwd_state[0].P00);
-        // Log phase at key positions
+        float smooth_drift = smoothed_phase[payload_symbols-1] - smoothed_phase[0];
+        IRIS_LOG("[KALMAN] payload %d syms: fwd_drift=%.3f rad (%.1f deg), "
+                 "smoothed_drift=%.3f rad (%.1f deg), fwd_P00=%.6f",
+                 payload_symbols,
+                 fwd_drift, fwd_drift * 180.0f / (float)M_PI,
+                 smooth_drift, smooth_drift * 180.0f / (float)M_PI,
+                 fwd_state[payload_symbols-1].P00);
+        // Log smoothed phase at key positions
         char pbuf[512]; int pp = 0;
         pp += snprintf(pbuf+pp, sizeof(pbuf)-pp, "[KALMAN] phase@sym: ");
-        for (int k = 0; k < payload_symbols; k += payload_symbols/8) {
+        int step = std::max(1, payload_symbols / 8);
+        for (int k = 0; k < payload_symbols; k += step) {
             pp += snprintf(pbuf+pp, sizeof(pbuf)-pp, "%d:%.2f° ",
                           k, smoothed_phase[k] * 180.0f / (float)M_PI);
+            if (pp > 450) break;
         }
         pp += snprintf(pbuf+pp, sizeof(pbuf)-pp, "%d:%.2f°",
                       payload_symbols-1,
