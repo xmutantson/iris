@@ -719,57 +719,53 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     }
 
     // --- Kalman filter parameters ---
-    // Process noise: phase has random-walk component from FM discriminator
-    // jitter; frequency drifts from oscillator instability + de-emphasis.
-    // OTA data shows non-linear phase paths (S-curves, 90°+ excursion over
-    // 11K symbols).  Q_freq must be high enough to track frequency CHANGES,
-    // not just constant offsets.  1e-5 allows ~4 Hz/s frequency slew.
+    // 3-state model: [phase, freq, accel] tracks thermal frequency drift
+    // from FM transmitter PA heating.  The accel state captures frequency
+    // acceleration (quadratic phase) that the 2-state model cannot follow.
     float q_phase = 1e-4f;   // phase process noise variance (rad²/symbol)
     float q_freq  = 1e-5f;   // frequency process noise variance (rad²/symbol³)
-    // Measurement noise: pilot phase error variance at typical SNR (~8 dB)
-    float r_meas  = 0.10f;   // measurement noise variance (rad²)
-    // Decision-directed measurement noise (higher — hard decisions may be wrong)
+    float q_accel = 1e-7f;   // freq-rate process noise variance (rad²/symbol⁵)
+    float r_meas  = 0.10f;   // pilot measurement noise variance (rad²)
     float r_dd    = 0.25f;   // DD measurement noise variance (rad²)
 
     // --- Pass 2: Forward Kalman filter ---
-    // State: x = [phase, freq]  (phase in rad, freq in rad/symbol)
-    // Transition: x[k+1] = A * x[k] + w,  A = [[1,1],[0,1]]
-    // Measurement at pilots: z = H * x + v,  H = [1, 0]
+    // State: x = [phase, freq, accel]
+    // Transition: A = [[1,1,0.5],[0,1,1],[0,0,1]]
+    //   phase += freq + 0.5*accel,  freq += accel,  accel persists
+    // Measurement at pilots: z = H * x + v,  H = [1, 0, 0]
     struct KalmanState {
-        float phase;       // estimated phase (rad)
-        float freq;        // estimated frequency (rad/symbol)
-        float P00, P01, P11;  // covariance matrix (symmetric 2x2)
+        float phase, freq, accel;
+        float P00, P01, P02, P11, P12, P22;  // 3x3 symmetric covariance
     };
 
     std::vector<KalmanState> fwd_state(payload_symbols);
     {
-        // Initialize from header PLL output
         KalmanState s;
         s.phase = running_phase;
         s.freq = pll_freq;
-        // Initial covariance: moderate uncertainty
-        s.P00 = 0.01f;   // phase variance
-        s.P01 = 0.0f;
-        s.P11 = 1e-6f;   // freq variance
+        s.accel = 0.0f;
+        s.P00 = 0.01f;  s.P01 = 0.0f;  s.P02 = 0.0f;
+        s.P11 = 1e-6f;  s.P12 = 0.0f;
+        s.P22 = 1e-8f;
 
         for (int k = 0; k < payload_symbols; k++) {
-            // Predict: x_pred = A * x,  P_pred = A*P*A' + Q
+            // Predict: x = A*x,  P = A*P*A' + Q
+            // A = [[1,1,0.5],[0,1,1],[0,0,1]]
             if (k > 0) {
-                s.phase += s.freq;  // phase += freq * 1
-                // P_pred = A*P*A' + Q:
-                // [P00+2*P01+P11+q_phase, P01+P11]
-                // [P01+P11,               P11+q_freq]
-                float new_P00 = s.P00 + 2*s.P01 + s.P11 + q_phase;
-                float new_P01 = s.P01 + s.P11;
-                float new_P11 = s.P11 + q_freq;
-                s.P00 = new_P00;
-                s.P01 = new_P01;
-                s.P11 = new_P11;
+                s.phase += s.freq + 0.5f * s.accel;
+                s.freq  += s.accel;
+                float p00=s.P00, p01=s.P01, p02=s.P02;
+                float p11=s.P11, p12=s.P12, p22=s.P22;
+                s.P00 = p00 + 2*p01 + 1.5f*p02 + p11 + 1.5f*p12 + 0.25f*p22 + q_phase;
+                s.P01 = p01 + p02 + p11 + 1.5f*p12 + 0.5f*p22;
+                s.P02 = p02 + p12 + 0.5f*p22;
+                s.P11 = p11 + 2*p12 + p22 + q_freq;
+                s.P12 = p12 + p22;
+                s.P22 = p22 + q_accel;
             }
 
-            // Measurement update at pilot symbols
+            // Measurement update at pilot symbols (H = [1,0,0])
             if (raw_samples[k].is_pilot) {
-                // Measure phase error: pilot is known +1 BPSK
                 float iv = raw_samples[k].iv;
                 float qv = raw_samples[k].qv;
                 float phase_corr = -s.phase;
@@ -777,89 +773,85 @@ bool decode_native_frame(const float* iq_samples, size_t count,
                 float ss = std::sin(phase_corr);
                 float re = iv * cc - qv * ss;
                 float im = iv * ss + qv * cc;
-                float z = std::atan2(im, re);  // phase error (innovation)
+                float z = std::atan2(im, re);
 
-                // Update channel gain from pilot magnitude (use raw IQ magnitude)
                 float pmag = std::sqrt(iv * iv + qv * qv);
                 channel_gain = 0.85f * channel_gain + 0.15f * pmag;
 
-                // Kalman gain: K = P * H' * (H*P*H' + R)^-1
-                // H = [1, 0], so H*P*H' = P00
-                float S = s.P00 + r_meas;  // innovation covariance
-                float K0 = s.P00 / S;      // gain for phase
-                float K1 = s.P01 / S;      // gain for freq
-
-                // State update: x += K * z
+                float S = s.P00 + r_meas;
+                float K0 = s.P00 / S;
+                float K1 = s.P01 / S;
+                float K2 = s.P02 / S;
                 s.phase += K0 * z;
                 s.freq  += K1 * z;
-
-                // Covariance update: P = (I - K*H) * P
-                float new_P00 = s.P00 - K0 * s.P00;
-                float new_P01 = s.P01 - K0 * s.P01;
-                float new_P11 = s.P11 - K1 * s.P01;
-                s.P00 = new_P00;
-                s.P01 = new_P01;
-                s.P11 = new_P11;
+                s.accel += K2 * z;
+                float np00 = s.P00 - K0*s.P00;
+                float np01 = s.P01 - K0*s.P01;
+                float np02 = s.P02 - K0*s.P02;
+                float np11 = s.P11 - K1*s.P01;
+                float np12 = s.P12 - K1*s.P02;
+                float np22 = s.P22 - K2*s.P02;
+                s.P00=np00; s.P01=np01; s.P02=np02;
+                s.P11=np11; s.P12=np12; s.P22=np22;
             }
 
             fwd_state[k] = s;
         }
     }
 
-    // --- Pass 3: RTS (Rauch-Tung-Striebel) backward smoother ---
-    // Unlike the two-filter approach (which requires an independent backward
-    // Kalman filter with A^{-1} transition), the RTS smoother works directly
-    // from the forward pass results. It's numerically stable and correct.
-    //
-    // For each k from N-2 down to 0:
-    //   P_pred = A * P_fwd[k] * A' + Q       (one-step prediction covariance)
-    //   C = P_fwd[k] * A' * P_pred^{-1}      (smoother gain)
-    //   x_smooth[k] = x_fwd[k] + C * (x_smooth[k+1] - A * x_fwd[k])
-    //
-    // A = [[1,1],[0,1]]  (phase += freq, freq constant)
+    // --- Pass 3: RTS backward smoother (3-state) ---
+    // C = P_fwd[k] * A' * (A * P_fwd[k] * A' + Q)^{-1}
+    // x_smooth[k] = x_fwd[k] + C * (x_smooth[k+1] - A * x_fwd[k])
+    // A = [[1,1,0.5],[0,1,1],[0,0,1]]
     std::vector<float> smoothed_phase(payload_symbols);
     std::vector<float> smoothed_freq(payload_symbols);
+    std::vector<float> smoothed_accel(payload_symbols);
     {
-        // Last symbol: smoothed = forward (no future information)
         smoothed_phase[payload_symbols-1] = fwd_state[payload_symbols-1].phase;
         smoothed_freq[payload_symbols-1] = fwd_state[payload_symbols-1].freq;
+        smoothed_accel[payload_symbols-1] = fwd_state[payload_symbols-1].accel;
 
         for (int k = payload_symbols - 2; k >= 0; k--) {
-            float P00 = fwd_state[k].P00;
-            float P01 = fwd_state[k].P01;
-            float P11 = fwd_state[k].P11;
+            float p00=fwd_state[k].P00, p01=fwd_state[k].P01, p02=fwd_state[k].P02;
+            float p11=fwd_state[k].P11, p12=fwd_state[k].P12, p22=fwd_state[k].P22;
 
-            // Predicted covariance at k+1 from forward state at k
-            // P_pred = A * P * A' + Q
-            float pp00 = P00 + 2*P01 + P11 + q_phase;
-            float pp01 = P01 + P11;
-            float pp11 = P11 + q_freq;
+            // P_pred = A*P*A' + Q
+            float pp00 = p00 + 2*p01 + 1.5f*p02 + p11 + 1.5f*p12 + 0.25f*p22 + q_phase;
+            float pp01 = p01 + p02 + p11 + 1.5f*p12 + 0.5f*p22;
+            float pp02 = p02 + p12 + 0.5f*p22;
+            float pp11 = p11 + 2*p12 + p22 + q_freq;
+            float pp12 = p12 + p22;
+            float pp22 = p22 + q_accel;
 
-            // P_fwd[k] * A' = [[P00+P01, P01], [P01+P11, P11]]
-            float PA00 = P00 + P01, PA01 = P01;
-            float PA10 = P01 + P11, PA11 = P11;
+            // PA = P * A'  (A' = [[1,0,0],[1,1,0],[0.5,1,1]])
+            float pa00=p00+p01+0.5f*p02, pa01=p01+p02,         pa02=p02;
+            float pa10=p01+p11+0.5f*p12, pa11=p11+p12,         pa12=p12;
+            float pa20=p02+p12+0.5f*p22, pa21=p12+p22,         pa22=p22;
 
-            // C = (P*A') * P_pred^{-1}  (2x2 matrix inverse)
-            float det = pp00 * pp11 - pp01 * pp01;
-            if (std::abs(det) < 1e-20f) det = 1e-20f;  // prevent division by zero
-            float inv_det = 1.0f / det;
+            // inv(P_pred) via cofactors (symmetric 3x3)
+            float det = pp00*(pp11*pp22 - pp12*pp12)
+                      - pp01*(pp01*pp22 - pp02*pp12)
+                      + pp02*(pp01*pp12 - pp02*pp11);
+            if (std::abs(det) < 1e-30f) det = 1e-30f;
+            float id = 1.0f / det;
+            float i00=(pp11*pp22-pp12*pp12)*id, i01=(pp02*pp12-pp01*pp22)*id, i02=(pp01*pp12-pp02*pp11)*id;
+            float i11=(pp00*pp22-pp02*pp02)*id, i12=(pp01*pp02-pp00*pp12)*id;
+            float i22=(pp00*pp11-pp01*pp01)*id;
 
-            float C00 = (PA00 * pp11 - PA01 * pp01) * inv_det;
-            float C01 = (-PA00 * pp01 + PA01 * pp00) * inv_det;
-            float C10 = (PA10 * pp11 - PA11 * pp01) * inv_det;
-            float C11 = (-PA10 * pp01 + PA11 * pp00) * inv_det;
+            // C = PA * inv(P_pred)  (3x3)
+            float c00=pa00*i00+pa01*i01+pa02*i02, c01=pa00*i01+pa01*i11+pa02*i12, c02=pa00*i02+pa01*i12+pa02*i22;
+            float c10=pa10*i00+pa11*i01+pa12*i02, c11=pa10*i01+pa11*i11+pa12*i12, c12=pa10*i02+pa11*i12+pa12*i22;
+            float c20=pa20*i00+pa21*i01+pa22*i02, c21=pa20*i01+pa21*i11+pa22*i12, c22=pa20*i02+pa21*i12+pa22*i22;
 
             // Innovation: x_smooth[k+1] - A * x_fwd[k]
-            // A * x_fwd[k] = [phase + freq, freq]
-            float pred_phase = fwd_state[k].phase + fwd_state[k].freq;
-            float pred_freq = fwd_state[k].freq;
+            float fp=fwd_state[k].phase, ff=fwd_state[k].freq, fa=fwd_state[k].accel;
+            float dp = smoothed_phase[k+1] - (fp + ff + 0.5f*fa);
+            float df = smoothed_freq[k+1]  - (ff + fa);
+            float da = smoothed_accel[k+1] - fa;
 
-            float innov_phase = smoothed_phase[k+1] - pred_phase;
-            float innov_freq = smoothed_freq[k+1] - pred_freq;
-
-            // x_smooth[k] = x_fwd[k] + C * innovation
-            smoothed_phase[k] = fwd_state[k].phase + C00 * innov_phase + C01 * innov_freq;
-            smoothed_freq[k] = fwd_state[k].freq + C10 * innov_phase + C11 * innov_freq;
+            smoothed_phase[k] = fp + c00*dp + c01*df + c02*da;
+            smoothed_freq[k]  = ff + c10*dp + c11*df + c12*da;
+            smoothed_accel[k] = fa + c20*dp + c21*df + c22*da;
         }
     }
 
@@ -916,76 +908,100 @@ bool decode_native_frame(const float* iq_samples, size_t count,
             }
         }
 
-        // Step 2: Forward Kalman with DD measurements at every symbol
+        // Step 2: Forward Kalman with DD measurements (3-state)
         std::vector<KalmanState> dd_fwd(payload_symbols);
         {
             KalmanState s;
             s.phase = smoothed_phase[0];
             s.freq = smoothed_freq[0];
-            s.P00 = 0.01f;
-            s.P01 = 0.0f;
-            s.P11 = 1e-6f;
+            s.accel = smoothed_accel[0];
+            s.P00 = 0.01f;  s.P01 = 0.0f;  s.P02 = 0.0f;
+            s.P11 = 1e-6f;  s.P12 = 0.0f;
+            s.P22 = 1e-8f;
 
             for (int k = 0; k < payload_symbols; k++) {
                 if (k > 0) {
-                    s.phase += s.freq;
-                    float new_P00 = s.P00 + 2*s.P01 + s.P11 + q_phase;
-                    float new_P01 = s.P01 + s.P11;
-                    float new_P11 = s.P11 + q_freq;
-                    s.P00 = new_P00;
-                    s.P01 = new_P01;
-                    s.P11 = new_P11;
+                    s.phase += s.freq + 0.5f * s.accel;
+                    s.freq  += s.accel;
+                    float p00=s.P00, p01=s.P01, p02=s.P02;
+                    float p11=s.P11, p12=s.P12, p22=s.P22;
+                    s.P00 = p00 + 2*p01 + 1.5f*p02 + p11 + 1.5f*p12 + 0.25f*p22 + q_phase;
+                    s.P01 = p01 + p02 + p11 + 1.5f*p12 + 0.5f*p22;
+                    s.P02 = p02 + p12 + 0.5f*p22;
+                    s.P11 = p11 + 2*p12 + p22 + q_freq;
+                    s.P12 = p12 + p22;
+                    s.P22 = p22 + q_accel;
                 }
 
                 if (dd_valid[k]) {
                     float r = raw_samples[k].is_pilot ? r_meas : r_dd;
-                    // Innovation: difference between measured phase and predicted
                     float z = dd_phase_meas[k] - s.phase;
-                    // Wrap to [-pi, pi]
                     while (z > (float)M_PI) z -= 2*(float)M_PI;
                     while (z < -(float)M_PI) z += 2*(float)M_PI;
 
                     float S = s.P00 + r;
                     float K0 = s.P00 / S;
                     float K1 = s.P01 / S;
+                    float K2 = s.P02 / S;
                     s.phase += K0 * z;
                     s.freq  += K1 * z;
-                    s.P00 -= K0 * s.P00;
-                    s.P01 -= K0 * s.P01;
-                    s.P11 -= K1 * s.P01;
+                    s.accel += K2 * z;
+                    float np00 = s.P00 - K0*s.P00;
+                    float np01 = s.P01 - K0*s.P01;
+                    float np02 = s.P02 - K0*s.P02;
+                    float np11 = s.P11 - K1*s.P01;
+                    float np12 = s.P12 - K1*s.P02;
+                    float np22 = s.P22 - K2*s.P02;
+                    s.P00=np00; s.P01=np01; s.P02=np02;
+                    s.P11=np11; s.P12=np12; s.P22=np22;
                 }
 
                 dd_fwd[k] = s;
             }
         }
 
-        // Step 3: RTS smoother on DD forward pass
+        // Step 3: RTS smoother on DD forward pass (3-state)
         {
             smoothed_phase[payload_symbols-1] = dd_fwd[payload_symbols-1].phase;
             smoothed_freq[payload_symbols-1] = dd_fwd[payload_symbols-1].freq;
+            smoothed_accel[payload_symbols-1] = dd_fwd[payload_symbols-1].accel;
 
             for (int k = payload_symbols - 2; k >= 0; k--) {
-                float P00 = dd_fwd[k].P00;
-                float P01 = dd_fwd[k].P01;
-                float P11 = dd_fwd[k].P11;
-                float pp00 = P00 + 2*P01 + P11 + q_phase;
-                float pp01 = P01 + P11;
-                float pp11 = P11 + q_freq;
-                float PA00 = P00 + P01, PA01 = P01;
-                float PA10 = P01 + P11, PA11 = P11;
-                float det = pp00 * pp11 - pp01 * pp01;
-                if (std::abs(det) < 1e-20f) det = 1e-20f;
-                float inv_det = 1.0f / det;
-                float C00 = (PA00 * pp11 - PA01 * pp01) * inv_det;
-                float C01 = (-PA00 * pp01 + PA01 * pp00) * inv_det;
-                float C10 = (PA10 * pp11 - PA11 * pp01) * inv_det;
-                float C11 = (-PA10 * pp01 + PA11 * pp00) * inv_det;
-                float pred_phase = dd_fwd[k].phase + dd_fwd[k].freq;
-                float pred_freq = dd_fwd[k].freq;
-                float innov_phase = smoothed_phase[k+1] - pred_phase;
-                float innov_freq = smoothed_freq[k+1] - pred_freq;
-                smoothed_phase[k] = dd_fwd[k].phase + C00 * innov_phase + C01 * innov_freq;
-                smoothed_freq[k] = dd_fwd[k].freq + C10 * innov_phase + C11 * innov_freq;
+                float p00=dd_fwd[k].P00, p01=dd_fwd[k].P01, p02=dd_fwd[k].P02;
+                float p11=dd_fwd[k].P11, p12=dd_fwd[k].P12, p22=dd_fwd[k].P22;
+
+                float pp00 = p00 + 2*p01 + 1.5f*p02 + p11 + 1.5f*p12 + 0.25f*p22 + q_phase;
+                float pp01 = p01 + p02 + p11 + 1.5f*p12 + 0.5f*p22;
+                float pp02 = p02 + p12 + 0.5f*p22;
+                float pp11 = p11 + 2*p12 + p22 + q_freq;
+                float pp12 = p12 + p22;
+                float pp22 = p22 + q_accel;
+
+                float pa00=p00+p01+0.5f*p02, pa01=p01+p02,         pa02=p02;
+                float pa10=p01+p11+0.5f*p12, pa11=p11+p12,         pa12=p12;
+                float pa20=p02+p12+0.5f*p22, pa21=p12+p22,         pa22=p22;
+
+                float det = pp00*(pp11*pp22 - pp12*pp12)
+                          - pp01*(pp01*pp22 - pp02*pp12)
+                          + pp02*(pp01*pp12 - pp02*pp11);
+                if (std::abs(det) < 1e-30f) det = 1e-30f;
+                float id = 1.0f / det;
+                float i00=(pp11*pp22-pp12*pp12)*id, i01=(pp02*pp12-pp01*pp22)*id, i02=(pp01*pp12-pp02*pp11)*id;
+                float i11=(pp00*pp22-pp02*pp02)*id, i12=(pp01*pp02-pp00*pp12)*id;
+                float i22=(pp00*pp11-pp01*pp01)*id;
+
+                float c00=pa00*i00+pa01*i01+pa02*i02, c01=pa00*i01+pa01*i11+pa02*i12, c02=pa00*i02+pa01*i12+pa02*i22;
+                float c10=pa10*i00+pa11*i01+pa12*i02, c11=pa10*i01+pa11*i11+pa12*i12, c12=pa10*i02+pa11*i12+pa12*i22;
+                float c20=pa20*i00+pa21*i01+pa22*i02, c21=pa20*i01+pa21*i11+pa22*i12, c22=pa20*i02+pa21*i12+pa22*i22;
+
+                float fp=dd_fwd[k].phase, ff=dd_fwd[k].freq, fa=dd_fwd[k].accel;
+                float dp = smoothed_phase[k+1] - (fp + ff + 0.5f*fa);
+                float df = smoothed_freq[k+1]  - (ff + fa);
+                float da = smoothed_accel[k+1] - fa;
+
+                smoothed_phase[k] = fp + c00*dp + c01*df + c02*da;
+                smoothed_freq[k]  = ff + c10*dp + c11*df + c12*da;
+                smoothed_accel[k] = fa + c20*dp + c21*df + c22*da;
             }
         }
     }
