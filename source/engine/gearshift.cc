@@ -53,7 +53,11 @@ int Gearshift::update(float snr_db) {
 
     // Decrement cooldown on each update (each successfully decoded frame)
     if (cooldown_ > 0) cooldown_--;
-    fail_count_ = 0;  // Reset consecutive failure count on successful decode
+    // Drain fail_count_ gradually: one success cancels one failure.
+    // This allows alternating pass/fail patterns (marginal channel) to
+    // accumulate and eventually trigger downshift, instead of the old
+    // behavior where any success instantly reset fail_count_ to 0.
+    if (fail_count_ > 0) fail_count_--;
 
     if (target > current_level_ && cooldown_ == 0) {
         // Upshift: hold for stability (suppressed during cooldown)

@@ -1078,21 +1078,23 @@ void Ax25Session::tick() {
                     t1_ = t1_with_jitter();
                 }
             } else if (state_ == Ax25SessionState::CONNECTED) {
-                if (kiss_managed_) {
-                    // KISS client handles its own polling — don't send RR
+                if (kiss_managed_ && !native_active_) {
+                    // Pure KISS passthrough: client handles its own polling
                     t1_ = t1_with_jitter();
                     IRIS_LOG("AX25 T1 (KISS-managed) — skipping poll in CONNECTED (%d/%d)", retry_count_, N2);
                 } else {
-                    // Enter Timer Recovery (State 4)
-                    IRIS_LOG("AX25 T1 timeout -> TIMER_RECOVERY, poll (%d/%d)",
-                             retry_count_, N2);
+                    // Enter Timer Recovery: send RR poll to probe the peer.
+                    // In OFDM-KISS native mode, we MUST poll — the session layer
+                    // is the actual transport, and 30s+ silences kill throughput.
+                    IRIS_LOG("AX25 T1 timeout -> TIMER_RECOVERY, poll (%d/%d)%s",
+                             retry_count_, N2, native_active_ ? " [native]" : "");
                     send_rr(true, true);  // Command with P=1
                     t1_ = t1_with_jitter();
                     t3_ = 0;  // Stop T3 — T1 now supervises the link (AX.25 2.2 §6.4.4)
                     set_state(Ax25SessionState::TIMER_RECOVERY);
                 }
             } else if (state_ == Ax25SessionState::TIMER_RECOVERY) {
-                if (kiss_managed_) {
+                if (kiss_managed_ && !native_active_) {
                     t1_ = t1_with_jitter();
                     IRIS_LOG("AX25 T1 (KISS-managed) — skipping re-poll in TIMER_RECOVERY (%d/%d)", retry_count_, N2);
                 } else {

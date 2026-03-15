@@ -225,13 +225,14 @@ std::vector<float> build_native_frame(const uint8_t* payload, size_t len,
     // QAM16+ always needs pilots.  BPSK/QPSK need them on long frames (>256 symbols)
     // where the decision-directed PLL drifts without known reference points.
     // OTA testing showed 2400-symbol QPSK frames losing phase lock at the tail.
-    bool use_pilots = (PILOT_SPACING > 0) &&
+    int ps = pilot_spacing_for((int)config.modulation);
+    bool use_pilots = (ps > 0) &&
         (config.modulation >= Modulation::QAM16 || (int)payload_symbols.size() > 256);
     if (use_pilots) {
         std::vector<std::complex<float>> with_pilots;
-        with_pilots.reserve(payload_symbols.size() + payload_symbols.size() / PILOT_SPACING + 1);
+        with_pilots.reserve(payload_symbols.size() + payload_symbols.size() / ps + 1);
         for (size_t i = 0; i < payload_symbols.size(); i++) {
-            if (i > 0 && (i % PILOT_SPACING) == 0)
+            if (i > 0 && (i % ps) == 0)
                 with_pilots.push_back({1.0f, 0.0f});  // Known +1 pilot
             with_pilots.push_back(payload_symbols[i]);
         }
@@ -601,9 +602,10 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     int data_symbols = padded_bits / bps;
 
     // Account for mid-frame pilots (must match TX insertion logic)
-    bool use_pilots = (PILOT_SPACING > 0) &&
+    int ps = pilot_spacing_for((int)mod);
+    bool use_pilots = (ps > 0) &&
         (mod >= Modulation::QAM16 || data_symbols > 256);
-    int n_pilots = use_pilots ? ((data_symbols > 0) ? ((data_symbols - 1) / PILOT_SPACING) : 0) : 0;
+    int n_pilots = use_pilots ? ((data_symbols > 0) ? ((data_symbols - 1) / ps) : 0) : 0;
     int payload_symbols = data_symbols + n_pilots;
 
     // Pre-check: verify buffer has enough data for ALL payload symbols
@@ -685,11 +687,11 @@ bool decode_native_frame(const float* iq_samples, size_t count,
         float im = iv * ss + qv * cc;
 
         // Check if this position is a pilot symbol.
-        // TX inserts a pilot BEFORE every PILOT_SPACING-th data symbol:
-        //   for (i=0..N) { if (i>0 && i%32==0) insert_pilot; push data[i]; }
-        // RX mirrors: after PILOT_SPACING data symbols, expect one pilot.
+        // TX inserts a pilot BEFORE every ps-th data symbol:
+        //   for (i=0..N) { if (i>0 && i%ps==0) insert_pilot; push data[i]; }
+        // RX mirrors: after ps data symbols, expect one pilot.
         bool is_pilot = false;
-        if (use_pilots && since_pilot == PILOT_SPACING) {
+        if (use_pilots && since_pilot == ps) {
             is_pilot = true;
         }
 
@@ -699,10 +701,11 @@ bool decode_native_frame(const float* iq_samples, size_t count,
             running_phase += payload_pll_alpha * 2.0f * phase_err;
             pll_freq += payload_pll_beta * 2.0f * phase_err;
             // Update channel gain from pilot magnitude.
-            // Aggressive tracking (0.5/0.5) to follow signal fade during
-            // long frames — OTA logs showed gain dropping 4:1 across 1600 symbols.
+            // Smooth tracking to avoid noise-induced gain oscillations.
+            // With pilots every 16 symbols at QAM16, we get frequent updates
+            // so we can afford to smooth more aggressively.
             float pilot_mag = std::sqrt(re * re + im * im);
-            channel_gain = 0.5f * channel_gain + 0.5f * pilot_mag;
+            channel_gain = 0.85f * channel_gain + 0.15f * pilot_mag;
             since_pilot = 0;  // reset counter after pilot consumed
         } else {
             symbols.push_back({re, im});
@@ -710,15 +713,23 @@ bool decode_native_frame(const float* iq_samples, size_t count,
             data_sym_count++;
             since_pilot++;
 
-            // Decision-directed PLL: demap to nearest constellation point
-            uint8_t dec_bits[8];
-            demap_symbol({re, im}, dec_bits, mod);
-            auto decided = map_symbol(dec_bits, mod);
-            float phase_err = std::atan2(
-                im * decided.real() - re * decided.imag(),
-                re * decided.real() + im * decided.imag());
-            running_phase += payload_pll_alpha * phase_err;
-            pll_freq += payload_pll_beta * phase_err;
+            // Decision-directed PLL for BPSK/QPSK (low symbol error rate).
+            // For QAM16+, skip DD updates — at ~8 dB SNR, the ~10% SER causes
+            // positive-feedback cycle-slips between pilots. With pilots every
+            // 16 symbols, pilot-only tracking is sufficient.
+            if (mod < Modulation::QAM16) {
+                uint8_t dec_bits[8];
+                demap_symbol({re, im}, dec_bits, mod);
+                auto decided = map_symbol(dec_bits, mod);
+                float phase_err = std::atan2(
+                    im * decided.real() - re * decided.imag(),
+                    re * decided.real() + im * decided.imag());
+                running_phase += payload_pll_alpha * phase_err;
+                pll_freq += payload_pll_beta * phase_err;
+            }
+            // QAM16+: phase tracks only on pilots (every 16 symbols).
+            // This eliminates DD cycle-slip at the cost of slower tracking,
+            // which is acceptable with the denser pilot grid.
         }
         running_phase += pll_freq;  // Advance phase by current frequency estimate
     }
@@ -743,8 +754,19 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     std::vector<uint8_t> bits;
 
     if (fec != LdpcRate::NONE) {
-        // Soft-decision path: LLR values give LDPC much more information
-        auto llrs = demap_soft(symbols, mod);
+        // Soft-decision path: LLR values give LDPC much more information.
+        // Noise-variance-scaled LLRs (sigma_sq) only for QAM16+ where the
+        // proper max-log-MAP scaling is critical for constellation geometry.
+        // For BPSK/QPSK, the fixed scaling works well with the min-sum decoder
+        // (0.75 scaling factor). Applying sigma_sq to BPSK/QPSK makes LLRs
+        // ~4x larger at typical SNR, causing over-confident wrong-sign LLRs
+        // that the min-sum decoder can't overcome.
+        float sigma_sq = 0;
+        if (mod >= Modulation::QAM16 && g_decode_snr > 0 && g_decode_snr < 50.0f) {
+            float snr_lin = std::pow(10.0f, g_decode_snr / 10.0f);
+            sigma_sq = 1.0f / snr_lin;
+        }
+        auto llrs = demap_soft(symbols, mod, sigma_sq);
 
         // Reliability weighting: scale each symbol's LLRs by its received magnitude.
         // Symbols with low magnitude (attenuated by VB-Cable, radio echo, fading)

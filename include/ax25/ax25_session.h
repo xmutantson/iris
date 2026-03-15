@@ -83,6 +83,10 @@ public:
     bool is_active() const { return state_ != Ax25SessionState::DISCONNECTED; }
     bool we_initiated() const { return we_initiated_; }
     bool is_kiss_managed() const { return kiss_managed_; }
+    // Native mode flag: when true, T1 polls are NOT suppressed even in
+    // KISS-managed mode. In OFDM-KISS native mode, the session layer is
+    // the actual transport and must actively poll on timeout.
+    void set_native_active(bool v) { native_active_ = v; }
     void set_kiss_passthrough(bool v) { kiss_passthrough_ = v; }
     bool is_kiss_passthrough() const { return kiss_passthrough_; }
     int retry_count() const { return retry_count_; }
@@ -178,6 +182,7 @@ private:
     bool srej_enabled_ = false;         // SREJ supported (negotiated via XID)
     uint8_t last_received_ctrl_ = 0;    // For FRMR info field
     bool kiss_managed_ = false;          // Session initiated by KISS client (don't generate SABM/DISC retries)
+    bool native_active_ = false;          // OFDM-KISS native mode: enable T1 polls even in KISS mode
     bool we_initiated_ = false;          // We sent SABM (true) vs received SABM (false)
     bool kiss_passthrough_ = false;      // KISS client active — don't accept incoming connections
     // Channel busy: pause T1/T3 while DCD or PTT active (Direwolf pattern).

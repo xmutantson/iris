@@ -31,7 +31,10 @@ std::vector<std::complex<float>> map_bits(const std::vector<uint8_t>& bits, Modu
 std::vector<uint8_t> demap_bits(const std::vector<std::complex<float>>& symbols, Modulation mod);
 
 // Soft demap: produce LLR values (positive = likely 0, negative = likely 1)
-std::vector<float> demap_soft(const std::vector<std::complex<float>>& symbols, Modulation mod);
+// sigma_sq: noise variance per dimension (from preamble SNR estimate).
+// 0 = use fixed normalization (legacy behavior).
+std::vector<float> demap_soft(const std::vector<std::complex<float>>& symbols, Modulation mod,
+                              float sigma_sq = 0.0f);
 
 } // namespace iris
 

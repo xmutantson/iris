@@ -409,7 +409,18 @@ bool Modem::init(const IrisConfig& config) {
         // This is safe: the window is short (~1s) and AX.25 retry handles drops.
         std::lock_guard<std::mutex> lock(tx_mutex_);
         if (ofdm_kiss_tx_) {
-            tx_queue_.push(std::vector<uint8_t>(data, data + len));
+            std::vector<uint8_t> frame(data, data + len);
+            // Peer SNR feedback: append our RX SNR to S-frames (RR/REJ/RNR)
+            // so the peer can cap its TX speed to what we can actually decode.
+            // Encoding: 1 byte, SNR * 4 (0.25 dB steps), 0 = no data.
+            // Only appended on native PHY — old peers or AFSK ignore extra bytes.
+            if (len == 15 && (data[14] & 0x03) == 0x01) {  // S-frame (15 bytes, ctrl bit 0 = 1)
+                uint8_t snr_byte = 0;
+                if (snr_db_ > 0)
+                    snr_byte = (uint8_t)std::min(255.0f, std::max(1.0f, snr_db_ * 4.0f));
+                frame.push_back(snr_byte);
+            }
+            tx_queue_.push(std::move(frame));
         } else {
             ax25_tx_queue_.push(std::vector<uint8_t>(data, data + len));
             // Buffer I-frame info fields during AFSK phase for B2F replay.
@@ -796,12 +807,32 @@ void Modem::dispatch_rx_frame(const std::vector<uint8_t>& frame, bool from_fx25,
                 batch_airtime_s_ = std::min(batch_airtime_s_ + 1.0f, BATCH_AIRTIME_MAX);
                 if (batch_airtime_s_ != prev)
                     IRIS_LOG("Batch airtime: %.0fs -> %.0fs (RR ACK)", prev, batch_airtime_s_);
+                tx_no_ack_count_ = 0;  // peer acknowledged
             } else if (stype == Ax25SType::REJ || stype == Ax25SType::RNR) {
                 float prev = batch_airtime_s_;
                 batch_airtime_s_ = std::max(batch_airtime_s_ / 2.0f, BATCH_AIRTIME_MIN);
                 if (batch_airtime_s_ != prev)
                     IRIS_LOG("Batch airtime: %.0fs -> %.0fs (%s)", prev, batch_airtime_s_,
                              stype == Ax25SType::REJ ? "REJ" : "RNR");
+                // REJ/RNR = peer couldn't decode our frame. Downshift TX speed.
+                // On asymmetric links, local RX SNR doesn't predict peer's RX SNR.
+                // Treating peer REJ as a decode failure drives gearshift down so we
+                // TX at a rate the peer can actually receive.
+                tx_no_ack_count_ = 0;  // peer responded (even if negative)
+                gearshift_.report_failure();
+                IRIS_LOG("Gearshift: peer %s -> report_failure (level=%d)",
+                         stype == Ax25SType::REJ ? "REJ" : "RNR",
+                         gearshift_.current_level());
+            }
+            // Peer SNR feedback: extract appended SNR byte from native S-frames.
+            // Standard S-frame is 15 bytes. If 16+ bytes, byte 15 is quantized
+            // peer RX SNR (0.25 dB steps). This tells us what the peer measures
+            // from our signal — use it to cap TX speed on asymmetric links.
+            if (from_ofdm && frame.size() >= 16 && frame[15] > 0) {
+                float reported_snr = frame[15] / 4.0f;
+                peer_snr_db_ = reported_snr;
+                IRIS_LOG("Peer SNR feedback: %.1f dB (from %s)", reported_snr,
+                         stype == Ax25SType::RR ? "RR" : "REJ/RNR");
             }
         }
     }
@@ -878,10 +909,14 @@ void Modem::dispatch_rx_frame(const std::vector<uint8_t>& frame, bool from_fx25,
                     probe_manual_ = false;
                     ofdm_kiss_probing_ = true;
                     ofdm_kiss_probe_done_ = false;
-                    // Start listening immediately — initiator sends tones ~3s
-                    // after PROBE:START.  12s window catches them with margin
-                    // even with probe-after-connect delay.
-                    probe_.start_responder(config_.sample_rate, 12.0f);
+                    // Responder capture window: must be long enough to catch
+                    // initiator's ~2.25s probe tones (which arrive ~3-5s after
+                    // PROBE:START), but short enough to reply while the initiator
+                    // is still listening (initiator has 25s capture).
+                    // 15s: catches tones arriving at t+3..5 with margin,
+                    // finishes by t+15, sends reply by t+18 — well within
+                    // initiator's 25s window.
+                    probe_.start_responder(config_.sample_rate, 15.0f);
                 }
                 is_probe = true;
             }
@@ -1122,6 +1157,7 @@ void Modem::process_rx_native(const float* audio, int count) {
                     if (!ofdm_kiss_tx_) {
                         // Responder: heard first native frame from initiator → promote TX
                         ofdm_kiss_tx_ = true;
+                        ax25_session_.set_native_active(true);
                         IRIS_LOG("OFDM-KISS: TX promoted to native (responder)");
                         if (gui_log_) gui_log_("OFDM-KISS: native TX active (responder)");
                         // Migrate accumulated I-frames from AFSK to native queue
@@ -1645,6 +1681,28 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                     tx_fec_d = 2;
                     IRIS_LOG("TX native hail frame %zu bytes (BPSK r1/2)", frame_data.size());
                 } else {
+                    // TX-without-ACK guard: if we've sent 3+ native frames with
+                    // no peer ACK/REJ, the peer likely can't decode at this speed.
+                    // Downshift before sending the next frame.
+                    tx_no_ack_count_++;
+                    if (tx_no_ack_count_ >= 3 && level > 0) {
+                        gearshift_.report_failure();
+                        level = gearshift_.current_level();
+                        IRIS_LOG("Gearshift: no peer ACK for %d TX frames -> report_failure (level=%d)",
+                                 tx_no_ack_count_, level);
+                    }
+                    // Peer SNR cap: if the peer reported its RX SNR (from our signal),
+                    // don't TX at a speed level the peer can't decode.
+                    // This handles asymmetric links where our RX SNR is high but
+                    // the peer's RX SNR is lower (different TX power, antennas, etc).
+                    if (peer_snr_db_ > 0 && level > 0) {
+                        int peer_max = snr_to_speed_level(peer_snr_db_);
+                        if (peer_max < level) {
+                            IRIS_LOG("Gearshift: capping TX level %d -> %d (peer SNR %.1f dB)",
+                                     level, peer_max, peer_snr_db_);
+                            level = peer_max;
+                        }
+                    }
                     tx_mod = SPEED_LEVELS[level].modulation;
                     tx_fec_n = SPEED_LEVELS[level].fec_rate_num;
                     tx_fec_d = SPEED_LEVELS[level].fec_rate_den;
@@ -2307,6 +2365,7 @@ void Modem::tick() {
             peer_is_iris_ = true;
             ofdm_kiss_ = true;
             ofdm_kiss_tx_ = true;
+            ax25_session_.set_native_active(true);  // Enable T1 polls in native mode
             IRIS_LOG("OFDM-KISS: native mode active (probe-first)");
             if (gui_log_) gui_log_("OFDM-KISS: native mode active");
 

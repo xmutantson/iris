@@ -249,6 +249,11 @@ private:
     AGC agc_;
     float snr_db_ = 0;
 
+    // Peer SNR feedback: what the remote side measures from our TX signal.
+    // Used to cap TX speed on asymmetric links where local RX SNR ≠ peer RX SNR.
+    // -1 = no peer SNR report received yet.
+    float peer_snr_db_ = -1.0f;
+
     // ARQ session (native Iris protocol)
     ArqSession arq_;
 
@@ -346,6 +351,11 @@ private:
     float batch_airtime_s_ = 3.0f;               // Current batch cap (seconds)
     static constexpr float BATCH_AIRTIME_MIN = 3.0f;
     static constexpr float BATCH_AIRTIME_MAX = 9.0f;
+
+    // TX-without-ACK counter: tracks consecutive native TX frames with no RR/REJ.
+    // If we TX 3+ frames without any peer acknowledgment, downshift — the peer
+    // likely can't decode us (asymmetric link or interference).
+    int tx_no_ack_count_ = 0;
 
     // OFDM-KISS transport-layer compression
     uint16_t ofdm_kiss_peer_caps_ = 0;         // Negotiated caps (intersection of local & peer)

@@ -145,23 +145,32 @@ std::vector<uint8_t> demap_bits(const std::vector<std::complex<float>>& symbols,
 }
 
 // Soft demap: produce LLR values (positive = likely 0, negative = likely 1)
-// Approximate LLR for each bit based on distance from decision boundary
-std::vector<float> demap_soft(const std::vector<std::complex<float>>& symbols, Modulation mod) {
+// sigma_sq: noise variance per dimension. When provided, LLR = (d1-d0)/sigma_sq
+// which is the correct max-log-MAP expression. Without it, a fixed normalization
+// is used which produces over-confident LLRs at low SNR.
+std::vector<float> demap_soft(const std::vector<std::complex<float>>& symbols, Modulation mod,
+                              float sigma_sq) {
     int bps = bits_per_symbol(mod);
     std::vector<float> llrs;
     llrs.reserve(symbols.size() * bps);
 
     for (const auto& sym : symbols) {
+        // LLR scaling: if sigma_sq is provided, LLR = (d1-d0)/sigma_sq
+        // which is the correct max-log-MAP. Without sigma_sq, use fixed
+        // normalization (works at design SNR but over-confident at low SNR).
         switch (mod) {
-            case Modulation::BPSK:
-                // bit 0: +1 = 0, -1 = 1. LLR = 2*re (scaled)
-                llrs.push_back(2.0f * sym.real());
+            case Modulation::BPSK: {
+                // bit 0: +1 = 0, -1 = 1. LLR = 2*re/sigma_sq
+                float scale = (sigma_sq > 0) ? (2.0f / sigma_sq) : 2.0f;
+                llrs.push_back(scale * sym.real());
                 break;
+            }
 
             case Modulation::QPSK: {
-                // bit 0 from I: +norm=0, -norm=1. LLR proportional to re
-                // bit 1 from Q: +norm=0, -norm=1. LLR proportional to im
-                float scale = 2.0f * std::sqrt(2.0f);  // 2/sigma normalized
+                // bit 0 from I, bit 1 from Q. Distance between ±1/√2 = √2.
+                // Exact LLR = 2 * coord * √2 / sigma_sq
+                float norm = std::sqrt(2.0f);
+                float scale = (sigma_sq > 0) ? (2.0f * norm / sigma_sq) : (2.0f * norm);
                 llrs.push_back(scale * sym.real());
                 llrs.push_back(scale * sym.imag());
                 break;
@@ -186,6 +195,10 @@ std::vector<float> demap_soft(const std::vector<std::complex<float>>& symbols, M
                 float i_val = sym.real() * norm;
                 float q_val = sym.imag() * norm;
 
+                // LLR denominator: sigma_sq scaled to integer grid, or fixed norm
+                // On the integer grid, noise variance = sigma_sq * norm^2
+                float denom = (sigma_sq > 0) ? (sigma_sq * norm * norm) : (norm * norm / (float)order);
+
                 // For each axis, compute approximate LLR for each Gray-coded bit
                 // by finding min distance to constellation points with bit=0 vs bit=1
                 // Q-axis first (low bits), then I-axis (high bits)
@@ -204,11 +217,8 @@ std::vector<float> demap_soft(const std::vector<std::complex<float>>& symbols, M
                             else
                                 min_d0 = std::min(min_d0, dist_sq);
                         }
-                        // LLR = (min_d1 - min_d0) — positive means closer to 0
-                        float llr = (min_d1 - min_d0) / (norm * norm / (float)order);
-                        // Bits are packed: I-axis bits first (high), then Q-axis bits (low)
-                        // map_symbol packs as: val = i_gray << nbits_axis | q_gray
-                        // bits[i] = (val >> i) & 1, so bit 0 is LSB of q_gray
+                        // LLR = (min_d1 - min_d0) / denom — positive means closer to 0
+                        float llr = (min_d1 - min_d0) / denom;
                         llrs.push_back(llr);
                     }
                 }

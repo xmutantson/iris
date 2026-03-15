@@ -2,9 +2,9 @@
 """
 Iris FM Data Modem -- FM Channel Simulator Benchmark.
 
-Simulates a realistic VHF FM link using --bandpass, --deemphasis, and --noise
-flags. Uses AGW protocol to establish a proper connected-mode session, which
-triggers the full probe → EQ → gearshift → native PHY pipeline.
+Runs TWO iris instances on VB-Cable to create a proper bidirectional link.
+Simulates realistic VHF FM conditions using --bandpass, --deemphasis, and --noise.
+The full pipeline runs naturally: AFSK connect → probe → EQ → gearshift → native PHY.
 
 Replicates OTA conditions observed on the KG7VSN <-> W7WEK 146.5 MHz link:
   - Passband: 300-3200 Hz (typical FM narrowband radio)
@@ -12,68 +12,51 @@ Replicates OTA conditions observed on the KG7VSN <-> W7WEK 146.5 MHz link:
   - SNR: variable (test parameter)
 
 Usage:
-  python fm_channel_benchmark.py                      # Default: 60s, no noise
-  python fm_channel_benchmark.py --noise 0.01          # Add AWGN
+  python fm_channel_benchmark.py                      # Default: 60s, mild noise
+  python fm_channel_benchmark.py --noise 0.01          # More noise
   python fm_channel_benchmark.py --bandpass 300-3000   # Custom bandpass
   python fm_channel_benchmark.py --duration 120        # Longer test
   python fm_channel_benchmark.py --no-deemphasis       # Skip de-emphasis
+  python fm_channel_benchmark.py --no-bandpass --no-deemphasis  # Clean baseline
 """
-import subprocess, socket, time, sys, os, argparse, re, struct
+import subprocess, socket, time, sys, os, argparse, re, struct, json
 from datetime import datetime
 
 IRIS = os.path.join(os.path.dirname(__file__), "..", "build", "iris.exe")
 if not os.path.isfile(IRIS):
     IRIS = r"C:\Program Files\Iris\iris.exe"
 
-# AGW/PE protocol constants
+# AGW protocol
 AGW_HEADER_SIZE = 36
-AGW_VERSION    = ord('R')
-AGW_PORT_INFO  = ord('G')
-AGW_REGISTER   = ord('X')
-AGW_CONNECT    = ord('C')
-AGW_DATA       = ord('D')
-AGW_DISCONNECT = ord('d')
-AGW_OUTSTANDING = ord('Y')
 
 
 def agw_build_header(kind, call_from="", call_to="", data_len=0):
-    """Build a 36-byte AGW header."""
     hdr = bytearray(36)
-    hdr[0] = 0        # port
-    hdr[4] = kind      # data_kind
-    hdr[6] = 0xF0      # pid
-    # call_from: bytes 8-17 (10 bytes, null-padded)
+    hdr[0] = 0
+    hdr[4] = kind
+    hdr[6] = 0xF0
     cf = call_from.encode('ascii')[:9]
     hdr[8:8+len(cf)] = cf
-    # call_to: bytes 18-27 (10 bytes, null-padded)
     ct = call_to.encode('ascii')[:9]
     hdr[18:18+len(ct)] = ct
-    # data_len: bytes 28-31 (uint32 LE)
     struct.pack_into('<I', hdr, 28, data_len)
     return bytes(hdr)
 
 
 def agw_parse_header(data):
-    """Parse a 36-byte AGW header. Returns dict."""
     if len(data) < 36:
         return None
-    kind = data[4]
-    call_from = data[8:18].split(b'\x00')[0].decode('ascii', errors='replace').strip()
-    call_to = data[18:28].split(b'\x00')[0].decode('ascii', errors='replace').strip()
-    data_len = struct.unpack_from('<I', data, 28)[0]
     return {
-        'kind': kind,
-        'kind_char': chr(kind) if 32 <= kind < 127 else '?',
-        'call_from': call_from,
-        'call_to': call_to,
-        'data_len': data_len,
+        'kind': data[4],
+        'kind_char': chr(data[4]) if 32 <= data[4] < 127 else '?',
+        'call_from': data[8:18].split(b'\x00')[0].decode('ascii', errors='replace').strip(),
+        'call_to': data[18:28].split(b'\x00')[0].decode('ascii', errors='replace').strip(),
+        'data_len': struct.unpack_from('<I', data, 28)[0],
     }
 
 
 def agw_recv_frame(sock, timeout=30):
-    """Receive one complete AGW frame. Returns (header_dict, data_bytes) or None."""
     sock.settimeout(timeout)
-    # Read 36-byte header
     hdr_buf = b""
     while len(hdr_buf) < 36:
         try:
@@ -86,7 +69,6 @@ def agw_recv_frame(sock, timeout=30):
     hdr = agw_parse_header(hdr_buf)
     if hdr is None:
         return None
-    # Read data payload
     data = b""
     remaining = hdr['data_len']
     while len(data) < remaining:
@@ -100,6 +82,34 @@ def agw_recv_frame(sock, timeout=30):
     return hdr, data
 
 
+def find_vb_cable(iris_path):
+    """Auto-detect VB-Cable device IDs."""
+    try:
+        result = subprocess.run([iris_path, "--list-audio"],
+                                capture_output=True, text=True, timeout=10)
+        output = result.stdout + result.stderr
+    except Exception as e:
+        print(f"  Failed to list audio devices: {e}")
+        return None, None
+
+    capture_id = None
+    playback_id = None
+    for line in output.splitlines():
+        # Look for "CABLE Output" (capture) and "CABLE Input" (playback)
+        # Prefer plain "CABLE" over "CABLE-A", "CABLE-B", etc.
+        m = re.match(r'\s*\[(\d+)\]\s+CABLE Output \(VB-Audio', line)
+        if m:
+            capture_id = int(m.group(1))
+        m = re.match(r'\s*\[(\d+)\]\s+CABLE Input \(VB-Audio', line)
+        if m:
+            playback_id = int(m.group(1))
+
+    if capture_id is None or playback_id is None:
+        print("  VB-Cable not found. Available devices:")
+        print(output)
+    return capture_id, playback_id
+
+
 def parse_log(log_path):
     """Parse iris log for gearshift events, probe results, decode stats."""
     info = {
@@ -111,7 +121,6 @@ def parse_log(log_path):
         'probe_baud': 0,
         'rx_eq_range': 0,
         'tx_eq_range': 0,
-        'crc_errors': 0,
         'decode_failures': 0,
         'frames_decoded': 0,
         'ldpc_iters_avg': 0,
@@ -128,7 +137,6 @@ def parse_log(log_path):
 
     with open(log_path, errors='replace') as f:
         for line in f:
-            # Gearshift events
             m = re.search(r'gearshift: (\d+)->(\d+)', line)
             if m:
                 old, new = int(m.group(1)), int(m.group(2))
@@ -138,7 +146,6 @@ def parse_log(log_path):
                     info['peak_level'] = new
                     info['peak_level_name'] = f'A{new}'
 
-            # Probe results
             m = re.search(r'Probe.*band ([\d.]+)-([\d.]+) Hz \(([\d.]+) Hz BW\)', line)
             if m:
                 info['probe_bandwidth'] = float(m.group(3))
@@ -151,7 +158,6 @@ def parse_log(log_path):
             if m:
                 info['probe_baud'] = int(m.group(1))
 
-            # EQ
             m = re.search(r'\[CH-EQ\] Configured.*EQ range ([\d.]+) dB', line)
             if m:
                 val = float(m.group(1))
@@ -160,36 +166,27 @@ def parse_log(log_path):
                 else:
                     info['tx_eq_range'] = val
 
-            # LDPC iterations
             m = re.search(r'ldpc_iters=(\d+)', line)
             if m:
                 ldpc_iters_total += int(m.group(1))
                 ldpc_iters_count += 1
 
-            # Decode failures
             if 'decode FAIL' in line:
                 info['decode_failures'] += 1
 
-            # Native frames decoded
             if 'RX native frame' in line and 'DISCARDED' not in line:
                 info['frames_decoded'] += 1
 
-            # Native mode activated
-            if 'OFDM-KISS' in line and 'activated' in line.lower():
-                info['native_activated'] = True
-            if 'native=1' in line:
+            if 'OFDM-KISS' in line and ('native mode active' in line.lower() or 'activat' in line.lower()):
                 info['native_activated'] = True
 
-            # Connection established
             m = re.search(r'\[([\d.]+)\].*CONNECTED', line)
             if m and info['connection_time'] == 0:
                 info['connection_time'] = float(m.group(1))
 
-            # Compression
             if 'decompress:' in line or 'compress:' in line:
                 info['compression_events'] += 1
 
-            # NACK
             if 'AX25 TX REJ' in line:
                 info['nack_events'] += 1
 
@@ -199,230 +196,314 @@ def parse_log(log_path):
     return info
 
 
-def run_benchmark(iris_path, duration, bandpass, deemph_us, noise, payload_size, extra_args):
-    """Run the FM channel simulator benchmark using AGW protocol."""
-    # Kill any existing iris
+def run_benchmark(iris_path, duration, bandpass, deemph_us, noise, payload_size,
+                  capture_id, playback_id, extra_args):
+    """Run two iris instances on VB-Cable and measure throughput."""
     os.system("taskkill /F /IM iris.exe 2>nul >nul")
     time.sleep(3)
 
-    log_file = os.path.abspath("iris_fm_bench.log")
-    if os.path.isfile(log_file):
-        try: os.remove(log_file)
-        except: pass
+    log_a = os.path.abspath("iris_fm_bench_A.log")
+    log_b = os.path.abspath("iris_fm_bench_B.log")
+    for f in [log_a, log_b]:
+        if os.path.isfile(f):
+            try: os.remove(f)
+            except: pass
 
-    callsign = "BENCH"
-
-    cmd = [
-        iris_path, "--loopback", "--nogui",
-        "--callsign", callsign,
-        "--mode", "A",
-        "--log", log_file,
-        "--ptt-pre", "50",     # Simulate ~50ms radio keying delay
+    # Common args for both instances
+    common = [
+        "--nogui", "--mode", "A",
+        "--capture", str(capture_id),
+        "--playback", str(playback_id),
+        "--ptt-pre", "50",
         "--ptt-post", "50",
     ]
-
     if bandpass:
-        cmd += ["--bandpass", bandpass]
+        common += ["--bandpass", bandpass]
     if deemph_us > 0:
-        cmd += ["--deemphasis", str(deemph_us)]
+        common += ["--deemphasis", str(deemph_us)]
     if noise > 0:
-        cmd += ["--noise", str(noise)]
-    cmd += extra_args
+        common += ["--noise", str(noise)]
+    common += extra_args
 
-    print(f"  Command: {' '.join(cmd)}")
-    proc = subprocess.Popen(cmd, creationflags=subprocess.CREATE_NEW_CONSOLE)
+    # Instance A: ALPHA (AGW 8010, KISS 8011)
+    cmd_a = [iris_path] + common + [
+        "--callsign", "ALPHA",
+        "--agw-port", "8010",
+        "--kiss-port", "8011",
+        "--log", log_a,
+    ]
 
-    # Wait for AGW port
-    sock = None
+    # Instance B: BRAVO (AGW 8020, KISS 8021)
+    cmd_b = [iris_path] + common + [
+        "--callsign", "BRAVO",
+        "--agw-port", "8020",
+        "--kiss-port", "8021",
+        "--log", log_b,
+    ]
+
+    print(f"  Instance A: {' '.join(cmd_a)}")
+    print(f"  Instance B: {' '.join(cmd_b)}")
+
+    proc_a = subprocess.Popen(cmd_a, creationflags=subprocess.CREATE_NEW_CONSOLE)
+    time.sleep(1)
+    proc_b = subprocess.Popen(cmd_b, creationflags=subprocess.CREATE_NEW_CONSOLE)
+
+    # Connect to AGW on both instances
+    sock_a = None
+    sock_b = None
     for attempt in range(15):
         time.sleep(1)
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(3)
-            s.connect(("127.0.0.1", 8000))
-            sock = s
-            break
+            if sock_a is None:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(3)
+                s.connect(("127.0.0.1", 8010))
+                sock_a = s
+            if sock_b is None:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(3)
+                s.connect(("127.0.0.1", 8020))
+                sock_b = s
+            if sock_a and sock_b:
+                break
         except Exception:
-            s.close()
-    if sock is None:
+            pass
+    if sock_a is None or sock_b is None:
         print("  AGW connect failed")
-        proc.terminate()
+        proc_a.terminate()
+        proc_b.terminate()
         return None
 
-    print("  AGW connected")
+    print("  AGW connected to both instances")
 
-    # Register callsign
-    hdr = agw_build_header(AGW_REGISTER, call_from=callsign)
-    sock.sendall(hdr)
-    resp = agw_recv_frame(sock, timeout=5)
-    if resp:
-        print(f"  Registered callsign: {callsign}")
+    # Register callsigns
+    sock_a.sendall(agw_build_header(ord('X'), call_from="ALPHA"))
+    agw_recv_frame(sock_a, timeout=5)
+    sock_b.sendall(agw_build_header(ord('X'), call_from="BRAVO"))
+    agw_recv_frame(sock_b, timeout=5)
+    print(f"  Registered ALPHA + BRAVO")
 
-    # Initiate connection (BENCH -> BENCH, loopback self-connect)
-    print(f"  Connecting {callsign} -> {callsign} (loopback)...")
-    hdr = agw_build_header(AGW_CONNECT, call_from=callsign, call_to=callsign)
-    sock.sendall(hdr)
+    # Connect ALPHA -> BRAVO
+    print(f"  Connecting ALPHA -> BRAVO...")
+    sock_a.sendall(agw_build_header(ord('C'), call_from="ALPHA", call_to="BRAVO"))
 
-    # Wait for CONNECTED notification
+    # Wait for CONNECTED on both sides
     connect_start = time.time()
-    connected = False
-    while time.time() - connect_start < 60:
-        resp = agw_recv_frame(sock, timeout=2)
-        if resp is None:
-            continue
-        hdr_info, data = resp
-        kind = hdr_info['kind_char']
-        if kind == 'C' and data:
-            msg = data.decode('ascii', errors='replace')
-            if 'CONNECTED' in msg:
-                connected = True
-                print(f"  CONNECTED ({time.time() - connect_start:.1f}s)")
-                break
-        elif kind == 'd':
-            print(f"  Connection REJECTED")
+    connected_a = False
+    connected_b = False
+    while time.time() - connect_start < 90:
+        if not connected_a:
+            resp = agw_recv_frame(sock_a, timeout=1)
+            if resp:
+                hdr_info, data = resp
+                if hdr_info['kind_char'] == 'C' and data and b'CONNECTED' in data:
+                    connected_a = True
+                    print(f"  ALPHA CONNECTED ({time.time() - connect_start:.1f}s)")
+        if not connected_b:
+            resp = agw_recv_frame(sock_b, timeout=1)
+            if resp:
+                hdr_info, data = resp
+                if hdr_info['kind_char'] == 'C' and data and b'CONNECTED' in data:
+                    connected_b = True
+                    print(f"  BRAVO CONNECTED ({time.time() - connect_start:.1f}s)")
+        if connected_a and connected_b:
             break
+        if not connected_a and not connected_b:
+            # Check for rejection
+            pass
 
-    if not connected:
-        print(f"  Connection failed (timeout after {time.time() - connect_start:.1f}s)")
-        sock.close()
-        proc.terminate()
+    if not connected_a:
+        print(f"  Connection failed (ALPHA timeout)")
+        sock_a.close()
+        sock_b.close()
+        proc_a.terminate()
+        proc_b.terminate()
         return None
+    # BRAVO might not get AGW notification — that's OK, modem still accepts
+    if not connected_b:
+        print(f"  (BRAVO AGW notification not received, continuing)")
 
-    # Wait for probe + EQ + gearshift to settle
-    # The modem does probe -> EQ -> native mode activation automatically
-    # after connection is established. Give it time to complete.
-    print(f"  Waiting for probe + native mode activation...")
+    # Wait for probe + native mode
+    print(f"  Waiting for probe + native mode...")
     settle_start = time.time()
-    # Drain any incoming frames during settle period
-    while time.time() - settle_start < 30:
-        resp = agw_recv_frame(sock, timeout=1)
-        # Check log periodically for native mode activation
-        if time.time() - settle_start > 5:
-            log_info = parse_log(log_file)
-            if log_info['native_activated'] or log_info['probe_tones'] > 0:
-                # Give a bit more time for gearshift to start
-                time.sleep(3)
+    native_active = False
+    while time.time() - settle_start < 90:
+        # Drain any AGW frames from both sockets
+        try:
+            agw_recv_frame(sock_a, timeout=0.5)
+        except: pass
+        try:
+            agw_recv_frame(sock_b, timeout=0.5)
+        except: pass
+        # Check logs for native mode activation
+        if time.time() - settle_start > 15:
+            log_a_info = parse_log(log_a)
+            log_b_info = parse_log(log_b)
+            if log_a_info['native_activated'] or log_b_info['native_activated']:
+                native_active = True
+                # Give gearshift time to settle
+                time.sleep(5)
                 break
 
-    log_info = parse_log(log_file)
-    if log_info['native_activated']:
-        print(f"  Native mode ACTIVE (probe: {log_info['probe_tones']} tones, "
-              f"BW {log_info['probe_bandwidth']:.0f} Hz, baud {log_info['probe_baud']})")
+    # Re-parse logs after settle
+    log_a_info = parse_log(log_a)
+    log_b_info = parse_log(log_b)
+    probe_info = log_a_info if log_a_info['probe_tones'] > 0 else log_b_info
+
+    if native_active:
+        print(f"  Native mode ACTIVE (probe: {probe_info['probe_tones']} tones, "
+              f"BW {probe_info['probe_bandwidth']:.0f} Hz, baud {probe_info['probe_baud']})")
     else:
-        print(f"  Native mode not activated (running on AFSK)")
+        print(f"  Native mode not activated after {time.time() - settle_start:.0f}s (running on AFSK)")
 
     # Build test payload
     test_data = bytes([(i * 37 + 17) & 0xFF for i in range(payload_size)])
 
     print(f"  Running {duration}s measurement...")
 
-    # Measurement phase: send data via AGW 'D' frames, receive via AGW 'D' frames
-    tx_count = 0
-    rx_bytes = 0
-    rx_frames = 0
+    # Measurement phase: bidirectional data flow
+    # Send ALPHA>BRAVO via sock_a, BRAVO→ALPHA via sock_b
+    # Receive at both ends. This ensures both sides get enough frames for gearshift.
+    tx_count_ab = 0  # ALPHA>BRAVO
+    tx_count_ba = 0  # BRAVO→ALPHA
+    rx_bytes_b = 0   # Received at BRAVO
+    rx_frames_b = 0
+    rx_bytes_a = 0   # Received at ALPHA
+    rx_frames_a = 0
 
     start = time.time()
     last_report = start
-    sock.settimeout(0.01)
+    sock_a.settimeout(0.05)
+    sock_b.settimeout(0.05)
 
-    while time.time() - start < duration:
-        elapsed = time.time() - start
-
-        # Send data frames to keep pipeline full
-        ahead = tx_count - rx_frames
-        to_send = max(0, min(20 - ahead, 5))
-        for _ in range(to_send):
-            try:
-                frame_hdr = agw_build_header(AGW_DATA, call_from=callsign,
-                                              call_to=callsign, data_len=len(test_data))
-                sock.sendall(frame_hdr + test_data)
-                tx_count += 1
-            except:
-                break
-
-        # Receive data frames
-        for _ in range(20):
-            try:
-                # Try to read header
-                hdr_buf = sock.recv(36)
-                if not hdr_buf or len(hdr_buf) < 36:
-                    # Partial header — save for later
-                    break
-                hdr_info = agw_parse_header(hdr_buf)
-                if hdr_info is None:
-                    break
-                # Read data
-                data = b""
-                remaining = hdr_info['data_len']
-                sock.settimeout(1)
-                while len(data) < remaining:
-                    chunk = sock.recv(remaining - len(data))
-                    if not chunk:
-                        break
-                    data += chunk
-                sock.settimeout(0.01)
-
-                if hdr_info['kind_char'] == 'D':
-                    rx_frames += 1
-                    rx_bytes += len(data)
-            except socket.timeout:
-                break
-            except:
-                break
-
-        # Progress report every 15s
-        if time.time() - last_report >= 15:
-            bps_so_far = rx_bytes * 8 / elapsed if elapsed > 0 else 0
-            print(f"  [{elapsed:.0f}s] {rx_frames} frames, {rx_bytes} bytes, "
-                  f"{bps_so_far:.0f} bps")
-            last_report = time.time()
-
-    measure_elapsed = time.time() - start
-
-    # Drain in-flight frames
-    drain_timeout = min(30, duration / 2)
-    drain_end = time.time() + drain_timeout
-    sock.settimeout(0.5)
-    while time.time() < drain_end and tx_count > rx_frames:
+    def try_recv_agw(sock):
+        """Try to receive one AGW 'D' frame. Returns data length or 0."""
         try:
-            hdr_buf = sock.recv(36)
-            if not hdr_buf or len(hdr_buf) < 36:
-                continue
+            hdr_buf = b""
+            sock.settimeout(0.05)
+            while len(hdr_buf) < 36:
+                chunk = sock.recv(36 - len(hdr_buf))
+                if not chunk:
+                    return 0, False
+                hdr_buf += chunk
+            if len(hdr_buf) < 36:
+                return 0, False
             hdr_info = agw_parse_header(hdr_buf)
-            if hdr_info is None:
-                continue
+            if not hdr_info:
+                return 0, False
             data = b""
             remaining = hdr_info['data_len']
+            sock.settimeout(2)
             while len(data) < remaining:
                 chunk = sock.recv(remaining - len(data))
                 if not chunk:
                     break
                 data += chunk
-            if hdr_info['kind_char'] == 'D':
-                rx_frames += 1
-                rx_bytes += len(data)
+            return len(data), hdr_info['kind_char'] == 'D'
         except socket.timeout:
-            continue
+            return 0, False
         except:
-            break
+            return 0, False
+
+    while time.time() - start < duration:
+        elapsed = time.time() - start
+
+        # Send data ALPHA → BRAVO
+        ahead_ab = tx_count_ab - rx_frames_b
+        to_send = max(0, min(10 - ahead_ab, 3))
+        for _ in range(to_send):
+            try:
+                frame_hdr = agw_build_header(ord('D'), call_from="ALPHA",
+                                              call_to="BRAVO", data_len=len(test_data))
+                sock_a.sendall(frame_hdr + test_data)
+                tx_count_ab += 1
+            except: break
+
+        # Send data BRAVO → ALPHA
+        ahead_ba = tx_count_ba - rx_frames_a
+        to_send = max(0, min(10 - ahead_ba, 3))
+        for _ in range(to_send):
+            try:
+                frame_hdr = agw_build_header(ord('D'), call_from="BRAVO",
+                                              call_to="ALPHA", data_len=len(test_data))
+                sock_b.sendall(frame_hdr + test_data)
+                tx_count_ba += 1
+            except: break
+
+        # Receive at BRAVO (data from ALPHA)
+        dlen, is_data = try_recv_agw(sock_b)
+        if is_data and dlen > 0:
+            rx_frames_b += 1
+            rx_bytes_b += dlen
+
+        # Receive at ALPHA (data from BRAVO)
+        dlen, is_data = try_recv_agw(sock_a)
+        if is_data and dlen > 0:
+            rx_frames_a += 1
+            rx_bytes_a += dlen
+
+        # Progress report every 15s
+        total_rx_bytes = rx_bytes_a + rx_bytes_b
+        total_rx_frames = rx_frames_a + rx_frames_b
+        if time.time() - last_report >= 15:
+            bps_so_far = total_rx_bytes * 8 / elapsed if elapsed > 0 else 0
+            print(f"  [{elapsed:.0f}s] {total_rx_frames} frames, {total_rx_bytes} bytes, "
+                  f"{bps_so_far:.0f} bps  (A>B:{rx_frames_b} B>A:{rx_frames_a})")
+            last_report = time.time()
+
+    measure_elapsed = time.time() - start
+    rx_bytes = rx_bytes_a + rx_bytes_b
+    rx_frames = rx_frames_a + rx_frames_b
+    tx_count = tx_count_ab + tx_count_ba
+
+    # Drain in-flight from both sides
+    drain_end = time.time() + min(30, duration / 2)
+    while time.time() < drain_end and (tx_count_ab > rx_frames_b or tx_count_ba > rx_frames_a):
+        dlen, is_data = try_recv_agw(sock_b)
+        if is_data and dlen > 0:
+            rx_frames_b += 1
+            rx_bytes_b += dlen
+            rx_frames += 1
+            rx_bytes += dlen
+        dlen, is_data = try_recv_agw(sock_a)
+        if is_data and dlen > 0:
+            rx_frames_a += 1
+            rx_bytes_a += dlen
+            rx_frames += 1
+            rx_bytes += dlen
 
     # Disconnect
     try:
-        hdr = agw_build_header(AGW_DISCONNECT, call_from=callsign, call_to=callsign)
-        sock.sendall(hdr)
+        sock_a.sendall(agw_build_header(ord('d'), call_from="ALPHA", call_to="BRAVO"))
         time.sleep(1)
     except:
         pass
 
-    sock.close()
-    proc.terminate()
-    try:
-        proc.wait(timeout=5)
-    except:
-        proc.kill()
+    sock_a.close()
+    sock_b.close()
 
-    # Parse log for detailed stats
-    log_info = parse_log(log_file)
+    # Parse final logs
+    log_a_final = parse_log(log_a)
+    log_b_final = parse_log(log_b)
+
+    proc_a.terminate()
+    proc_b.terminate()
+    for p in [proc_a, proc_b]:
+        try: p.wait(timeout=5)
+        except: p.kill()
+
+    # Merge results from both logs
+    merged = {}
+    for key in log_a_final:
+        va, vb = log_a_final[key], log_b_final[key]
+        if key == 'gearshift_events':
+            merged[key] = va if va else vb
+        elif key == 'native_activated':
+            merged[key] = va or vb
+        elif isinstance(va, (int, float)):
+            merged[key] = max(va, vb)
+        else:
+            merged[key] = va if va else vb
 
     bps = rx_bytes * 8 / measure_elapsed if measure_elapsed > 0 else 0
 
@@ -432,22 +513,22 @@ def run_benchmark(iris_path, duration, bandpass, deemph_us, noise, payload_size,
         'tx_frames': tx_count,
         'duration': measure_elapsed,
         'throughput_bps': bps,
-        **log_info,
+        **merged,
     }
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Iris FM Channel Simulator Benchmark",
+        description="Iris FM Channel Simulator Benchmark (two-instance VB-Cable)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   %(prog)s                                    # Default FM channel (300-3200 Hz, 75us de-emphasis)
-  %(prog)s --noise 0.005                      # Add mild noise
+  %(prog)s --noise 0.005                      # Mild noise
   %(prog)s --noise 0.01                       # Moderate noise (like real VHF)
   %(prog)s --bandpass 500-2700 --noise 0.01   # Narrow radio + noise
   %(prog)s --no-deemphasis                    # Flat channel (no de-emphasis)
-  %(prog)s --no-bandpass --no-deemphasis      # Clean loopback (baseline)
+  %(prog)s --no-bandpass --no-deemphasis      # Clean VB-Cable (baseline)
         """)
     parser.add_argument("--iris", default=IRIS, help="Path to iris.exe")
     parser.add_argument("--duration", type=int, default=60,
@@ -462,15 +543,35 @@ Examples:
                        help="De-emphasis time constant in us (default: 75)")
     parser.add_argument("--no-deemphasis", action="store_true",
                        help="Disable de-emphasis filter")
-    parser.add_argument("--noise", type=float, default=0.0,
-                       help="AWGN noise amplitude (0 = none)")
+    parser.add_argument("--noise", type=float, default=0.005,
+                       help="AWGN noise amplitude (default: 0.005)")
     parser.add_argument("--tx-level", type=float, default=None)
+    parser.add_argument("--capture", type=int, default=None,
+                       help="Audio capture device ID (auto-detect VB-Cable)")
+    parser.add_argument("--playback", type=int, default=None,
+                       help="Audio playback device ID (auto-detect VB-Cable)")
     args = parser.parse_args()
 
     iris_path = os.path.abspath(args.iris)
     if not os.path.isfile(iris_path):
         print(f"[ERROR] Not found: {iris_path}")
         return 1
+
+    # Auto-detect VB-Cable if not specified
+    capture_id = args.capture
+    playback_id = args.playback
+    if capture_id is None or playback_id is None:
+        print("  Auto-detecting VB-Cable...")
+        c, p = find_vb_cable(iris_path)
+        if c is None or p is None:
+            print("[ERROR] VB-Cable not found. Use --capture and --playback to specify device IDs.")
+            print(f"  Run: {iris_path} --list-audio")
+            return 1
+        if capture_id is None:
+            capture_id = c
+        if playback_id is None:
+            playback_id = p
+        print(f"  VB-Cable: capture={capture_id}, playback={playback_id}")
 
     bandpass = None if args.no_bandpass else args.bandpass
     deemph_us = 0 if args.no_deemphasis else args.deemphasis
@@ -487,18 +588,19 @@ Examples:
     if args.noise > 0:
         channel_desc.append(f"noise {args.noise}")
     if not channel_desc:
-        channel_desc.append("clean loopback")
+        channel_desc.append("clean VB-Cable")
 
     print("=" * 70)
     print(f"  Iris FM Data Modem -- FM Channel Simulator Benchmark")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  Channel: {', '.join(channel_desc)}")
     print(f"  Duration: {args.duration}s, payload: {args.payload} bytes")
+    print(f"  Audio: capture={capture_id}, playback={playback_id}")
     print("=" * 70)
 
     result = run_benchmark(
         iris_path, args.duration, bandpass, deemph_us,
-        args.noise, args.payload, extra
+        args.noise, args.payload, capture_id, playback_id, extra
     )
 
     if result is None:

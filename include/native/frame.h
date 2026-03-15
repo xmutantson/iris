@@ -24,7 +24,18 @@ uint32_t crc32(const uint8_t* data, size_t len);
 // Mid-frame pilot spacing (symbols between pilots, 0 = disabled)
 // Pilots are known +1 BPSK symbols inserted after constellation mapping.
 // Active for 16QAM and above where phase drift is critical.
-constexpr int PILOT_SPACING = 32;  // 1 pilot every 32 data symbols
+// QAM16+ uses tighter spacing (16) for better phase/gain tracking;
+// BPSK/QPSK uses wider spacing (32) when pilots are needed (long frames).
+constexpr int PILOT_SPACING_QAM = 16;   // QAM16 and above: 1 pilot every 16 symbols (~6% overhead)
+constexpr int PILOT_SPACING_LOW = 32;   // BPSK/QPSK long frames: 1 pilot every 32 symbols
+
+// Returns the pilot spacing for the given modulation
+inline int pilot_spacing_for(int mod_int) {
+    return (mod_int >= 2) ? PILOT_SPACING_QAM : PILOT_SPACING_LOW;  // mod>=2 is QAM16+
+}
+
+// Legacy constant for backward reference
+constexpr int PILOT_SPACING = 16;  // default (tightest)
 
 // Preamble m-sequence (length 63, LFSR polynomial x^6+x+1)
 std::vector<std::complex<float>> generate_preamble();
