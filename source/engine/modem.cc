@@ -923,10 +923,11 @@ void Modem::dispatch_rx_frame(const std::vector<uint8_t>& frame, bool from_fx25,
                     // initiator's ~2.25s probe tones (which arrive ~3-5s after
                     // PROBE:START), but short enough to reply while the initiator
                     // is still listening (initiator has 12s capture).
-                    // 6s: catches tones arriving at t+3..5 with margin,
-                    // finishes by t+6, sends reply by t+9 — well within
-                    // initiator's 12s window.
-                    probe_.start_responder(config_.sample_rate, 6.0f);
+                    // Tones arrive ~5-7s after PROBE:START (countdown + PROBE:START
+                    // TX + PTT delays). 10s window catches tones with margin,
+                    // finishes by t+10, sends reply by t+13 — within initiator's
+                    // 12s capture (which starts after tones, not after PROBE:START).
+                    probe_.start_responder(config_.sample_rate, 10.0f);
                 }
                 is_probe = true;
             }
