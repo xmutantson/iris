@@ -54,6 +54,13 @@ inline int pilot_spacing_for(int mod_int) {
 // Legacy constant for backward reference
 constexpr int PILOT_SPACING = 16;  // default (tightest)
 
+// Tail pilots: known +1 BPSK symbols appended after the last data symbol.
+// These give the RTS backward smoother measurement data at the frame tail,
+// fixing the asymmetry where smoothed[N-1] == forward[N-1] (no future data).
+// Without these, forward Kalman drift at the tail propagates uncorrected,
+// causing the last LDPC block to fail on long frames (8000+ symbols).
+constexpr int N_TAIL_PILOTS = 4;
+
 // Preamble m-sequence (length 63, LFSR polynomial x^6+x+1)
 std::vector<std::complex<float>> generate_preamble();
 

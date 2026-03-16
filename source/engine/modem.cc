@@ -608,10 +608,10 @@ void Modem::ptt_off() {
         // desynchronizes after any collision.
         if (!loopback_mode_ && ax25_session_.is_active()) {
             static thread_local std::minstd_rand rng(std::random_device{}());
-            int jitter = rng() % (config_.sample_rate / 2);  // 0-500ms random
+            int jitter = rng() % (config_.sample_rate / 4);  // 0-250ms random
             int base = ax25_session_.we_initiated()
-                ? config_.sample_rate * 3 / 2      // initiator: 1.5s base (yield to response)
-                : config_.sample_rate;             // responder: 1.0s base (respond sooner)
+                ? config_.sample_rate              // initiator: 1.0s base (yield to response)
+                : config_.sample_rate * 3 / 4;    // responder: 0.75s base (respond sooner)
             csma_holdoff_ = std::max(csma_holdoff_.load(), base + jitter);
         }
 
@@ -778,10 +778,11 @@ void Modem::dispatch_rx_frame(const std::vector<uint8_t>& frame, bool from_fx25,
         if (ax25_session_.is_active()) {
             if (native_data && !ax25_session_.we_initiated()) {
                 // Responder receiving native I-frame: burst holdoff
-                rx_holdoff = config_.sample_rate * 3 / 2;  // 1500ms
+                // Self-hear guard (300ms) + FM turnaround (~200ms) + margin
+                rx_holdoff = config_.sample_rate * 4 / 5;  // 800ms
             } else {
                 rx_holdoff = ax25_session_.we_initiated()
-                    ? config_.sample_rate * 6 / 5   // initiator: 1200ms (yield to response)
+                    ? config_.sample_rate * 4 / 5   // initiator: 800ms
                     : config_.sample_rate * 2 / 5;  // responder: 400ms (ACK quickly)
             }
         } else {
@@ -874,6 +875,15 @@ void Modem::dispatch_rx_frame(const std::vector<uint8_t>& frame, bool from_fx25,
                 peer_snr_db_ = reported_snr;
                 IRIS_LOG("Peer SNR feedback: %.1f dB (from %s)", reported_snr,
                          stype == Ax25SType::RR ? "RR" : "REJ/RNR");
+            }
+        } else if ((ctrl & 0x01) == 0x00) {  // I-frame
+            // I-frames carry N(R) that implicitly acknowledges our data.
+            // The S-frame sniff above misses this — if the peer sends data
+            // instead of explicit RR, we still need to track their N(R).
+            uint8_t nr = (ctrl >> 5) & 0x07;
+            if (nr != last_peer_nr_) {
+                tx_no_ack_count_ = 0;  // peer acknowledged via I-frame N(R)
+                last_peer_nr_ = nr;
             }
         }
     }
@@ -1203,6 +1213,11 @@ void Modem::process_rx_native(const float* audio, int count) {
                 return;
             }
             frames_rx_++;
+            // Successful native RX proves the link is alive.  Reset the no-ack
+            // counter so gearshift doesn't penalise us for sending S-frame ACKs
+            // that the peer acknowledges implicitly via I-frame N(R) — which the
+            // S-frame–only sniff at line ~832 doesn't catch.
+            tx_no_ack_count_ = 0;
             IRIS_LOG("RX native frame %zu bytes at offset %d", payload.size(), start);
 
             {
@@ -1215,15 +1230,25 @@ void Modem::process_rx_native(const float* audio, int count) {
                 snr_db_ = snr;
                 snr_preamble_db_ = decode_snr_preamble_db();
                 int ldpc_iters = ldpc_last_max_iters();
-                gearshift_.feed_ldpc_iters(ldpc_iters, 50);
-                int old_level = gearshift_.current_level();
-                gearshift_.update(snr);
+                // Don't feed gearshift during auto-tune — tune test frames
+                // may decode at higher SNR than actual data (different direction,
+                // different gain), causing premature upshift.
+                bool in_tune = (tune_state_ != TuneState::IDLE &&
+                                tune_state_ != TuneState::DONE);
+                if (!in_tune) {
+                    gearshift_.feed_ldpc_iters(ldpc_iters, 50);
+                    int old_level = gearshift_.current_level();
+                    gearshift_.update(snr);
+                    int new_level = gearshift_.current_level();
+                    IRIS_LOG("[SNR] est=%.1f dB, ldpc_iters=%d, boost=+%.1f, eff=%.1f, gearshift: %d->%d (smoothed=%.1f, cd=%d)",
+                             snr, ldpc_iters, gearshift_.boost(),
+                             gearshift_.smoothed_snr() + gearshift_.boost(),
+                             old_level, new_level, gearshift_.smoothed_snr(), gearshift_.cooldown());
+                } else {
+                    IRIS_LOG("[SNR] est=%.1f dB, ldpc_iters=%d (tune frame, gearshift skipped)",
+                             snr, ldpc_iters);
+                }
                 arq_.set_local_snr(snr);
-                int new_level = gearshift_.current_level();
-                IRIS_LOG("[SNR] est=%.1f dB, ldpc_iters=%d, boost=+%.1f, eff=%.1f, gearshift: %d->%d (smoothed=%.1f, cd=%d)",
-                         snr, ldpc_iters, gearshift_.boost(),
-                         gearshift_.smoothed_snr() + gearshift_.boost(),
-                         old_level, new_level, gearshift_.smoothed_snr(), gearshift_.cooldown());
             }
 
             {
@@ -1522,8 +1547,8 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                 // Role-asymmetric: responder responds sooner, initiator yields.
                 {
                     int native_listen = (ax25_session_.is_active() && ax25_session_.we_initiated())
-                        ? config_.sample_rate * 3      // initiator: 3.0s (yield to response)
-                        : config_.sample_rate * 2;     // responder: 2.0s (respond sooner)
+                        ? config_.sample_rate * 3 / 2  // initiator: 1.5s (yield to response)
+                        : config_.sample_rate;          // responder: 1.0s (respond sooner)
                     csma_holdoff_ = std::max(csma_holdoff_.load(), native_listen);
                 }
             }
@@ -1579,10 +1604,12 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
     // Covers: DCD active, DCD holdoff, CSMA holdoff, PTT (in ptt_on/off),
     // probing, and pending native frame (waiting for more data after preamble).
     bool native_frame_pending = (pending_frame_start_ >= 0 && pending_frame_timeout_ > 0);
-    bool tx_blocked = dcd_busy || (dcd_holdoff_ > 0) || (csma_holdoff_ > 0)
-                      || ofdm_kiss_probing_ || ofdm_kiss_probe_cd_ > 0
-                      || native_frame_pending;
-    ax25_session_.set_channel_busy(tx_blocked);
+    // Channel busy pauses AX.25 T1/T3 timers. Only pause when someone is
+    // actually on the air (DCD = peer transmitting, PTT handled separately in
+    // ptt_on/ptt_off). CSMA holdoff and probe countdown are TX deferrals —
+    // T1 must keep running during those because the peer may be responding.
+    bool channel_active = dcd_busy || native_frame_pending;
+    ax25_session_.set_channel_busy(channel_active);
 
     if (dcd_busy || dcd_holdoff_ > 0) {
         std::memset(tx_audio, 0, frame_count * sizeof(float));
@@ -2723,7 +2750,8 @@ void Modem::tick() {
 
             // Connection already established before probe.
             // Held I-frames release via native after listen window expires.
-            ax25_session_.set_t1_ticks(300);
+            // T1 is already set to 2.0s by set_native_active(true) above —
+            // don't override with the AFSK-era 15s value.
             probe_connect_timeout_ = 0;
             IRIS_LOG("Probe done — releasing held I-frames via native");
 
@@ -3043,34 +3071,34 @@ void Modem::tune_apply_corrections() {
 
     float old_level = config_.tx_level;
 
-    // TX: reduce if we're too loud for the peer
+    // TX: adjust toward peer_gain=1.0.
+    //   peer_gain > 1 → we're too loud → reduce TX (always safe).
+    //   peer_gain < 1 → we're too quiet → boost TX (capped at 1.0).
+    //   Both sides adjust independently — the peer also adjusts RX gain,
+    //   but we can't assume they will, so we do our part.
     if (tune_peer_gain_ > 0.01f) {
-        if (tune_peer_gain_ > 1.0f) {
-            config_.tx_level /= tune_peer_gain_;
-            config_.tx_level = std::clamp(config_.tx_level, 0.01f, 1.0f);
-            config_.calibrated_tx_level = config_.tx_level;
-            IRIS_LOG("[TUNE] TX: peer_gain=%.3f (too loud), level %.3f → %.3f",
+        config_.tx_level /= tune_peer_gain_;
+        config_.tx_level = std::clamp(config_.tx_level, 0.05f, 1.0f);
+        config_.calibrated_tx_level = config_.tx_level;
+        if (std::abs(config_.tx_level - old_level) > 0.001f) {
+            IRIS_LOG("[TUNE] TX: peer_gain=%.3f, level %.3f → %.3f",
                      tune_peer_gain_, old_level, config_.tx_level);
         } else {
-            IRIS_LOG("[TUNE] TX: peer_gain=%.3f (quiet) — no change (peer boosts RX)",
-                     tune_peer_gain_);
+            IRIS_LOG("[TUNE] TX: peer_gain=%.3f, level %.3f (no change needed)",
+                     tune_peer_gain_, config_.tx_level);
         }
     }
 
-    // RX: boost if peer is too quiet; skip if peer will reduce their TX
+    // RX: normalize so channel_gain ≈ 1.0.
+    //   my_gain < 1 → peer is quiet → boost RX.
+    //   my_gain > 1 → peer is loud → attenuate RX.
+    //   The peer also adjusts TX, but we compensate on our side too
+    //   to avoid the deadlock where both sides "defer to peer."
     if (tune_my_gain_ > 0.01f) {
-        if (tune_my_gain_ <= 1.0f) {
-            // Peer is quiet, can't boost TX → we compensate with RX gain
-            native_rx_gain_ = 1.0f / tune_my_gain_;
-            native_rx_gain_ = std::clamp(native_rx_gain_, 1.0f, 10.0f);
-            IRIS_LOG("[TUNE] RX: my_gain=%.3f (quiet peer), rx_gain=%.3f",
-                     tune_my_gain_, native_rx_gain_);
-        } else {
-            // Peer is loud — they'll reduce their TX, no RX correction needed
-            native_rx_gain_ = 1.0f;
-            IRIS_LOG("[TUNE] RX: my_gain=%.3f (loud peer) — no change (peer reduces TX)",
-                     tune_my_gain_);
-        }
+        native_rx_gain_ = 1.0f / tune_my_gain_;
+        native_rx_gain_ = std::clamp(native_rx_gain_, 0.1f, 10.0f);
+        IRIS_LOG("[TUNE] RX: my_gain=%.3f, rx_gain=%.3f",
+                 tune_my_gain_, native_rx_gain_);
     }
 
     if (gui_log_) {
