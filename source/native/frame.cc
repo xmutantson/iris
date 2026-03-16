@@ -817,8 +817,11 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     //   - Feedforward (FF) taps: cancel pre-cursor ISI
     //   - Feedback (FB) taps: cancel post-cursor ISI using past decisions
     // Trained on pilot symbols (known +1 BPSK), DD mode between pilots.
-    // Only activates when pilots are present (long frames).
-    if (use_pilots && payload_symbols > 64) {
+    // DISABLED: The causal FIR structure introduces a 1-sample delay (center
+    // tap at ff[1]), shifting all pilot positions by 1 symbol.  This causes
+    // the Kalman to see data where pilots should be, corrupting phase tracking.
+    // TODO: Fix by pre-filling ff_buf or using zero-delay architecture.
+    if (false && use_pilots && payload_symbols > 64) {
         constexpr int N_FF = 3;   // feedforward taps (pre-cursor + main)
         constexpr int N_FB = 2;   // feedback taps (post-cursor)
         constexpr float MU = 0.01f;  // LMS step size
@@ -874,11 +877,26 @@ bool decode_native_frame(const float* iq_samples, size_t count,
 
             if (do_update) {
                 std::complex<float> e = d - y;
+                // Clamp error to prevent divergence on large phase offsets
+                float emag = std::abs(e);
+                if (emag > 2.0f) e *= 2.0f / emag;
                 // LMS update with leaky regularization
                 for (int t = 0; t < N_FF; t++)
                     ff[t] = LEAK * ff[t] + MU * e * std::conj(ff_buf[t]);
                 for (int t = 0; t < N_FB; t++)
                     fb[t] = LEAK * fb[t] - MU * e * std::conj(fb_buf[t]);
+                // NaN guard: reset taps if diverged
+                bool taps_ok = true;
+                for (int t = 0; t < N_FF; t++)
+                    if (!std::isfinite(ff[t].real()) || !std::isfinite(ff[t].imag())) taps_ok = false;
+                for (int t = 0; t < N_FB; t++)
+                    if (!std::isfinite(fb[t].real()) || !std::isfinite(fb[t].imag())) taps_ok = false;
+                if (!taps_ok) {
+                    // Reset to identity — DFE becomes passthrough
+                    for (int t = 0; t < N_FF; t++) ff[t] = {0.0f, 0.0f};
+                    for (int t = 0; t < N_FB; t++) fb[t] = {0.0f, 0.0f};
+                    ff[N_FF / 2] = {1.0f, 0.0f};
+                }
                 n_updates++;
             }
 
@@ -1530,6 +1548,14 @@ bool decode_native_frame(const float* iq_samples, size_t count,
                 sorted_mags[sorted_mags.size() / 2] : 1.0f;
             if (median_mag < 0.01f) median_mag = 0.01f;
 
+            // Median P00 for CSI outlier detection
+            float median_p00 = 0.0f;
+            if (!sym_phase_var.empty()) {
+                std::vector<float> sorted_p00(sym_phase_var);
+                std::sort(sorted_p00.begin(), sorted_p00.end());
+                median_p00 = sorted_p00[sorted_p00.size() / 2];
+            }
+
             float snr_lin = (g_decode_snr > 0 && g_decode_snr < 50.0f) ?
                 std::pow(10.0f, g_decode_snr / 10.0f) : 1.0f;
 
@@ -1539,11 +1565,17 @@ bool decode_native_frame(const float* iq_samples, size_t count,
                 float w_mag = std::min(1.0f, sym_reliability[si] / median_mag);
                 w_mag *= w_mag;
 
-                // Kalman P00 CSI weight
+                // Kalman P00 CSI weight: only attenuate symbols with P00
+                // significantly above median (outliers from channel disturbance).
+                // Normal P00 cycling between pilots is NOT penalized.
                 float w_csi = 1.0f;
-                if (si < (int)sym_phase_var.size()) {
-                    w_csi = 1.0f / (1.0f + snr_lin * sym_phase_var[si]);
-                    w_csi = std::max(0.01f, w_csi);  // floor to avoid total erasure
+                if (si < (int)sym_phase_var.size() && median_p00 > 1e-10f) {
+                    float ratio = sym_phase_var[si] / median_p00;
+                    // Soft attenuation: ramps down when P00 > 3× median
+                    if (ratio > 3.0f) {
+                        w_csi = 3.0f / ratio;
+                        w_csi = std::max(0.05f, w_csi);
+                    }
                 }
 
                 float weight = w_mag * w_csi;
