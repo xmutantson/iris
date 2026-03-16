@@ -232,6 +232,22 @@ std::vector<float> build_native_frame(const uint8_t* payload, size_t len,
 
     auto payload_symbols = map_bits(payload_bits, config.modulation);
 
+    // Symbol interleaving: scatter data symbols across the frame so that
+    // a contiguous burst of phase corruption (phase slip, impulse) maps
+    // to non-adjacent symbols after de-interleaving, breaking up correlated
+    // errors that LDPC can't correct. Uses congruential permutation:
+    // dst[i] = src[(i * stride) % N], stride coprime to N.
+    if (payload_symbols.size() > 1) {
+        int N = (int)payload_symbols.size();
+        // Choose stride coprime to N. 47 is prime and works for most N.
+        // If N is a multiple of 47 (unlikely), fall back to 41.
+        int stride = (N % 47 != 0) ? 47 : 41;
+        std::vector<std::complex<float>> interleaved(N);
+        for (int i = 0; i < N; i++)
+            interleaved[(i * stride) % N] = payload_symbols[i];
+        payload_symbols = std::move(interleaved);
+    }
+
     // Insert mid-frame pilots for phase tracking.
     // QAM16+ always needs pilots.  BPSK/QPSK need them on long frames (>256 symbols)
     // where the decision-directed PLL drifts without known reference points.
@@ -1220,6 +1236,25 @@ bool decode_native_frame(const float* iq_samples, size_t count,
         symbols.push_back({re, im});
         sym_reliability.push_back(raw_samples[k].mag);
         sym_phase_var.push_back(fwd_state[k].P00);
+    }
+
+    // Symbol de-interleaving: reverse the TX congruential permutation.
+    // TX: dst[(i*stride)%N] = src[i]  →  RX: dst[i] = src[(i*stride)%N]
+    if (symbols.size() > 1) {
+        int N = (int)symbols.size();
+        int stride = (N % 47 != 0) ? 47 : 41;
+        std::vector<std::complex<float>> deinterleaved(N);
+        std::vector<float> deint_rel(N);
+        std::vector<float> deint_pvar(N);
+        for (int i = 0; i < N; i++) {
+            int src = (i * stride) % N;
+            deinterleaved[i] = symbols[src];
+            deint_rel[i] = sym_reliability[src];
+            deint_pvar[i] = sym_phase_var[src];
+        }
+        symbols = std::move(deinterleaved);
+        sym_reliability = std::move(deint_rel);
+        sym_phase_var = std::move(deint_pvar);
     }
 
     // Kalman RTS smoother diagnostics
