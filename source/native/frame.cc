@@ -380,24 +380,58 @@ bool decode_native_frame(const float* iq_samples, size_t count,
         q_in[i] = iq_samples[2 * i + 1];
     }
 
-    // Impulse noise blanking: clip passband amplitude to 3.5x RMS.
-    // Prevents single loud clicks from corrupting multiple symbols.
+    // Hampel impulse blanking: MAD-based outlier detection + soft replacement.
+    // MAD (Median Absolute Deviation) is immune to outliers — up to 50% of
+    // samples can be corrupted and the threshold stays correct.  The old
+    // RMS-based blanker inflated its threshold when impulse bursts raised
+    // RMS, letting subsequent impulses through.
+    // Window ~11 samples (~half a symbol at SPS=23), threshold 3×MAD.
+    // Soft replacement with local median instead of hard zeroing.
     {
-        float energy = 0;
+        constexpr int HAMPEL_HALF = 5;   // half-window = 5 → window = 11
+        constexpr float HAMPEL_K = 3.0f; // threshold multiplier
+        // MAD-to-sigma conversion: sigma ≈ 1.4826 × MAD for Gaussian
+        constexpr float MAD_SCALE = 1.4826f;
+
+        std::vector<float> mags(n_samples);
         for (size_t i = 0; i < n_samples; i++)
-            energy += i_in[i] * i_in[i] + q_in[i] * q_in[i];
-        float rms = std::sqrt(energy / (float)n_samples);
-        float clip_thresh = 3.5f * rms;
-        if (clip_thresh > 1e-6f) {
-            for (size_t i = 0; i < n_samples; i++) {
-                float mag = std::sqrt(i_in[i] * i_in[i] + q_in[i] * q_in[i]);
-                if (mag > clip_thresh) {
-                    float scale = clip_thresh / mag;
-                    i_in[i] *= scale;
-                    q_in[i] *= scale;
-                }
+            mags[i] = std::sqrt(i_in[i] * i_in[i] + q_in[i] * q_in[i]);
+
+        int n_blanked = 0;
+        std::vector<float> window_buf(2 * HAMPEL_HALF + 1);
+
+        for (size_t i = 0; i < n_samples; i++) {
+            int lo = std::max(0, (int)i - HAMPEL_HALF);
+            int hi = std::min((int)n_samples - 1, (int)i + HAMPEL_HALF);
+            int wlen = hi - lo + 1;
+
+            // Copy magnitudes into window buffer and find median
+            for (int j = 0; j < wlen; j++)
+                window_buf[j] = mags[lo + j];
+            std::nth_element(window_buf.begin(), window_buf.begin() + wlen/2,
+                             window_buf.begin() + wlen);
+            float median = window_buf[wlen / 2];
+
+            // MAD: median of absolute deviations from median
+            for (int j = 0; j < wlen; j++)
+                window_buf[j] = std::abs(mags[lo + j] - median);
+            std::nth_element(window_buf.begin(), window_buf.begin() + wlen/2,
+                             window_buf.begin() + wlen);
+            float mad = window_buf[wlen / 2];
+
+            float thresh = median + HAMPEL_K * MAD_SCALE * mad;
+            if (thresh < 1e-6f) continue;
+
+            if (mags[i] > thresh) {
+                // Soft replacement: scale to median magnitude (preserves phase)
+                float scale = median / mags[i];
+                i_in[i] *= scale;
+                q_in[i] *= scale;
+                n_blanked++;
             }
         }
+        if (n_blanked > 0)
+            IRIS_LOG("[DECODE] Hampel blanked %d/%zu samples", n_blanked, n_samples);
     }
 
     auto i_filt = fir_filter(i_in, rrc_taps);
