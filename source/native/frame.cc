@@ -1193,6 +1193,7 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     // --- Pass 5: Apply smoothed phase corrections, extract symbols ---
     std::vector<std::complex<float>> symbols;
     std::vector<float> sym_reliability;
+    std::vector<float> sym_phase_var;  // Kalman P00 per data symbol (for CSI weighting)
     for (int k = 0; k < payload_symbols; k++) {
         if (raw_samples[k].is_pilot) continue;  // skip pilots
 
@@ -1206,6 +1207,7 @@ bool decode_native_frame(const float* iq_samples, size_t count,
 
         symbols.push_back({re, im});
         sym_reliability.push_back(raw_samples[k].mag);
+        sym_phase_var.push_back(fwd_state[k].P00);
     }
 
     // Kalman RTS smoother diagnostics
@@ -1321,47 +1323,62 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     std::vector<uint8_t> bits;
 
     if (fec != LdpcRate::NONE) {
-        // Soft-decision path: LLR values give LDPC much more information.
-        // Noise-variance-scaled LLRs (sigma_sq) only for QAM16+ where the
-        // proper max-log-MAP scaling is critical for constellation geometry.
-        // For BPSK/QPSK, the fixed scaling works well with the min-sum decoder
-        // (0.75 scaling factor). Applying sigma_sq to BPSK/QPSK makes LLRs
-        // ~4x larger at typical SNR, causing over-confident wrong-sign LLRs
-        // that the min-sum decoder can't overcome.
+        // Soft-decision path: noise-variance-scaled LLRs for all modulations.
+        // sigma_sq is now safe for BPSK/QPSK because per-symbol Kalman P00
+        // weighting (below) attenuates LLRs from poorly-tracked symbols,
+        // preventing the over-confident wrong-sign problem that previously
+        // caused sigma_sq to be disabled for BPSK/QPSK.
         float sigma_sq = 0;
-        if (mod >= Modulation::QAM16 && g_decode_snr > 0 && g_decode_snr < 50.0f) {
+        if (g_decode_snr > 0 && g_decode_snr < 50.0f) {
             float snr_lin = std::pow(10.0f, g_decode_snr / 10.0f);
             sigma_sq = 1.0f / snr_lin;
         }
         auto llrs = demap_soft(symbols, mod, sigma_sq);
 
-        // Reliability weighting: scale each symbol's LLRs by its received magnitude.
-        // Symbols with low magnitude (attenuated by VB-Cable, radio echo, fading)
-        // get LLRs pushed toward zero = erasure, telling LDPC "I don't know" instead
-        // of "I'm confident and wrong". This is critical for VB-Cable and radio paths.
+        // Combined reliability weighting: magnitude + Kalman P00 CSI.
+        // 1) Magnitude: symbols with low magnitude get erased (fading, echo).
+        // 2) P00 (phase variance): symbols with poor phase tracking get
+        //    attenuated — tells LDPC "I don't know" instead of injecting
+        //    confidently-wrong LLRs from residual phase rotation.
+        //    w_csi = 1 / (1 + SNR_linear * P00) — when P00 is small (good
+        //    tracking), w≈1; when P00 is large, w→0.
         {
-            // Compute median magnitude as reference for "normal" signal level
             std::vector<float> sorted_mags(sym_reliability);
             std::sort(sorted_mags.begin(), sorted_mags.end());
             float median_mag = sorted_mags.size() > 0 ?
                 sorted_mags[sorted_mags.size() / 2] : 1.0f;
             if (median_mag < 0.01f) median_mag = 0.01f;
 
-            int n_attenuated = 0;
+            float snr_lin = (g_decode_snr > 0 && g_decode_snr < 50.0f) ?
+                std::pow(10.0f, g_decode_snr / 10.0f) : 1.0f;
+
+            int n_attenuated = 0, n_phase_attenuated = 0;
             for (int si = 0; si < (int)symbols.size(); si++) {
-                float weight = std::min(1.0f, sym_reliability[si] / median_mag);
-                // Square the weight to more aggressively erase weak symbols
-                weight *= weight;
-                if (weight < 0.1f) n_attenuated++;
+                // Magnitude weight (squared, as before)
+                float w_mag = std::min(1.0f, sym_reliability[si] / median_mag);
+                w_mag *= w_mag;
+
+                // Kalman P00 CSI weight
+                float w_csi = 1.0f;
+                if (si < (int)sym_phase_var.size()) {
+                    w_csi = 1.0f / (1.0f + snr_lin * sym_phase_var[si]);
+                    w_csi = std::max(0.01f, w_csi);  // floor to avoid total erasure
+                }
+
+                float weight = w_mag * w_csi;
+                if (w_mag < 0.1f) n_attenuated++;
+                if (w_csi < 0.5f) n_phase_attenuated++;
+
                 for (int bi = 0; bi < bps; bi++) {
                     int llr_idx = si * bps + bi;
                     if (llr_idx < (int)llrs.size())
                         llrs[llr_idx] *= weight;
                 }
             }
-            if (n_attenuated > 0)
-                IRIS_LOG("[DECODE] reliability: %d/%d symbols attenuated (median_mag=%.3f)",
-                         n_attenuated, (int)symbols.size(), median_mag);
+            if (n_attenuated > 0 || n_phase_attenuated > 0)
+                IRIS_LOG("[DECODE] reliability: %d/%d mag-attenuated, %d/%d phase-attenuated (median_mag=%.3f)",
+                         n_attenuated, (int)symbols.size(),
+                         n_phase_attenuated, (int)symbols.size(), median_mag);
         }
 
         scramble_soft(llrs);
