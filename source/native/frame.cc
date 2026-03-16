@@ -812,6 +812,102 @@ bool decode_native_frame(const float* iq_samples, size_t count,
             raw_samples[k2].is_pilot = true;
     }
 
+    // --- LMS-DFE Adaptive Equalizer ---
+    // Compensates FM group delay ISI using a decision-feedback structure:
+    //   - Feedforward (FF) taps: cancel pre-cursor ISI
+    //   - Feedback (FB) taps: cancel post-cursor ISI using past decisions
+    // Trained on pilot symbols (known +1 BPSK), DD mode between pilots.
+    // Only activates when pilots are present (long frames).
+    if (use_pilots && payload_symbols > 64) {
+        constexpr int N_FF = 3;   // feedforward taps (pre-cursor + main)
+        constexpr int N_FB = 2;   // feedback taps (post-cursor)
+        constexpr float MU = 0.01f;  // LMS step size
+        constexpr float LEAK = 0.999f;  // leaky LMS for stability
+
+        std::complex<float> ff[N_FF] = {};
+        std::complex<float> fb[N_FB] = {};
+        ff[N_FF / 2] = {1.0f, 0.0f};  // center tap initialized to unity
+
+        // Ring buffer for feedforward input and feedback decisions
+        std::complex<float> ff_buf[N_FF] = {};
+        std::complex<float> fb_buf[N_FB] = {};
+
+        std::vector<std::complex<float>> eq_out(payload_symbols);
+        int n_updates = 0;
+
+        for (int k = 0; k < payload_symbols; k++) {
+            // Shift feedforward buffer
+            for (int t = N_FF - 1; t > 0; t--)
+                ff_buf[t] = ff_buf[t - 1];
+            ff_buf[0] = {raw_samples[k].iv, raw_samples[k].qv};
+
+            // Compute DFE output: y = FF'*x - FB'*d_prev
+            std::complex<float> y = {0.0f, 0.0f};
+            for (int t = 0; t < N_FF; t++)
+                y += std::conj(ff[t]) * ff_buf[t];
+            for (int t = 0; t < N_FB; t++)
+                y -= std::conj(fb[t]) * fb_buf[t];
+
+            eq_out[k] = y;
+
+            // Determine reference symbol for LMS update
+            std::complex<float> d;
+            bool do_update = false;
+
+            if (raw_samples[k].is_pilot) {
+                d = {1.0f, 0.0f};  // known pilot
+                do_update = true;
+            } else if (k >= N_FF) {
+                // Decision-directed: snap to nearest constellation point
+                // Only for BPSK/QPSK (simple slicing, low error rate)
+                if (mod <= Modulation::QPSK) {
+                    float norm = 1.0f / std::sqrt(2.0f);
+                    if (mod == Modulation::BPSK) {
+                        d = {y.real() >= 0 ? 1.0f : -1.0f, 0.0f};
+                    } else {
+                        d = {y.real() >= 0 ? norm : -norm,
+                             y.imag() >= 0 ? norm : -norm};
+                    }
+                    do_update = true;
+                }
+            }
+
+            if (do_update) {
+                std::complex<float> e = d - y;
+                // LMS update with leaky regularization
+                for (int t = 0; t < N_FF; t++)
+                    ff[t] = LEAK * ff[t] + MU * e * std::conj(ff_buf[t]);
+                for (int t = 0; t < N_FB; t++)
+                    fb[t] = LEAK * fb[t] - MU * e * std::conj(fb_buf[t]);
+                n_updates++;
+            }
+
+            // Shift feedback buffer with decided symbol
+            for (int t = N_FB - 1; t > 0; t--)
+                fb_buf[t] = fb_buf[t - 1];
+            fb_buf[0] = raw_samples[k].is_pilot ? std::complex<float>{1.0f, 0.0f}
+                                                  : y;  // use equalized output
+        }
+
+        // Apply equalized output back to raw_samples
+        for (int k = 0; k < payload_symbols; k++) {
+            raw_samples[k].iv = eq_out[k].real();
+            raw_samples[k].qv = eq_out[k].imag();
+            raw_samples[k].mag = std::sqrt(eq_out[k].real() * eq_out[k].real() +
+                                            eq_out[k].imag() * eq_out[k].imag());
+        }
+
+        if (n_updates > 0) {
+            float ff_energy = 0;
+            for (int t = 0; t < N_FF; t++)
+                ff_energy += std::norm(ff[t]);
+            IRIS_LOG("[DFE] %d updates, FF energy=%.3f, ff[0]=(%.3f,%.3f) ff[1]=(%.3f,%.3f) ff[2]=(%.3f,%.3f)",
+                     n_updates, ff_energy,
+                     ff[0].real(), ff[0].imag(), ff[1].real(), ff[1].imag(),
+                     ff[2].real(), ff[2].imag());
+        }
+    }
+
     // --- Kalman filter parameters ---
     // 3-state model: [phase, freq, accel] tracks thermal frequency drift
     // from FM transmitter PA heating.  The accel state captures frequency
