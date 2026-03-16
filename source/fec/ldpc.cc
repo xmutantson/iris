@@ -224,7 +224,11 @@ static inline int find_var_in_check(const IraMatrix& M, int chk, int var) {
     return -1;
 }
 
-// --- Min-Sum Decoder ---
+// --- Layered Min-Sum Decoder ---
+// Processes one check-node row at a time, immediately updating variable
+// posteriors before moving to the next row.  Information propagates
+// multiple hops per sweep — converges in ~15 sweeps vs ~30 flooding iters.
+// This frees the iteration budget for marginal cliff frames.
 
 static int decode_min_sum(const std::vector<float>& llr, const IraMatrix& M,
                            DecoderWorkspace& ws, int max_iter,
@@ -232,29 +236,31 @@ static int decode_min_sum(const std::vector<float>& llr, const IraMatrix& M,
     constexpr float SCALE = 0.80f;
     ws.reset_messages();
 
+    // Initialize posteriors with channel LLRs
+    for (int i = 0; i < M.n; i++)
+        ws.posterior[i] = llr[i];
+
     for (int iter = 0; iter < max_iter; iter++) {
         if (abort_flag && abort_flag->load(std::memory_order_relaxed))
             return -(iter + 1);
 
-        // Check node update
+        // Layered sweep: for each check node, update c2v messages and
+        // immediately update connected variable posteriors.
         for (int j = 0; j < M.p; j++) {
             int deg = 0;
             float v2c[64];
+            int cols[64];
+
+            // Compute v2c = posterior - old c2v (extrinsic info to check node)
             for (int idx = 0; idx < M.cwidth; idx++) {
                 int col = M.c_adj(j, idx);
                 if (col == -1) break;
-                float msg = llr[col];
-                for (int vidx = 0; vidx < M.vwidth; vidx++) {
-                    int chk = M.v_adj(col, vidx);
-                    if (chk == -1) break;
-                    if (chk == j) continue;
-                    int ci = find_var_in_check(M, chk, col);
-                    if (ci >= 0) msg += ws.c2v[chk * M.cwidth + ci];
-                }
-                v2c[deg] = msg;
+                cols[deg] = col;
+                v2c[deg] = ws.posterior[col] - ws.c2v[j * M.cwidth + idx];
                 deg++;
             }
 
+            // Min-sum check node update
             for (int idx = 0; idx < deg; idx++) {
                 float min_abs = 1e9f;
                 int sign = 1;
@@ -264,18 +270,12 @@ static int decode_min_sum(const std::vector<float>& llr, const IraMatrix& M,
                     if (a < min_abs) min_abs = a;
                     if (v2c[idx2] < 0) sign = -sign;
                 }
-                ws.c2v[j * M.cwidth + idx] = sign * min_abs * SCALE;
-            }
-        }
+                float new_c2v = sign * min_abs * SCALE;
 
-        // Posterior
-        for (int i = 0; i < M.n; i++) {
-            ws.posterior[i] = llr[i];
-            for (int vidx = 0; vidx < M.vwidth; vidx++) {
-                int chk = M.v_adj(i, vidx);
-                if (chk == -1) break;
-                int ci = find_var_in_check(M, chk, i);
-                if (ci >= 0) ws.posterior[i] += ws.c2v[chk * M.cwidth + ci];
+                // Immediately update variable posterior:
+                // posterior += (new_c2v - old_c2v)
+                ws.posterior[cols[idx]] += new_c2v - ws.c2v[j * M.cwidth + idx];
+                ws.c2v[j * M.cwidth + idx] = new_c2v;
             }
         }
 
