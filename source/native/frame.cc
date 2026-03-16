@@ -418,6 +418,10 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     int sps = default_config.samples_per_symbol;
     size_t n_samples = count / 2;
 
+    // OTA diagnostic accumulators (used in [FRAME] summary line at end)
+    int diag_hampel_blanked = 0;
+    float diag_eq_delta = 0.0f;  // sum of off-center tap magnitudes
+
     auto rrc_taps = rrc_filter(default_config.rrc_alpha, RRC_SPAN, sps);
 
     std::vector<float> i_in(n_samples), q_in(n_samples);
@@ -443,7 +447,7 @@ bool decode_native_frame(const float* iq_samples, size_t count,
         for (size_t i = 0; i < n_samples; i++)
             mags[i] = std::sqrt(i_in[i] * i_in[i] + q_in[i] * q_in[i]);
 
-        int n_blanked = 0;
+        int& n_blanked = diag_hampel_blanked;
         std::vector<float> window_buf(2 * HAMPEL_HALF + 1);
 
         for (size_t i = 0; i < n_samples; i++) {
@@ -891,6 +895,9 @@ bool decode_native_frame(const float* iq_samples, size_t count,
             float ff_energy = 0;
             for (int t = 0; t < N_FF; t++)
                 ff_energy += std::norm(ff[t]);
+            // EQ tap delta: how far off-center taps are from zero (ISI severity)
+            for (int t = 0; t < N_FF; t++)
+                if (t != CENTER) diag_eq_delta += std::abs(ff[t]);
             IRIS_LOG("[EQ] %d updates, energy=%.3f, taps=(%.3f,%.3f) (%.3f,%.3f) (%.3f,%.3f)",
                      n_updates, ff_energy,
                      ff[0].real(), ff[0].imag(), ff[1].real(), ff[1].imag(),
@@ -1699,6 +1706,9 @@ bool decode_native_frame(const float* iq_samples, size_t count,
                          llrs.size());
             }
             IRIS_LOG("[DECODE] LDPC decode failed (did not converge)");
+            IRIS_LOG("[FRAME] FAIL/LDPC mod=%d fec=%d len=%d snr=%.1f eq=%.3f hampel=%d chase=%d",
+                     (int)mod, (int)fec, payload_len, g_decode_snr,
+                     diag_eq_delta, diag_hampel_blanked, g_chase_combines);
             return false;
         }
         // Decode succeeded — clear Chase buffer
@@ -1735,6 +1745,9 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     uint32_t calc_crc = crc32(decoded_bytes.data(), payload_len);
     if (rx_crc != calc_crc) {
         IRIS_LOG("[DECODE] CRC mismatch: rx=0x%08x calc=0x%08x (len=%d)", rx_crc, calc_crc, payload_len);
+        IRIS_LOG("[FRAME] FAIL/CRC mod=%d fec=%d len=%d snr=%.1f eq=%.3f hampel=%d ldpc=%d chase=%d",
+                 (int)mod, (int)fec, payload_len, g_decode_snr,
+                 diag_eq_delta, diag_hampel_blanked, ldpc_last_max_iters(), g_chase_combines);
         return false;
     }
 
@@ -1743,6 +1756,10 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     // Record how many IQ pairs this frame consumed (for buffer drain)
     int last_symbol_pos = payload_start + payload_symbols * sps;
     g_decode_consumed_iq = (size_t)(last_symbol_pos + RRC_SPAN * sps);
+
+    IRIS_LOG("[FRAME] OK mod=%d fec=%d len=%d snr=%.1f eq=%.3f hampel=%d ldpc=%d chase=%d",
+             (int)mod, (int)fec, payload_len, g_decode_snr,
+             diag_eq_delta, diag_hampel_blanked, ldpc_last_max_iters(), g_chase_combines);
     return true;
 }
 
