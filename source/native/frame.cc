@@ -226,6 +226,24 @@ std::vector<float> build_native_frame(const uint8_t* payload, size_t len,
     while (payload_bits.size() % bps != 0)
         payload_bits.push_back(0);
 
+    // BICM (Bit-Interleaved Coded Modulation) for QAM16+:
+    // Column-row interleaver ensures bits mapped to the same QAM symbol
+    // come from distant positions in the LDPC codeword, equalizing the
+    // unequal protection of MSB vs LSB bit positions in QAM constellations.
+    // Zero gain for BPSK/QPSK (symmetric constellation, all bits equal).
+    if (bps >= 4) {
+        int nbits = (int)payload_bits.size();
+        int ncols = nbits / bps;  // number of symbols
+        // Write row-by-row (bps rows × ncols columns), read column-by-column
+        std::vector<uint8_t> bicm(nbits);
+        for (int r = 0; r < bps; r++) {
+            for (int c = 0; c < ncols; c++) {
+                bicm[c * bps + r] = payload_bits[r * ncols + c];
+            }
+        }
+        payload_bits = std::move(bicm);
+    }
+
     // Scramble encoded bits to ensure uniform QAM symbol distribution
     // (LDPC zero-padding maps to high-power corner symbols without scrambling)
     scramble_bits(payload_bits);
@@ -1431,6 +1449,21 @@ bool decode_native_frame(const float* iq_samples, size_t count,
         scramble_soft(llrs);
         if ((int)llrs.size() > encoded_bits)
             llrs.resize(encoded_bits);
+
+        // BICM de-interleave for QAM16+: reverse the column-row interleaver.
+        // TX: wrote bps rows × ncols columns row-by-row, read column-by-column.
+        // RX: received data is column-order; write back to row-order.
+        if (bps >= 4 && (int)llrs.size() >= bps) {
+            int nbits = (int)llrs.size();
+            int ncols = nbits / bps;
+            std::vector<float> debicm(nbits);
+            for (int r = 0; r < bps; r++) {
+                for (int c = 0; c < ncols; c++) {
+                    debicm[r * ncols + c] = llrs[c * bps + r];
+                }
+            }
+            llrs = std::move(debicm);
+        }
 
         // De-interleave each LDPC block (reverses TX interleaver)
         {
