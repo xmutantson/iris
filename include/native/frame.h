@@ -108,6 +108,13 @@ const KalmanTrace& decode_kalman_trace();
 // Get channel gain from last decoded frame's preamble (for auto-tune)
 float decode_channel_gain();
 
+// Chase combining (CC-HARQ): accumulate LLRs across retransmissions.
+// Enable before ARQ retransmit of the same frame; disable/clear on new frame.
+void chase_enable();    // Enable Chase combining mode
+void chase_disable();   // Disable and clear stored LLRs
+void chase_clear();     // Clear stored LLRs (keep enabled)
+int chase_combine_count();  // Number of successful combines so far
+
 } // namespace iris
 
 #endif

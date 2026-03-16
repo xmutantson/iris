@@ -1,4 +1,5 @@
 #include "arq/arq.h"
+#include "native/frame.h"
 #include <cstring>
 #include <algorithm>
 #include <cstdio>
@@ -54,6 +55,7 @@ void ArqSession::reset() {
     remote_snr_ = 0;
     local_snr_ = 0;
     retransmit_count_ = 0;
+    chase_disable();
     peer_caps_ = 0;
     ack_timeout_ms_ = ARQ_DEFAULT_ACK_TIMEOUT_MS;
     rtt_sum_ms_ = 0;
@@ -109,6 +111,7 @@ void ArqSession::set_speed(int level) {
     level = std::max(0, std::min(level, NUM_SPEED_LEVELS - 1));
     if (level != speed_level_) {
         speed_level_ = level;
+        chase_clear();  // Speed change = different frame format, old LLRs invalid
         if (callbacks_.on_speed_changed)
             callbacks_.on_speed_changed(level);
     }
@@ -382,6 +385,7 @@ void ArqSession::handle_connect(const ArqFrame& frame) {
     last_received_eob_seq_ = -1;
 
     set_state(ArqState::CONNECTED);
+    chase_enable();  // Enable Chase combining for this session
 
     ArqFrame ack;
     ack.type = ArqType::CONNECT_ACK;
@@ -423,6 +427,7 @@ void ArqSession::handle_connect_ack(const ArqFrame& frame) {
     last_received_eob_seq_ = -1;
 
     set_state(ArqState::CONNECTED);
+    chase_enable();  // Enable Chase combining for this session
     start_turboshift();
     send_next_data();
 }
@@ -546,7 +551,9 @@ void ArqSession::handle_ack(const ArqFrame& frame) {
         consec_data_nacks_++;
         consec_data_acks_ = 0;
 
-        // Retransmit on NACK
+        // Retransmit on NACK — enable Chase combining so the receiver
+        // can accumulate LLRs from this retransmission with the previous
+        // failed attempt (+3 dB effective SNR per combine).
         int slot = ack_seq % ARQ_WINDOW_SIZE;
         if (tx_window_[slot].sent && !tx_window_[slot].acked) {
             ArqFrame data_frame;

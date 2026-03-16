@@ -299,6 +299,18 @@ const KalmanTrace& decode_kalman_trace() { return g_kalman_trace; }
 static float g_decode_channel_gain = 1.0f;
 float decode_channel_gain() { return g_decode_channel_gain; }
 
+// Chase combining (CC-HARQ): store LLRs from failed LDPC decodes.
+// On retransmit of the same frame, element-wise add new LLRs to stored
+// LLRs before feeding to LDPC — equivalent to MRC, +3 dB per combine.
+static std::vector<float> g_chase_llrs;
+static int g_chase_combines = 0;
+static bool g_chase_active = false;
+
+void chase_enable() { g_chase_active = true; }
+void chase_disable() { g_chase_active = false; g_chase_llrs.clear(); g_chase_combines = 0; }
+void chase_clear() { g_chase_llrs.clear(); g_chase_combines = 0; }
+int chase_combine_count() { return g_chase_combines; }
+
 int detect_frame_start(const float* iq_samples, size_t count, int sps) {
     auto preamble = generate_preamble();
     auto sync = generate_sync_word();
@@ -1473,6 +1485,18 @@ bool decode_native_frame(const float* iq_samples, size_t count,
                      n_unsatisfied, n_checks, n_checks > 0 ? 100.0f * n_unsatisfied / n_checks : 0.0f);
         }
 
+        // Chase combining: if active and we have stored LLRs from a previous
+        // failed decode of the same frame, element-wise add them to the new LLRs.
+        // This is MRC (Maximum Ratio Combining) in LLR domain: +3 dB per combine.
+        if (g_chase_active && !g_chase_llrs.empty() &&
+            g_chase_llrs.size() == llrs.size()) {
+            for (size_t i = 0; i < llrs.size(); i++)
+                llrs[i] += g_chase_llrs[i];
+            g_chase_combines++;
+            IRIS_LOG("[DECODE] Chase combine #%d: added stored LLRs (%zu floats)",
+                     g_chase_combines, llrs.size());
+        }
+
         // Use SPA decoder for rate 3/4 — exact check-node messages gain
         // ~0.2 dB at the coding cliff vs min-sum approximation.
         // At N=1600 the compute cost is negligible.
@@ -1480,8 +1504,21 @@ bool decode_native_frame(const float* iq_samples, size_t count,
                                                              : LdpcDecoder::MIN_SUM;
         bits = LdpcCodec::decode_soft(llrs, fec, ldpc_algo);
         if (bits.empty()) {
+            // Store LLRs for potential Chase combining on retransmit
+            if (g_chase_active) {
+                g_chase_llrs = llrs;  // store combined (or first-attempt) LLRs
+                IRIS_LOG("[DECODE] LDPC failed — stored %zu LLRs for Chase combining",
+                         llrs.size());
+            }
             IRIS_LOG("[DECODE] LDPC decode failed (did not converge)");
             return false;
+        }
+        // Decode succeeded — clear Chase buffer
+        if (g_chase_active) {
+            g_chase_llrs.clear();
+            if (g_chase_combines > 0)
+                IRIS_LOG("[DECODE] Chase combining succeeded after %d combines", g_chase_combines);
+            g_chase_combines = 0;
         }
     } else {
         // No FEC: hard decision is fine
