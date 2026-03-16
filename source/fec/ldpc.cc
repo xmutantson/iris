@@ -229,7 +229,7 @@ static inline int find_var_in_check(const IraMatrix& M, int chk, int var) {
 static int decode_min_sum(const std::vector<float>& llr, const IraMatrix& M,
                            DecoderWorkspace& ws, int max_iter,
                            std::atomic<bool>* abort_flag) {
-    constexpr float SCALE = 0.75f;
+    constexpr float SCALE = 0.80f;
     ws.reset_messages();
 
     for (int iter = 0; iter < max_iter; iter++) {
