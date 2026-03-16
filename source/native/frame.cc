@@ -1406,6 +1406,26 @@ bool decode_native_frame(const float* iq_samples, size_t count,
                       payload_symbols-1,
                       smoothed_phase[payload_symbols-1] * 180.0f / (float)M_PI);
         IRIS_LOG("%s", pbuf);
+
+        // Tail P00 diagnostic: log phase variance at frame tail to assess
+        // whether tail pilots provide sufficient RTS smoother anchor.
+        // Large P00 at tail → Kalman under-tracking, consider more tail pilots
+        // or looser q_accel for final symbols.
+        {
+            int tail_start = std::max(0, payload_symbols - 32);
+            char tbuf[512]; int tp2 = 0;
+            tp2 += snprintf(tbuf+tp2, sizeof(tbuf)-tp2, "[KALMAN] P00 tail: ");
+            for (int k = tail_start; k < payload_symbols; k += 4) {
+                tp2 += snprintf(tbuf+tp2, sizeof(tbuf)-tp2, "%d:%.2e ",
+                               k, fwd_state[k].P00);
+                if (tp2 > 450) break;
+            }
+            float p00_head = fwd_state[std::min(16, payload_symbols-1)].P00;
+            float p00_tail = fwd_state[payload_symbols-1].P00;
+            tp2 += snprintf(tbuf+tp2, sizeof(tbuf)-tp2, " head=%.2e tail=%.2e ratio=%.1fx",
+                           p00_head, p00_tail, p00_tail / std::max(p00_head, 1e-10f));
+            IRIS_LOG("%s", tbuf);
+        }
     }
 
     // Populate Kalman trace for CSV logging and 3D GUI display
