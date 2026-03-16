@@ -55,6 +55,21 @@ enum class CalState {
     DONE,
 };
 
+// Auto-tune state machine (bilateral native-frame gain calibration)
+// Initiator: SEND_START → TX_TEST → WAIT_PEER → SEND_REPORT → WAIT_REPORT → APPLY → DONE
+// Responder: WAIT_PEER → SEND_REPORT_AND_TEST → WAIT_REPORT → APPLY → DONE
+enum class TuneState {
+    IDLE,
+    SEND_START,         // Queue TUNE:START, wait for TX drain
+    TX_TEST,            // Transmit native test frame
+    WAIT_PEER,          // Wait to decode peer's native test frame
+    SEND_REPORT,        // Send TUNE:REPORT with our measurement
+    SEND_REPORT_AND_TEST, // Responder: send report + our test frame
+    WAIT_REPORT,        // Wait for peer's TUNE:REPORT
+    APPLY,              // Apply gain corrections
+    DONE,
+};
+
 // Diagnostics snapshot for GUI
 struct ModemDiag {
     ModemState state;
@@ -62,6 +77,7 @@ struct ModemDiag {
     float snr_db;
     float agc_gain;
     float tx_level;
+    float native_rx_gain;
     int kiss_clients;
     int frames_rx;
     int frames_tx;
@@ -77,6 +93,7 @@ struct ModemDiag {
     Ax25SessionState ax25_state = Ax25SessionState::DISCONNECTED;
     std::vector<std::complex<float>> constellation;  // Last received symbols
     std::vector<float> spectrum;   // Power spectrum for waterfall
+    KalmanTrace kalman_trace;      // Kalman filter state trajectory for 3D view
 
     // Passband probe results
     ProbeState probe_state = ProbeState::IDLE;
@@ -134,6 +151,11 @@ public:
 
     // Standalone passband probe (debug — TX tones, listen, analyze)
     void start_probe();
+
+    // Auto-tune: bilateral native-frame gain calibration
+    // Each side sends a test frame, the other measures channel_gain from preamble,
+    // reports back. Both adjust TX level so peer receives at gain ≈ 1.0.
+    void start_autotune(const std::string& remote_callsign);
 
     // ARQ session control (native Iris protocol)
     void arq_connect(const std::string& remote_callsign);
@@ -390,6 +412,28 @@ private:
 
     std::string xid_peer_call_;                  // Peer callsign for probe exchange
 
+    // Auto-tune state
+    std::atomic<TuneState> tune_state_{TuneState::IDLE};
+    std::string tune_peer_call_;           // Remote callsign for tune exchange
+    bool tune_is_initiator_ = false;       // true = we started the tune
+    float tune_peer_gain_ = 0;            // What peer measured from our test frame
+    float tune_my_gain_ = 0;             // What we measured from peer's test frame
+    float native_rx_gain_ = 1.0f;        // RX gain correction (1/my_gain from auto-tune)
+    int tune_timeout_ = 0;               // Tick countdown for timeout
+    int tune_test_frames_sent_ = 0;      // Test frames transmitted
+    int tune_test_frames_target_ = 3;    // Send 3 test frames for averaging
+    int tune_frames_measured_ = 0;       // Peer test frames we've measured gain from
+    int tune_wait_peer_ticks_ = 0;       // Ticks spent in WAIT_PEER (for timeout transition)
+    int tune_report_resend_cd_ = 0;      // Countdown to resend TUNE:GAIN in WAIT_REPORT
+    void send_tune_ui(const char* payload);
+    void handle_tune_frame(const uint8_t* info, size_t len);
+    void tune_build_and_queue_test_frame();
+    void tune_apply_corrections();
+    void tune_audit(const char* fmt, ...);   // Audit to main log
+    void kalman_log_trace(const KalmanTrace& trace, bool decode_ok,
+                          float snr, float gain);  // Dump to kalman_trace.csv
+    FILE* kalman_log_file_ = nullptr;
+
     // Calibration
     std::atomic<CalState> cal_state_{CalState::IDLE};
     float cal_measured_rms_ = 0;
@@ -427,6 +471,7 @@ private:
     // Waterfall spectrum
     mutable std::mutex diag_mutex_;
     std::vector<std::complex<float>> last_constellation_;
+    KalmanTrace last_kalman_trace_;
     std::vector<float> last_spectrum_;
     float spectrum_low_hz_ = 0;
     float spectrum_high_hz_ = 4000.0f;

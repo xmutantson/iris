@@ -653,6 +653,7 @@ int main(int argc, char** argv) {
             },
             [&]() { modem.start_calibration(); gui.log("Calibration started"); },
             [&]() { modem.start_probe(); gui.log("Standalone probe started"); },
+            [&](const std::string& call) { modem.start_autotune(call); },
             [&](const IrisConfig& new_cfg) {
                 config = new_cfg;
                 save_config(config_path, config);
@@ -705,6 +706,13 @@ int main(int argc, char** argv) {
 
         // ARQ timeouts
         modem.tick();
+
+        // Sync calibrated TX level from modem back to main config (for save on shutdown)
+        if (modem.config().calibrated_tx_level > 0 &&
+            modem.config().calibrated_tx_level != config.calibrated_tx_level) {
+            config.tx_level = modem.config().tx_level;
+            config.calibrated_tx_level = modem.config().calibrated_tx_level;
+        }
 
         auto now = std::chrono::steady_clock::now();
         if (!use_gui && std::chrono::duration_cast<std::chrono::seconds>(now - last_status).count() >= 5) {

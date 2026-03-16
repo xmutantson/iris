@@ -5,6 +5,7 @@
 #include "imgui.h"
 #include "imgui_impl_opengl3.h"
 #include "engine/speed_level.h"
+#include "native/frame.h"
 #include "arq/arq.h"
 #include "ax25/ax25_session.h"
 #include "probe/passband_probe.h"
@@ -276,33 +277,156 @@ static void DrawMeter(const char* label, float value, float min_val, float max_v
     ImGui::PopID();
 }
 
-static void DrawConstellation(const std::vector<std::complex<float>>& points, float width, float height) {
+// 3D Kalman state viewer — shows phase/freq/accel trajectory in projected 3D space
+// Replaces constellation diagram. Auto-rotates, forward Kalman in cyan, RTS smoothed in green.
+static float g_kalman_yaw = 0.4f;    // rotation around vertical axis (radians)
+static float g_kalman_pitch = 0.3f;  // tilt angle
+static bool  g_kalman_auto_rotate = true;
+static bool  g_kalman_show_axes = true;
+
+// Simple 3D->2D isometric projection
+struct Vec3 { float x, y, z; };
+
+static ImVec2 project3d(Vec3 v, float yaw, float pitch, float cx, float cy, float scale) {
+    float c1 = cosf(yaw), s1 = sinf(yaw);
+    float rx = v.x * c1 + v.z * s1;
+    float rz = -v.x * s1 + v.z * c1;
+    float ry = v.y;
+    float c2 = cosf(pitch), s2 = sinf(pitch);
+    float py = ry * c2 - rz * s2;
+    return ImVec2(cx + rx * scale, cy - py * scale);
+}
+
+static void DrawKalman3D(const KalmanTrace& trace, float width, float height, bool show_controls = false) {
+    if (show_controls) {
+        ImGui::Checkbox("Axes", &g_kalman_show_axes);
+        ImGui::SameLine();
+        ImGui::Checkbox("Rotate", &g_kalman_auto_rotate);
+    }
+
     ImVec2 pos = ImGui::GetCursorScreenPos();
     ImDrawList* dl = ImGui::GetWindowDrawList();
 
-    dl->AddRectFilled(pos, ImVec2(pos.x + width, pos.y + height), IM_COL32(15, 15, 20, 255));
+    dl->AddRectFilled(pos, ImVec2(pos.x + width, pos.y + height), IM_COL32(10, 10, 15, 255));
+    // Clip drawing to widget bounds
+    dl->PushClipRect(pos, ImVec2(pos.x + width, pos.y + height), true);
 
     float cx = pos.x + width * 0.5f;
     float cy = pos.y + height * 0.5f;
-    dl->AddLine(ImVec2(pos.x, cy), ImVec2(pos.x + width, cy), IM_COL32(40, 40, 50, 255));
-    dl->AddLine(ImVec2(cx, pos.y), ImVec2(cx, pos.y + height), IM_COL32(40, 40, 50, 255));
-
     float dim = (width < height) ? width : height;
-    float scale = dim / 4.5f;
+    float scale = dim * 0.35f;
 
-    for (const auto& sym : points) {
-        float px = cx + sym.real() * scale;
-        float py = cy - sym.imag() * scale;
-        if (px >= pos.x && px <= pos.x + width && py >= pos.y && py <= pos.y + height)
-            dl->AddCircleFilled(ImVec2(px, py), 2.0f, IM_COL32(0, 200, 255, 180));
+    // Auto-rotate
+    if (g_kalman_auto_rotate)
+        g_kalman_yaw += 0.005f;
+
+    float yaw = g_kalman_yaw;
+    float pitch = g_kalman_pitch;
+
+    // Draw axes
+    float axis_len = 0.9f;
+    Vec3 origin = {0, 0, 0};
+    Vec3 ax_x = {axis_len, 0, 0};
+    Vec3 ax_y = {0, axis_len, 0};
+    Vec3 ax_z = {0, 0, axis_len};
+
+    ImVec2 o2 = project3d(origin, yaw, pitch, cx, cy, scale);
+    ImVec2 xp = project3d(ax_x, yaw, pitch, cx, cy, scale);
+    ImVec2 yp = project3d(ax_y, yaw, pitch, cx, cy, scale);
+    ImVec2 zp = project3d(ax_z, yaw, pitch, cx, cy, scale);
+
+    if (g_kalman_show_axes) {
+        dl->AddLine(o2, xp, IM_COL32(200, 60, 60, 150), 1.0f);
+        dl->AddLine(o2, yp, IM_COL32(60, 200, 60, 150), 1.0f);
+        dl->AddLine(o2, zp, IM_COL32(60, 60, 200, 150), 1.0f);
+        dl->AddText(xp, IM_COL32(200, 80, 80, 200), "Ph");
+        dl->AddText(yp, IM_COL32(80, 200, 80, 200), "Fr");
+        dl->AddText(zp, IM_COL32(80, 80, 200, 200), "Ac");
     }
 
-    if (points.empty()) {
-        const char* txt = "Waiting for data...";
+    if (trace.fwd.empty()) {
+        const char* txt = "No Kalman data";
         ImVec2 ts = ImGui::CalcTextSize(txt);
         dl->AddText(ImVec2(cx - ts.x * 0.5f, cy - 6), IM_COL32(80, 80, 80, 200), txt);
+    } else {
+        // Compute data ranges for normalization to [-1, 1]
+        float ph_min = 1e9f, ph_max = -1e9f;
+        float fr_min = 1e9f, fr_max = -1e9f;
+        float ac_min = 1e9f, ac_max = -1e9f;
+        for (const auto& p : trace.smoothed) {
+            ph_min = std::min(ph_min, p.phase); ph_max = std::max(ph_max, p.phase);
+            fr_min = std::min(fr_min, p.freq);  fr_max = std::max(fr_max, p.freq);
+            ac_min = std::min(ac_min, p.accel); ac_max = std::max(ac_max, p.accel);
+        }
+        for (const auto& p : trace.fwd) {
+            ph_min = std::min(ph_min, p.phase); ph_max = std::max(ph_max, p.phase);
+            fr_min = std::min(fr_min, p.freq);  fr_max = std::max(fr_max, p.freq);
+            ac_min = std::min(ac_min, p.accel); ac_max = std::max(ac_max, p.accel);
+        }
+        auto safe_range = [](float& lo, float& hi) {
+            if (hi - lo < 1e-9f) { lo -= 0.5f; hi += 0.5f; }
+            float m = (hi - lo) * 0.05f;
+            lo -= m; hi += m;
+        };
+        safe_range(ph_min, ph_max);
+        safe_range(fr_min, fr_max);
+        safe_range(ac_min, ac_max);
+
+        auto normalize = [](float v, float lo, float hi) -> float {
+            return 2.0f * (v - lo) / (hi - lo) - 1.0f;
+        };
+
+        auto to3d = [&](const KalmanTracePoint& p) -> Vec3 {
+            return { normalize(p.phase, ph_min, ph_max) * 0.8f,
+                     normalize(p.freq, fr_min, fr_max) * 0.8f,
+                     normalize(p.accel, ac_min, ac_max) * 0.8f };
+        };
+
+        // Forward Kalman trajectory (cyan, thin)
+        int n = (int)trace.fwd.size();
+        for (int i = 1; i < n; i++) {
+            ImVec2 a = project3d(to3d(trace.fwd[i-1]), yaw, pitch, cx, cy, scale);
+            ImVec2 b = project3d(to3d(trace.fwd[i]), yaw, pitch, cx, cy, scale);
+            dl->AddLine(a, b, IM_COL32(0, 160, 200, 100), 1.0f);
+        }
+
+        // Smoothed trajectory (green->yellow gradient, thicker)
+        n = (int)trace.smoothed.size();
+        for (int i = 1; i < n; i++) {
+            float t = (float)i / (float)(n - 1);
+            uint8_t r = (uint8_t)(t * 200);
+            uint8_t g = (uint8_t)(200 + t * 55);
+            ImVec2 a = project3d(to3d(trace.smoothed[i-1]), yaw, pitch, cx, cy, scale);
+            ImVec2 b = project3d(to3d(trace.smoothed[i]), yaw, pitch, cx, cy, scale);
+            dl->AddLine(a, b, IM_COL32(r, g, 0, 220), 1.5f);
+        }
+
+        // Pilot markers (white dots)
+        for (int i = 0; i < (int)trace.smoothed.size(); i++) {
+            if (trace.smoothed[i].is_pilot) {
+                ImVec2 p = project3d(to3d(trace.smoothed[i]), yaw, pitch, cx, cy, scale);
+                dl->AddCircleFilled(p, 2.0f, IM_COL32(255, 255, 255, 200));
+            }
+        }
+
+        // Start (green) / end (red) markers
+        if (!trace.smoothed.empty()) {
+            ImVec2 sp = project3d(to3d(trace.smoothed.front()), yaw, pitch, cx, cy, scale);
+            ImVec2 ep = project3d(to3d(trace.smoothed.back()), yaw, pitch, cx, cy, scale);
+            dl->AddCircleFilled(sp, 4.0f, IM_COL32(0, 255, 0, 255));
+            dl->AddCircleFilled(ep, 4.0f, IM_COL32(255, 60, 60, 255));
+        }
+
+        // Info text
+        char info[128];
+        snprintf(info, sizeof(info), "%d sym  Ph:%.0f%c  Fr:%.1e",
+                 trace.total_symbols,
+                 (ph_max - ph_min) * 180.0f / (float)M_PI, 0xB0,  // degree sign
+                 fr_max - fr_min);
+        dl->AddText(ImVec2(pos.x + 4, pos.y + 2), IM_COL32(160, 160, 160, 200), info);
     }
 
+    dl->PopClipRect();
     dl->AddRect(pos, ImVec2(pos.x + width, pos.y + height), IM_COL32(80, 80, 80, 255));
     ImGui::Dummy(ImVec2(width, height));
 }
@@ -466,6 +590,8 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
                 show_log_ = !show_log_;
             if (ImGui::MenuItem("Packet Log...", nullptr, show_packet_log_))
                 show_packet_log_ = !show_packet_log_;
+            if (ImGui::MenuItem("Kalman 3D...", nullptr, show_kalman_))
+                show_kalman_ = !show_kalman_;
             ImGui::EndMenu();
         }
         ImGui::EndMainMenuBar();
@@ -529,8 +655,8 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
         float diag_sz = avail.y;
         if (diag_sz < 80) diag_sz = 80;
 
-        // Left: Constellation diagram
-        DrawConstellation(diag.constellation, diag_sz, diag_sz);
+        // Left: 3D Kalman state viewer (phase/freq/accel trajectory)
+        DrawKalman3D(diag.kalman_trace, diag_sz, diag_sz);
 
         ImGui::SameLine();
 
@@ -655,6 +781,25 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Use native PHY (BPSK+LDPC) for hailing.\n~10 dB better sensitivity than AFSK.\nBoth sides must enable this.");
 
+            // Auto Tune: callsign input + button
+            {
+                static char tune_call[10] = "";
+                ImGui::SetNextItemWidth(70);
+                ImGui::InputText("##tunecall", tune_call, sizeof(tune_call),
+                                 ImGuiInputTextFlags_CharsUppercase | ImGuiInputTextFlags_CharsNoBlank);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Remote callsign for auto-tune");
+                ImGui::SameLine();
+                bool can_tune = (tune_call[0] != '\0');
+                if (!can_tune) ImGui::BeginDisabled();
+                if (ImGui::Button("Auto Tune", ImVec2(90, 28))) {
+                    if (callbacks_.on_autotune) callbacks_.on_autotune(std::string(tune_call));
+                }
+                if (!can_tune) ImGui::EndDisabled();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Bilateral gain calibration using native frames.\nBoth sides adjust TX level so peer receives at gain ~1.0.");
+            }
+
             if (ImGui::Button("Auto Cal", ImVec2(90, 28))) {
                 if (callbacks_.on_calibrate) callbacks_.on_calibrate();
             }
@@ -664,6 +809,10 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
             }
             if (config.calibrated_tx_level > 0)
                 ImGui::Text("Cal: %.3f", config.calibrated_tx_level);
+            if (diag.native_rx_gain != 1.0f) {
+                ImGui::SameLine();
+                ImGui::Text("RxG: %.2f", diag.native_rx_gain);
+            }
         }
         ImGui::EndGroup();
     }
@@ -962,6 +1111,17 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
                                   pkt_text_buf.size(),
                                   avail, ImGuiInputTextFlags_ReadOnly);
 
+        ImGui::End();
+    }
+
+    // ========== Kalman 3D Window (floating, draggable, resizable) ==========
+    if (show_kalman_) {
+        ImGui::SetNextWindowSize(ImVec2(400, 420), ImGuiCond_FirstUseEver);
+        ImGui::Begin("Kalman 3D", &show_kalman_);
+        ImVec2 avail = ImGui::GetContentRegionAvail();
+        float sz = (avail.x < avail.y) ? avail.x : avail.y;
+        if (sz < 100) sz = 100;
+        DrawKalman3D(last_diag_.kalman_trace, sz, sz, true);
         ImGui::End();
     }
 

@@ -7,6 +7,11 @@
 #include <cmath>
 #include <algorithm>
 #include <random>
+#include <chrono>
+#ifdef _WIN32
+#include <windows.h>
+#include <shlobj.h>
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -479,6 +484,7 @@ bool Modem::init(const IrisConfig& config) {
             probe_start_pending_ = false;
             native_mode_ = false;
             native_tx_ready_ = false;
+            native_rx_gain_ = 1.0f;
             disconnect_timeout_ticks_ = 600;  // 30s at 50ms/tick
         }
 
@@ -571,6 +577,10 @@ void Modem::shutdown() {
     state_ = ModemState::IDLE;
     native_mod_.reset();
     native_demod_.reset();
+    if (kalman_log_file_) {
+        fclose(kalman_log_file_);
+        kalman_log_file_ = nullptr;
+    }
 }
 
 void Modem::ptt_on() {
@@ -921,6 +931,12 @@ void Modem::dispatch_rx_frame(const std::vector<uint8_t>& frame, bool from_fx25,
                 handle_cal_frame(info, info_len);
                 is_cal = true;
             }
+            // TUNE: UI frames (auto-tune gain calibration)
+            if (!is_cal && info_len >= 5 && info[0] == 'T' && info[1] == 'U' &&
+                info[2] == 'N' && info[3] == 'E' && info[4] == ':') {
+                handle_tune_frame(info, info_len);
+                is_cal = true;  // reuse flag to skip further processing
+            }
             // PROBE:START UI frame — remote wants us to start probe responder.
             if (!is_cal && info_len >= 11 &&
                 memcmp(info, "PROBE:START", 11) == 0) {
@@ -1079,6 +1095,13 @@ void Modem::process_rx_native(const float* audio, int count) {
         iq_count = count * 2;
     }
 
+    // Apply RX gain correction from auto-tune: scales IQ so channel_gain ≈ 1.0.
+    // This compensates for quiet peers whose TX can't be boosted (radio deviation-limited).
+    if (native_rx_gain_ != 1.0f && !iq_buf.empty()) {
+        for (auto& s : iq_buf) s *= native_rx_gain_;
+        iq_data = iq_buf.data();  // pointer may have been invalidated
+    }
+
     rx_overlap_buf_.insert(rx_overlap_buf_.end(), iq_data, iq_data + iq_count);
 
     if (rx_overlap_buf_.size() > RX_OVERLAP_MAX) {
@@ -1130,8 +1153,40 @@ void Modem::process_rx_native(const float* audio, int count) {
         }
 
         std::vector<uint8_t> payload;
-        if (decode_native_frame(rx_overlap_buf_.data(), rx_overlap_buf_.size(),
-                                 start, phy_config_, payload)) {
+        // Always capture Kalman trace (even on decode failure — essential for debugging)
+        bool decode_ok = decode_native_frame(rx_overlap_buf_.data(), rx_overlap_buf_.size(),
+                                              start, phy_config_, payload);
+        {
+            std::lock_guard<std::mutex> lock(diag_mutex_);
+            last_kalman_trace_ = decode_kalman_trace();
+        }
+        kalman_log_trace(last_kalman_trace_, decode_ok,
+                         decode_snr_db(), decode_channel_gain());
+
+        // Auto-tune: capture channel_gain from peer's test frame.
+        // channel_gain comes from preamble — valid even on decode failure.
+        // Skip self-heard frames: after our own TX, the overlap buffer may
+        // still contain our echoed frames with inflated gain.
+        if (tune_state_ == TuneState::WAIT_PEER && native_selfhear_guard_ <= 0) {
+            float gain = decode_channel_gain();
+            if (gain > 0.01f) {
+                tune_frames_measured_++;
+                if (tune_my_gain_ == 0)
+                    tune_my_gain_ = gain;
+                else
+                    tune_my_gain_ = 0.7f * tune_my_gain_ + 0.3f * gain;  // EMA
+                IRIS_LOG("[TUNE] frame %d: gain=%.4f avg=%.4f (decode=%s)",
+                         tune_frames_measured_, gain, tune_my_gain_,
+                         decode_ok ? "OK" : "FAIL");
+                tune_audit("MEASURE peer=%s frame=%d raw_gain=%.4f ema_gain=%.4f decode=%s",
+                           tune_peer_call_.c_str(), tune_frames_measured_, gain,
+                           tune_my_gain_, decode_ok ? "OK" : "FAIL");
+                // Don't transition here — tick() handles WAIT_PEER→SEND_REPORT
+                // after accumulating enough frames or timeout.
+            }
+        }
+
+        if (decode_ok) {
             // Self-hear guard: discard frames decoded from our own TX echo
             if (native_selfhear_guard_ > 0) {
                 IRIS_LOG("RX native frame %zu bytes DISCARDED (self-hear guard, %d samples remaining)",
@@ -1280,6 +1335,16 @@ void Modem::process_rx_native(const float* audio, int count) {
                         return;
                     }
 
+                    // Filter out tune test frames — they are NOT AX.25 data.
+                    // If dispatched, the garbage bytes get parsed as RNR/REJ and
+                    // poison the AX.25 session state.
+                    static const uint8_t tune_marker[] = "TUNE_TEST_FRAME";
+                    if (len == sizeof(tune_marker) - 1 &&
+                        memcmp(data, tune_marker, len) == 0) {
+                        IRIS_LOG("[TUNE] Discarded decoded test frame (not dispatching to AX.25)");
+                        return;
+                    }
+
                     std::vector<uint8_t> ax25_frame(data, data + len);
                     if (packet_log_ && len >= 14)
                         packet_log_(false, "OFDM-KISS", describe_ax25(data, len));
@@ -1418,6 +1483,11 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
     }
 
     if (tx_pos_ < tx_buffer_.size()) {
+        // Fresh buffer at pos 0: turn PTT on before sending.
+        // Covers externally-filled buffers (tune test frames) that bypass
+        // the normal queue→build→ptt_on path below.
+        if (tx_pos_ == 0) ptt_on();
+
         size_t remaining = tx_buffer_.size() - tx_pos_;
         size_t to_copy = std::min((size_t)frame_count, remaining);
         std::memcpy(tx_audio, tx_buffer_.data() + tx_pos_, to_copy * sizeof(float));
@@ -2286,6 +2356,117 @@ void Modem::tick() {
         }
     }
 
+    // Auto-tune FSM tick
+    if (tune_state_ != TuneState::IDLE && tune_state_ != TuneState::DONE) {
+        tune_timeout_--;
+        if (tune_timeout_ <= 0) {
+            IRIS_LOG("[TUNE] Timeout — aborting");
+            tune_audit("TIMEOUT peer=%s role=%s state=%d my_gain=%.4f peer_gain=%.4f frames=%d",
+                       tune_peer_call_.c_str(),
+                       tune_is_initiator_ ? "initiator" : "responder",
+                       (int)tune_state_.load(), tune_my_gain_, tune_peer_gain_,
+                       tune_frames_measured_);
+            if (gui_log_) gui_log_("[TUNE] Timeout — no response from peer");
+            tune_state_ = TuneState::IDLE;
+        } else {
+            TuneState ts = tune_state_;
+            if (ts == TuneState::SEND_START) {
+                // Wait for TUNE:START UI frames to drain, then TX test frames
+                if (tx_buffer_.empty() && ax25_tx_queue_.empty()) {
+                    IRIS_LOG("[TUNE] TUNE:START sent, building test frames");
+                    if (gui_log_) gui_log_("[TUNE] Sending test frames...");
+                    tune_build_and_queue_test_frame();  // builds all frames + sets tx_pos_=0
+                    tune_state_ = TuneState::TX_TEST;
+                    // ptt_on() happens automatically in process_tx when tx_pos_==0 && !tx_buffer_.empty()
+                }
+            } else if (ts == TuneState::TX_TEST) {
+                // Wait for test frames to finish transmitting.
+                // process_tx clears tx_buffer_ and enters drain automatically,
+                // so check that we're back to IDLE (drain complete).
+                if (state_ == ModemState::IDLE && tx_buffer_.empty()) {
+                    if (tune_is_initiator_) {
+                        IRIS_LOG("[TUNE] Test frames sent, waiting for peer");
+                        if (gui_log_) gui_log_("[TUNE] Test frames sent, waiting for peer...");
+                        tune_state_ = TuneState::WAIT_PEER;
+                        tune_wait_peer_ticks_ = 0;
+                    } else {
+                        // Responder: test frames sent, wait for initiator's gain report
+                        IRIS_LOG("[TUNE] Responder: test frames sent, waiting for initiator report");
+                        if (gui_log_) gui_log_("[TUNE] Waiting for initiator report...");
+                        tune_state_ = TuneState::WAIT_REPORT;
+                        tune_report_resend_cd_ = 100;  // Resend our report after 5s if no response
+                    }
+                }
+            } else if (ts == TuneState::WAIT_PEER) {
+                // Accumulate gain measurements from peer's test frames.
+                // Wait for all expected frames OR 5s timeout.
+                // Using 5s minimum avoids sending our report while the peer
+                // is still transmitting (half-duplex collision).
+                tune_wait_peer_ticks_++;
+                if (tune_my_gain_ > 0 &&
+                    (tune_frames_measured_ >= tune_test_frames_target_ ||
+                     tune_wait_peer_ticks_ >= 100)) {  // 100 ticks = 5s
+                    IRIS_LOG("[TUNE] WAIT_PEER done: %d frames measured, avg gain=%.4f (waited %d ticks)",
+                             tune_frames_measured_, tune_my_gain_, tune_wait_peer_ticks_);
+                    if (tune_is_initiator_) {
+                        tune_state_ = TuneState::SEND_REPORT;
+                    } else {
+                        tune_state_ = TuneState::SEND_REPORT_AND_TEST;
+                    }
+                }
+            } else if (ts == TuneState::SEND_REPORT) {
+                // Send our gain measurement to peer (twice for reliability)
+                char report[48];
+                snprintf(report, sizeof(report), "TUNE:GAIN=%.4f", tune_my_gain_);
+                send_tune_ui(report);
+                send_tune_ui(report);
+                IRIS_LOG("[TUNE] Sending gain report: %.4f", tune_my_gain_);
+                tune_state_ = TuneState::WAIT_REPORT;
+                tune_report_resend_cd_ = 100;  // Resend after 5s if no response
+                // Fast-track: if peer_gain already received (arrived during WAIT_PEER)
+                if (tune_peer_gain_ > 0.01f) {
+                    IRIS_LOG("[TUNE] Fast-track: peer gain already received (%.4f)", tune_peer_gain_);
+                    tune_state_ = TuneState::APPLY;
+                }
+            } else if (ts == TuneState::WAIT_REPORT) {
+                // Resend TUNE:GAIN if the peer hasn't responded.
+                // This handles half-duplex collisions: our report may have been
+                // sent while the peer was still transmitting (PTT on, rx_muted).
+                tune_report_resend_cd_--;
+                if (tune_report_resend_cd_ <= 0) {
+                    char report[48];
+                    snprintf(report, sizeof(report), "TUNE:GAIN=%.4f", tune_my_gain_);
+                    send_tune_ui(report);
+                    send_tune_ui(report);
+                    tune_report_resend_cd_ = 100;  // retry again in 5s
+                    IRIS_LOG("[TUNE] Resending gain report (%.4f) — peer may have missed it", tune_my_gain_);
+                }
+            } else if (ts == TuneState::SEND_REPORT_AND_TEST) {
+                // Responder: send gain report via AFSK (twice for reliability), then native test frames.
+                char report[48];
+                snprintf(report, sizeof(report), "TUNE:GAIN=%.4f", tune_my_gain_);
+                send_tune_ui(report);
+                send_tune_ui(report);
+                IRIS_LOG("[TUNE] Responder: sending gain report (%.4f), test frames queued after drain",
+                         tune_my_gain_);
+                if (gui_log_) gui_log_("[TUNE] Sending report + test frames...");
+                tune_test_frames_sent_ = 0;
+                // Go to a sub-state: wait for AFSK report to drain, then send native test frames
+                tune_state_ = TuneState::SEND_START;  // reuse SEND_START to wait for drain + build
+            } else if (ts == TuneState::APPLY) {
+                tune_apply_corrections();  // sets DONE
+            }
+            // (responder TX_TEST completion handled in TX_TEST branch above)
+        }
+    }
+    // Reset DONE state after 5 seconds (100 ticks)
+    if (tune_state_ == TuneState::DONE) {
+        tune_timeout_--;
+        if (tune_timeout_ <= 0) {
+            tune_state_ = TuneState::IDLE;
+        }
+    }
+
     // DCD diagnostics: log state every 5s during active session.
     dcd_diag_ticks_++;
     if (ax25_session_.is_active() && dcd_diag_ticks_ >= 100) {  // 100 ticks = 5s
@@ -2545,6 +2726,20 @@ void Modem::tick() {
             ax25_session_.set_t1_ticks(300);
             probe_connect_timeout_ = 0;
             IRIS_LOG("Probe done — releasing held I-frames via native");
+
+            // Auto-tune after probe: gain characteristics change with bandwidth/baud,
+            // so recalibrate TX level for the newly discovered passband.
+            // Only the probe initiator triggers auto-tune — the responder will
+            // enter responder mode when it receives TUNE:START from us.
+            // TUNE:START frames queue behind csma_holdoff_ (3s listen window above),
+            // and the SEND_START tick handler waits for drain before sending test frames.
+            if (ax25_session_.we_initiated()) {
+                std::string peer = ax25_session_.remote_callsign();
+                if (!peer.empty()) {
+                    IRIS_LOG("[TUNE] Triggering auto-tune after probe (peer=%s)", peer.c_str());
+                    start_autotune(peer);
+                }
+            }
         } else if (probe_.has_results() && probe_.negotiated().valid) {
             // Manual probe: log only, no PHY change
             float low = probe_.negotiated().low_hz;
@@ -2580,6 +2775,7 @@ ModemDiag Modem::get_diagnostics() const {
     diag.snr_db = gearshift_.smoothed_snr();
     diag.agc_gain = agc_.gain();
     diag.tx_level = config_.tx_level;
+    diag.native_rx_gain = native_rx_gain_;
     diag.kiss_clients = 0;
     diag.frames_rx = frames_rx_;
     diag.frames_tx = frames_tx_;
@@ -2610,6 +2806,7 @@ ModemDiag Modem::get_diagnostics() const {
     {
         std::lock_guard<std::mutex> lock(diag_mutex_);
         diag.constellation = last_constellation_;
+        diag.kalman_trace = last_kalman_trace_;
         diag.spectrum = last_spectrum_;
     }
 
@@ -2685,6 +2882,311 @@ void Modem::compute_spectrum(const float* audio, int count) {
     last_spectrum_ = std::move(spec);
     spectrum_low_hz_ = 0;
     spectrum_high_hz_ = DS_RATE / 2.0f;
+}
+
+// --- Auto-Tune (bilateral native-frame gain calibration) ---
+// Protocol:
+//   Initiator: clicks Auto Tune → sends TUNE:START UI → TX native test frame(s) →
+//              waits for peer's TUNE:GAIN report + peer's test frame(s) →
+//              sends TUNE:GAIN report → both apply corrections → DONE.
+//   Responder: receives TUNE:START → waits for initiator's test frame(s) →
+//              sends TUNE:GAIN report + own test frame(s) → waits for initiator's report → DONE.
+//
+// The test frames are standard native frames (BPSK, LDPC 1/2) with a known payload.
+// channel_gain from preamble correlation gives the receive amplitude.
+// Each side adjusts TX: tx_level *= (1.0 / peer_measured_gain) to normalize to gain≈1.0.
+
+void Modem::send_tune_ui(const char* payload) {
+    auto src = ax25_make_addr(config_.callsign);
+    auto dst = ax25_make_addr("TUNE");
+    auto frame = ax25_build_u(dst, src, AX25_CTRL_UI, false, true);
+    frame.push_back(AX25_PID_NONE);
+    size_t plen = strlen(payload);
+    frame.insert(frame.end(), (const uint8_t*)payload, (const uint8_t*)payload + plen);
+    std::lock_guard<std::mutex> lock(tx_mutex_);
+    ax25_tx_queue_.push(std::move(frame));
+}
+
+void Modem::tune_build_and_queue_test_frame() {
+    // Build N native test frames with known payload into tx_buffer_.
+    // Using BPSK + LDPC 1/2 for maximum reliability.
+    // This builds the complete audio buffer (all frames concatenated)
+    // and lets process_tx handle PTT, tx_level, and TXDELAY padding.
+    const uint8_t test_payload[] = "TUNE_TEST_FRAME";
+
+    std::lock_guard<std::mutex> lock(tx_mutex_);
+    tx_buffer_.clear();
+
+    for (int i = 0; i < tune_test_frames_target_; i++) {
+        auto iq = build_native_frame(test_payload, sizeof(test_payload) - 1,
+                                      phy_config_, LdpcRate::RATE_1_2);
+        if (iq.empty()) {
+            IRIS_LOG("[TUNE] Failed to build test frame %d", i + 1);
+            continue;
+        }
+
+        std::vector<float> audio;
+        if (use_upconvert_) {
+            audio = upconverter_.iq_to_audio(iq.data(), iq.size());
+            if (tx_channel_eq_.is_configured()) {
+                tx_channel_eq_.apply(audio.data(), (int)audio.size());
+                for (auto& s : audio) {
+                    if (s > 0.95f) s = 0.95f + 0.05f * std::tanh((s - 0.95f) / 0.05f);
+                    else if (s < -0.95f) s = -0.95f + 0.05f * std::tanh((s + 0.95f) / 0.05f);
+                }
+            }
+        } else {
+            audio.resize(iq.size() / 2);
+            for (size_t j = 0; j < iq.size() / 2; j++)
+                audio[j] = iq[2 * j];
+        }
+
+        tx_buffer_.insert(tx_buffer_.end(), audio.begin(), audio.end());
+        tune_test_frames_sent_++;
+    }
+
+    // Apply tx_level, add TXDELAY padding (same as normal TX path)
+    for (auto& s : tx_buffer_) s *= config_.tx_level;
+
+    int pre_samples = 50 * config_.sample_rate / 1000;  // 50ms PTT settle
+    if (pre_samples > 0)
+        tx_buffer_.insert(tx_buffer_.begin(), pre_samples, 0.0f);
+    int post_samples = config_.ptt_post_delay_ms * config_.sample_rate / 1000;
+    if (post_samples > 0)
+        tx_buffer_.insert(tx_buffer_.end(), post_samples, 0.0f);
+
+    tx_pos_ = 0;
+    state_ = ModemState::TX_NATIVE;
+    frames_tx_++;
+
+    IRIS_LOG("[TUNE] Built %d test frames, %zu samples (%d ms)",
+             tune_test_frames_sent_, tx_buffer_.size(),
+             (int)(tx_buffer_.size() * 1000 / config_.sample_rate));
+}
+
+void Modem::handle_tune_frame(const uint8_t* info, size_t len) {
+    std::string payload((const char*)info, len);
+
+    if (payload.find("TUNE:START") != std::string::npos) {
+        // Remote is starting tune — enter responder mode
+        if (tune_state_ == TuneState::IDLE) {
+            IRIS_LOG("[TUNE] Received TUNE:START — entering responder mode");
+            if (gui_log_) gui_log_("[TUNE] Remote requested auto-tune");
+            tune_audit("=== TUNE START === local=%s role=responder tx_level=%.3f rx_gain=%.3f",
+                       config_.callsign.c_str(), config_.tx_level, native_rx_gain_);
+            tune_state_ = TuneState::WAIT_PEER;
+            tune_is_initiator_ = false;
+            tune_peer_call_ = ax25_session_.remote_callsign();
+            tune_my_gain_ = 0;
+            tune_peer_gain_ = 0;
+            tune_timeout_ = 400;  // 20s at 50ms/tick
+            tune_test_frames_sent_ = 0;
+            tune_frames_measured_ = 0;
+            tune_wait_peer_ticks_ = 0;
+        }
+    } else if (payload.find("TUNE:GAIN=") != std::string::npos) {
+        // Remote is reporting the gain they measured from our test frames
+        size_t pos = payload.find("TUNE:GAIN=");
+        float remote_gain = 0;
+        try {
+            remote_gain = std::stof(payload.substr(pos + 10));
+        } catch (...) {
+            IRIS_LOG("[TUNE] Invalid gain format in payload");
+            return;
+        }
+        if (remote_gain <= 0.01f || remote_gain > 10.0f) {
+            IRIS_LOG("[TUNE] Gain out of range: %.4f", remote_gain);
+            return;
+        }
+        IRIS_LOG("[TUNE] Peer reports gain=%.4f from our test frames (state=%d)",
+                 remote_gain, (int)tune_state_.load());
+        tune_audit("PEER_REPORT peer_gain=%.4f my_gain=%.4f state=%d",
+                   remote_gain, tune_my_gain_, (int)tune_state_.load());
+        tune_peer_gain_ = remote_gain;
+
+        if (tune_is_initiator_) {
+            // Only APPLY if we also measured the peer's gain.
+            // The peer's TUNE:GAIN report can arrive before their test frames
+            // (AFSK is shorter than native), so we may still be in WAIT_PEER.
+            if (tune_my_gain_ > 0 && tune_state_ == TuneState::WAIT_REPORT) {
+                tune_state_ = TuneState::APPLY;
+            } else if (tune_state_ == TuneState::WAIT_PEER) {
+                IRIS_LOG("[TUNE] Stored peer gain (still measuring their frames)");
+                // Stay in WAIT_PEER — tick() will handle transition after measuring
+            }
+            // If in SEND_REPORT, tick() will fast-track to APPLY after transitioning
+        } else {
+            // Responder: only APPLY from WAIT_REPORT
+            if (tune_state_ == TuneState::WAIT_REPORT) {
+                tune_state_ = TuneState::APPLY;
+            }
+        }
+    }
+}
+
+void Modem::tune_apply_corrections() {
+    // Hybrid TX/RX correction — no double-dip because adjustments are deterministic
+    // and each side can predict what the peer will do.
+    //
+    // Both sides exchange gain reports. Each side knows:
+    //   my_gain   = what WE measured from peer's test frames
+    //   peer_gain = what the PEER measured from OUR test frames
+    //
+    // TX rule: if peer_gain > 1, we're overdriving the peer → reduce TX.
+    //   Reducing always works (no radio clipping concern). Don't boost TX
+    //   (radio deviation limiter makes it unreliable, confirmed OTA).
+    //
+    // RX rule: if my_gain < 1, peer is too quiet for us → boost RX.
+    //   If my_gain > 1, the peer is too loud, but we KNOW they'll reduce
+    //   their TX (their peer_gain = our my_gain > 1), so skip RX correction.
+    //   This avoids double-dip: TX reduction + RX attenuation don't stack.
+
+    float old_level = config_.tx_level;
+
+    // TX: reduce if we're too loud for the peer
+    if (tune_peer_gain_ > 0.01f) {
+        if (tune_peer_gain_ > 1.0f) {
+            config_.tx_level /= tune_peer_gain_;
+            config_.tx_level = std::clamp(config_.tx_level, 0.01f, 1.0f);
+            config_.calibrated_tx_level = config_.tx_level;
+            IRIS_LOG("[TUNE] TX: peer_gain=%.3f (too loud), level %.3f → %.3f",
+                     tune_peer_gain_, old_level, config_.tx_level);
+        } else {
+            IRIS_LOG("[TUNE] TX: peer_gain=%.3f (quiet) — no change (peer boosts RX)",
+                     tune_peer_gain_);
+        }
+    }
+
+    // RX: boost if peer is too quiet; skip if peer will reduce their TX
+    if (tune_my_gain_ > 0.01f) {
+        if (tune_my_gain_ <= 1.0f) {
+            // Peer is quiet, can't boost TX → we compensate with RX gain
+            native_rx_gain_ = 1.0f / tune_my_gain_;
+            native_rx_gain_ = std::clamp(native_rx_gain_, 1.0f, 10.0f);
+            IRIS_LOG("[TUNE] RX: my_gain=%.3f (quiet peer), rx_gain=%.3f",
+                     tune_my_gain_, native_rx_gain_);
+        } else {
+            // Peer is loud — they'll reduce their TX, no RX correction needed
+            native_rx_gain_ = 1.0f;
+            IRIS_LOG("[TUNE] RX: my_gain=%.3f (loud peer) — no change (peer reduces TX)",
+                     tune_my_gain_);
+        }
+    }
+
+    if (gui_log_) {
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 "[TUNE] Done! TX=%.3f RxG=%.2f (we saw %.3f, peer saw %.3f)",
+                 config_.tx_level, native_rx_gain_, tune_my_gain_, tune_peer_gain_);
+        gui_log_(msg);
+    }
+
+    tune_audit("APPLY peer=%s role=%s my_gain=%.4f peer_gain=%.4f "
+               "tx_level=%.3f->%.3f rx_gain=%.3f frames_measured=%d",
+               tune_peer_call_.c_str(),
+               tune_is_initiator_ ? "initiator" : "responder",
+               tune_my_gain_, tune_peer_gain_,
+               old_level, config_.tx_level, native_rx_gain_,
+               tune_frames_measured_);
+
+    tune_state_ = TuneState::DONE;
+    tune_timeout_ = 100;  // 5s display before resetting to IDLE
+}
+
+void Modem::tune_audit(const char* fmt, ...) {
+    // Format and forward to main log via IRIS_LOG
+    char buf[512];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    IRIS_LOG("[TUNE-AUDIT] %s", buf);
+}
+
+void Modem::kalman_log_trace(const KalmanTrace& trace, bool decode_ok,
+                              float snr, float gain) {
+    if (trace.fwd.empty()) return;
+
+    // Lazy-open kalman_trace_YYYYMMDD_HHMMSS.csv in AppData/Iris/logs/
+    if (!kalman_log_file_) {
+        time_t now_t = time(NULL);
+        struct tm* t = localtime(&now_t);
+        char dir[512] = ".";
+        char path[700];
+#ifdef _WIN32
+        char appdata[MAX_PATH];
+        if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, appdata)))
+            snprintf(dir, sizeof(dir), "%s\\Iris\\logs", appdata);
+#else
+        const char* home = getenv("HOME");
+        if (home)
+            snprintf(dir, sizeof(dir), "%s/.config/iris/logs", home);
+#endif
+        snprintf(path, sizeof(path), "%s/kalman_trace_%04d%02d%02d_%02d%02d%02d.csv",
+                 dir, t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
+                 t->tm_hour, t->tm_min, t->tm_sec);
+        kalman_log_file_ = fopen(path, "w");
+        if (!kalman_log_file_) return;
+        fprintf(kalman_log_file_,
+                "timestamp,frame_seq,decode,snr_db,gain,total_sym,ds_factor,"
+                "sym_idx,fwd_phase,fwd_freq,fwd_accel,smo_phase,smo_freq,smo_accel,pilot\n");
+    }
+
+    // Wall-clock timestamp for this frame
+    auto now = std::chrono::system_clock::now();
+    auto t = std::chrono::system_clock::to_time_t(now);
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()).count() % 1000;
+    struct tm* tm = localtime(&t);
+    char ts[32];
+    snprintf(ts, sizeof(ts), "%04d-%02d-%02d %02d:%02d:%02d.%03d",
+             tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
+             tm->tm_hour, tm->tm_min, tm->tm_sec, (int)ms);
+
+    static int frame_seq = 0;
+    frame_seq++;
+
+    size_t n = std::min(trace.fwd.size(), trace.smoothed.size());
+    for (size_t i = 0; i < n; i++) {
+        int sym = (int)i * trace.downsample_factor;
+        fprintf(kalman_log_file_,
+                "%s,%d,%d,%.1f,%.4f,%d,%d,"
+                "%d,%.6f,%.6f,%.9f,%.6f,%.6f,%.9f,%d\n",
+                ts, frame_seq, decode_ok ? 1 : 0, snr, gain,
+                trace.total_symbols, trace.downsample_factor,
+                sym,
+                trace.fwd[i].phase, trace.fwd[i].freq, trace.fwd[i].accel,
+                trace.smoothed[i].phase, trace.smoothed[i].freq, trace.smoothed[i].accel,
+                trace.smoothed[i].is_pilot ? 1 : 0);
+    }
+    fflush(kalman_log_file_);
+}
+
+void Modem::start_autotune(const std::string& remote_callsign) {
+    if (tune_state_ != TuneState::IDLE && tune_state_ != TuneState::DONE) {
+        IRIS_LOG("[TUNE] Already in progress, ignoring");
+        return;
+    }
+    IRIS_LOG("[TUNE] Starting auto-tune with %s", remote_callsign.c_str());
+    if (gui_log_) gui_log_("[TUNE] Starting auto-tune with " + remote_callsign + "...");
+
+    tune_audit("=== TUNE START === local=%s peer=%s role=initiator tx_level=%.3f rx_gain=%.3f",
+               config_.callsign.c_str(), remote_callsign.c_str(),
+               config_.tx_level, native_rx_gain_);
+
+    tune_peer_call_ = remote_callsign;
+    tune_is_initiator_ = true;
+    tune_my_gain_ = 0;
+    tune_peer_gain_ = 0;
+    tune_test_frames_sent_ = 0;
+    tune_frames_measured_ = 0;
+    tune_wait_peer_ticks_ = 0;
+    tune_timeout_ = 400;  // 20s at 50ms/tick
+
+    // Send TUNE:START twice for reliability
+    tune_state_ = TuneState::SEND_START;
+    send_tune_ui("TUNE:START");
+    send_tune_ui("TUNE:START");
 }
 
 // --- Calibration ---

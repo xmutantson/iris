@@ -17,6 +17,7 @@ struct GuiCallbacks {
     std::function<void()> on_disconnect;
     std::function<void()> on_calibrate;
     std::function<void()> on_probe;
+    std::function<void(const std::string&)> on_autotune;  // callsign arg
     std::function<void(const IrisConfig&)> on_config_changed;
     std::function<void()> on_quit;
 };
@@ -70,6 +71,7 @@ private:
     bool show_config_ = false;
     bool show_log_ = false;
     bool show_packet_log_ = false;
+    bool show_kalman_ = false;
     int settings_tab_ = 0;
 
     // Packet log entries

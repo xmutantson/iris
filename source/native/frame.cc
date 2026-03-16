@@ -290,6 +290,12 @@ static float g_decode_snr_preamble = 0.0f;  // Preamble-only (no DD override)
 float decode_snr_db() { return g_decode_snr; }
 float decode_snr_preamble_db() { return g_decode_snr_preamble; }
 
+static KalmanTrace g_kalman_trace;
+const KalmanTrace& decode_kalman_trace() { return g_kalman_trace; }
+
+static float g_decode_channel_gain = 1.0f;
+float decode_channel_gain() { return g_decode_channel_gain; }
+
 int detect_frame_start(const float* iq_samples, size_t count, int sps) {
     auto preamble = generate_preamble();
     auto sync = generate_sync_word();
@@ -511,6 +517,7 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     float mag2 = std::sqrt(cr2 * cr2 + ci2 * ci2);
     float channel_gain = (mag1 / (half1_end - half1_start) + mag2 / (half2_end - half2_start)) / 2;
     if (channel_gain < 1e-6f) channel_gain = 1.0f;
+    g_decode_channel_gain = channel_gain;
 
     float freq_offset_hz = phase_per_symbol * default_config.baud_rate / (2.0f * (float)M_PI);
 
@@ -722,31 +729,36 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     // 3-state model: [phase, freq, accel] tracks thermal frequency drift
     // from FM transmitter PA heating.  The accel state captures frequency
     // acceleration (quadratic phase) that the 2-state model cannot follow.
-    float q_phase = 1e-4f;   // phase process noise variance (rad²/symbol)
+    float q_phase = 5e-4f;   // phase process noise variance (rad²/symbol)
     float q_freq  = 1e-5f;   // frequency process noise variance (rad²/symbol³)
-    float q_accel = 1e-7f;   // freq-rate process noise variance (rad²/symbol⁵)
-    float r_meas  = 0.10f;   // pilot measurement noise variance (rad²)
-    float r_dd    = 0.25f;   // DD measurement noise variance (rad²)
+    float q_accel = 1e-6f;   // freq-rate process noise variance (rad²/symbol⁵)
+    // Pilot noise variance scales as 1/gain²: at low gain, atan2 is noisier.
+    // Base r_meas=0.10 is calibrated for gain≈1.0.  At gain=0.57 (half amplitude),
+    // actual pilot phase noise is ~3x higher.  Without this scaling, the Kalman
+    // over-trusts noisy pilots and freq/accel states diverge.
+    float gain_sq = channel_gain * channel_gain;
+    float r_meas = std::max(0.05f, 0.10f / std::max(0.1f, gain_sq));
 
-    // --- Pass 2: Forward Kalman filter ---
-    // State: x = [phase, freq, accel]
-    // Transition: A = [[1,1,0.5],[0,1,1],[0,0,1]]
-    //   phase += freq + 0.5*accel,  freq += accel,  accel persists
-    // Measurement at pilots: z = H * x + v,  H = [1, 0, 0]
+    // --- Pilot-only Kalman ---
+    // Forward Kalman updates ONLY on pilot symbols (known +1 BPSK, every
+    // PILOT_SPACING symbols).  No decision-directed measurements.
+    //
+    // Soft DD at 6-10 dB SNR causes runaway: wrong decisions poison freq/accel
+    // states → phase spirals to millions of degrees.  Pilots every 16 symbols
+    // (7.7 ms at 2086 baud) give sufficient ground-truth density.  The RTS
+    // backward smoother optimally interpolates inter-pilot gaps.
+
     struct KalmanState {
         float phase, freq, accel;
         float P00, P01, P02, P11, P12, P22;  // 3x3 symmetric covariance
     };
 
-    // Strong Tracking Filter (STF): fading factor lambda scales A*P*A'
-    // when innovations exceed the model prediction, increasing Kalman gain
-    // during phase excursions without inflating noise in steady state.
-    const float stf_rho = 0.90f;   // forgetting factor (~10 pilot window)
-    const float stf_max = 20.0f;   // max fading factor clamp
-
-    float max_lambda_p1 = 1.0f, max_lambda_p2 = 1.0f;  // STF peak trackers
+    const char* pass2_mode = "pilot-only";
 
     std::vector<KalmanState> fwd_state(payload_symbols);
+    std::vector<float> smoothed_phase(payload_symbols);
+    std::vector<float> smoothed_freq(payload_symbols);
+    std::vector<float> smoothed_accel(payload_symbols);
     {
         KalmanState s;
         s.phase = running_phase;
@@ -755,52 +767,46 @@ bool decode_native_frame(const float* iq_samples, size_t count,
         s.P00 = 0.01f;  s.P01 = 0.0f;  s.P02 = 0.0f;
         s.P11 = 1e-6f;  s.P12 = 0.0f;
         s.P22 = 1e-8f;
-        float stf_Vk = r_meas + q_phase;  // innovation variance tracker
 
         for (int k = 0; k < payload_symbols; k++) {
-            // Predict with STF: P = lambda * A*P*A' + Q
+            // Predict: x[k|k-1] = A * x[k-1|k-1], P[k|k-1] = A*P*A' + Q
             if (k > 0) {
                 s.phase += s.freq + 0.5f * s.accel;
                 s.freq  += s.accel;
                 float p00=s.P00, p01=s.P01, p02=s.P02;
                 float p11=s.P11, p12=s.P12, p22=s.P22;
-                // A*P*A' components (before adding Q)
-                float a00 = p00 + 2*p01 + 1.5f*p02 + p11 + 1.5f*p12 + 0.25f*p22;
-                float a01 = p01 + p02 + p11 + 1.5f*p12 + 0.5f*p22;
-                float a02 = p02 + p12 + 0.5f*p22;
-                float a11 = p11 + 2*p12 + p22;
-                float a12 = p12 + p22;
-                float a22 = p22;
-                // STF fading factor: lambda >= 1
-                float Nk = stf_Vk - r_meas;
-                float lambda = (Nk > a00 && a00 > 1e-20f) ? (Nk / a00) : 1.0f;
-                if (lambda > stf_max) lambda = stf_max;
-                if (lambda > max_lambda_p1) max_lambda_p1 = lambda;
-                s.P00 = lambda*a00 + q_phase;
-                s.P01 = lambda*a01;
-                s.P02 = lambda*a02;
-                s.P11 = lambda*a11 + q_freq;
-                s.P12 = lambda*a12;
-                s.P22 = lambda*a22 + q_accel;
+                s.P00 = p00 + 2*p01 + p02 + p11 + p12 + 0.25f*p22 + q_phase;
+                s.P01 = p01 + p02 + p11 + 1.5f*p12 + 0.5f*p22;
+                s.P02 = p02 + p12 + 0.5f*p22;
+                s.P11 = p11 + 2*p12 + p22 + q_freq;
+                s.P12 = p12 + p22;
+                s.P22 = p22 + q_accel;
             }
+
+            // Measurement: pilots are direct, data symbols use soft DD
+            float z = 0.0f;
+            float r = -1.0f;  // negative = no measurement
 
             if (raw_samples[k].is_pilot) {
                 float iv = raw_samples[k].iv;
                 float qv = raw_samples[k].qv;
-                float phase_corr = -s.phase;
-                float cc = std::cos(phase_corr);
-                float ss = std::sin(phase_corr);
-                float re = iv * cc - qv * ss;
-                float im = iv * ss + qv * cc;
-                float z = std::atan2(im, re);
+                float pc = -s.phase;
+                float cc = std::cos(pc), ss = std::sin(pc);
+                z = std::atan2(iv * ss + qv * cc, iv * cc - qv * ss);
+                r = r_meas;
 
-                // Update STF innovation variance tracker
-                stf_Vk = stf_rho * stf_Vk + (1.0f - stf_rho) * z * z;
-
+                // Track channel gain from pilot magnitudes
                 float pmag = std::sqrt(iv * iv + qv * qv);
                 channel_gain = 0.85f * channel_gain + 0.15f * pmag;
+            }
+            // Data symbols: no measurement (pilot-only mode)
 
-                float S = s.P00 + r_meas;
+            // Kalman measurement update (skip if no valid measurement)
+            if (r > 0) {
+                while (z > (float)M_PI) z -= 2*(float)M_PI;
+                while (z < -(float)M_PI) z += 2*(float)M_PI;
+
+                float S = s.P00 + r;
                 float K0 = s.P00 / S;
                 float K1 = s.P01 / S;
                 float K2 = s.P02 / S;
@@ -821,13 +827,7 @@ bool decode_native_frame(const float* iq_samples, size_t count,
         }
     }
 
-    // --- Pass 3: RTS backward smoother (3-state) ---
-    // C = P_fwd[k] * A' * (A * P_fwd[k] * A' + Q)^{-1}
-    // x_smooth[k] = x_fwd[k] + C * (x_smooth[k+1] - A * x_fwd[k])
-    // A = [[1,1,0.5],[0,1,1],[0,0,1]]
-    std::vector<float> smoothed_phase(payload_symbols);
-    std::vector<float> smoothed_freq(payload_symbols);
-    std::vector<float> smoothed_accel(payload_symbols);
+    // --- RTS backward smoother (3-state) ---
     {
         smoothed_phase[payload_symbols-1] = fwd_state[payload_symbols-1].phase;
         smoothed_freq[payload_symbols-1] = fwd_state[payload_symbols-1].freq;
@@ -837,20 +837,17 @@ bool decode_native_frame(const float* iq_samples, size_t count,
             float p00=fwd_state[k].P00, p01=fwd_state[k].P01, p02=fwd_state[k].P02;
             float p11=fwd_state[k].P11, p12=fwd_state[k].P12, p22=fwd_state[k].P22;
 
-            // P_pred = A*P*A' + Q
-            float pp00 = p00 + 2*p01 + 1.5f*p02 + p11 + 1.5f*p12 + 0.25f*p22 + q_phase;
+            float pp00 = p00 + 2*p01 + p02 + p11 + p12 + 0.25f*p22 + q_phase;
             float pp01 = p01 + p02 + p11 + 1.5f*p12 + 0.5f*p22;
             float pp02 = p02 + p12 + 0.5f*p22;
             float pp11 = p11 + 2*p12 + p22 + q_freq;
             float pp12 = p12 + p22;
             float pp22 = p22 + q_accel;
 
-            // PA = P * A'  (A' = [[1,0,0],[1,1,0],[0.5,1,1]])
             float pa00=p00+p01+0.5f*p02, pa01=p01+p02,         pa02=p02;
             float pa10=p01+p11+0.5f*p12, pa11=p11+p12,         pa12=p12;
             float pa20=p02+p12+0.5f*p22, pa21=p12+p22,         pa22=p22;
 
-            // inv(P_pred) via cofactors (symmetric 3x3)
             float det = pp00*(pp11*pp22 - pp12*pp12)
                       - pp01*(pp01*pp22 - pp02*pp12)
                       + pp02*(pp01*pp12 - pp02*pp11);
@@ -860,12 +857,10 @@ bool decode_native_frame(const float* iq_samples, size_t count,
             float i11=(pp00*pp22-pp02*pp02)*id, i12=(pp01*pp02-pp00*pp12)*id;
             float i22=(pp00*pp11-pp01*pp01)*id;
 
-            // C = PA * inv(P_pred)  (3x3)
             float c00=pa00*i00+pa01*i01+pa02*i02, c01=pa00*i01+pa01*i11+pa02*i12, c02=pa00*i02+pa01*i12+pa02*i22;
             float c10=pa10*i00+pa11*i01+pa12*i02, c11=pa10*i01+pa11*i11+pa12*i12, c12=pa10*i02+pa11*i12+pa12*i22;
             float c20=pa20*i00+pa21*i01+pa22*i02, c21=pa20*i01+pa21*i11+pa22*i12, c22=pa20*i02+pa21*i12+pa22*i22;
 
-            // Innovation: x_smooth[k+1] - A * x_fwd[k]
             float fp=fwd_state[k].phase, ff=fwd_state[k].freq, fa=fwd_state[k].accel;
             float dp = smoothed_phase[k+1] - (fp + ff + 0.5f*fa);
             float df = smoothed_freq[k+1]  - (ff + fa);
@@ -877,206 +872,24 @@ bool decode_native_frame(const float* iq_samples, size_t count,
         }
     }
 
-    // --- Feedforward phase re-estimation (second pass) ---
-    // Viterbi-Viterbi M-th power for BPSK/QPSK: raises symbols to M-th
-    // power to strip data modulation blindly, then sliding-window averages
-    // to extract carrier phase.  No feedback, no circularity — the phase
-    // estimate cannot be poisoned by wrong symbol decisions.
-    // Falls back to decision-directed for QAM16+ where VV doesn't apply.
-    const char* pass2_mode = "none";  // for diagnostics
-    if (payload_symbols > 512) {
-        int vv_power = 0;
-        if (mod == Modulation::BPSK) vv_power = 2;
-        else if (mod == Modulation::QPSK) vv_power = 4;
-
-        std::vector<float> pass2_meas(payload_symbols, 0.0f);
-        std::vector<bool> pass2_valid(payload_symbols, false);
-        float r_pass2 = r_dd;
-
-        if (vv_power > 0) {
-            // VV feedforward: raise each symbol to M-th power, sliding window
-            const int VV_W = 32;  // sliding window half-width
-            r_pass2 = 0.15f;     // VV noise (no circularity, tighter than DD)
-            pass2_mode = (vv_power == 4) ? "VV4" : "VV2";
-
-            std::vector<std::complex<float>> raised(payload_symbols);
-            for (int k = 0; k < payload_symbols; k++) {
-                std::complex<float> sym(raw_samples[k].iv, raw_samples[k].qv);
-                std::complex<float> r = sym;
-                for (int p = 1; p < vv_power; p++) r *= sym;
-                raised[k] = r;
-            }
-
-            for (int k = 0; k < payload_symbols; k++) {
-                if (raw_samples[k].is_pilot) {
-                    pass2_meas[k] = std::atan2(raw_samples[k].qv, raw_samples[k].iv);
-                    pass2_valid[k] = true;
-                } else {
-                    int lo = std::max(0, k - VV_W);
-                    int hi = std::min(payload_symbols - 1, k + VV_W);
-                    std::complex<float> sum(0.0f, 0.0f);
-                    for (int j = lo; j <= hi; j++) sum += raised[j];
-
-                    if (std::abs(sum) > 1e-6f) {
-                        float raw_vv = std::arg(sum) / (float)vv_power;
-                        // Resolve M-fold ambiguity using first-pass smoothed phase
-                        float ref = smoothed_phase[k];
-                        float step = 2.0f * (float)M_PI / (float)vv_power;
-                        float best = raw_vv;
-                        float best_dist = 1e9f;
-                        for (int b = 0; b < vv_power; b++) {
-                            float cand = raw_vv + b * step;
-                            float d = cand - ref;
-                            while (d > (float)M_PI) d -= 2*(float)M_PI;
-                            while (d < -(float)M_PI) d += 2*(float)M_PI;
-                            if (std::abs(d) < best_dist) {
-                                best = cand;
-                                best_dist = std::abs(d);
-                            }
-                        }
-                        pass2_meas[k] = best;
-                        pass2_valid[k] = true;
-                    }
-                }
-            }
-        } else {
-            // QAM16+: decision-directed fallback (uses first-pass phase)
-            pass2_mode = "DD";
-            for (int k = 0; k < payload_symbols; k++) {
-                float iv = raw_samples[k].iv;
-                float qv = raw_samples[k].qv;
-                if (raw_samples[k].is_pilot) {
-                    pass2_meas[k] = std::atan2(qv, iv);
-                    pass2_valid[k] = true;
-                } else {
-                    float phase_corr = -smoothed_phase[k];
-                    float cc = std::cos(phase_corr);
-                    float ss = std::sin(phase_corr);
-                    float re = iv * cc - qv * ss;
-                    float im = iv * ss + qv * cc;
-                    float snapped_re = (re >= 0) ? ((re > 0.6667f) ? 1.0f : 0.3333f)
-                                                 : ((re < -0.6667f) ? -1.0f : -0.3333f);
-                    float snapped_im = (im >= 0) ? ((im > 0.6667f) ? 1.0f : 0.3333f)
-                                                 : ((im < -0.6667f) ? -1.0f : -0.3333f);
-                    float ref_phase = std::atan2(snapped_im, snapped_re);
-                    float raw_phase = std::atan2(qv, iv);
-                    pass2_meas[k] = raw_phase - ref_phase;
-                    while (pass2_meas[k] > (float)M_PI) pass2_meas[k] -= 2*(float)M_PI;
-                    while (pass2_meas[k] < -(float)M_PI) pass2_meas[k] += 2*(float)M_PI;
-                    float sym_mag = std::sqrt(re*re + im*im);
-                    pass2_valid[k] = (sym_mag > 0.3f);
-                }
-            }
-        }
-
-        // Step 2: Forward Kalman with VV/DD measurements + STF (3-state)
-        std::vector<KalmanState> p2_fwd(payload_symbols);
-        {
-            KalmanState s;
-            s.phase = smoothed_phase[0];
-            s.freq = smoothed_freq[0];
-            s.accel = smoothed_accel[0];
-            s.P00 = 0.01f;  s.P01 = 0.0f;  s.P02 = 0.0f;
-            s.P11 = 1e-6f;  s.P12 = 0.0f;
-            s.P22 = 1e-8f;
-            float stf_Vk2 = r_pass2 + q_phase;
-
-            for (int k = 0; k < payload_symbols; k++) {
-                if (k > 0) {
-                    s.phase += s.freq + 0.5f * s.accel;
-                    s.freq  += s.accel;
-                    float p00=s.P00, p01=s.P01, p02=s.P02;
-                    float p11=s.P11, p12=s.P12, p22=s.P22;
-                    float a00 = p00 + 2*p01 + 1.5f*p02 + p11 + 1.5f*p12 + 0.25f*p22;
-                    float a01 = p01 + p02 + p11 + 1.5f*p12 + 0.5f*p22;
-                    float a02 = p02 + p12 + 0.5f*p22;
-                    float a11 = p11 + 2*p12 + p22;
-                    float a12 = p12 + p22;
-                    float a22 = p22;
-                    float Nk = stf_Vk2 - r_pass2;
-                    float lambda = (Nk > a00 && a00 > 1e-20f) ? (Nk / a00) : 1.0f;
-                    if (lambda > stf_max) lambda = stf_max;
-                    if (lambda > max_lambda_p2) max_lambda_p2 = lambda;
-                    s.P00 = lambda*a00 + q_phase;
-                    s.P01 = lambda*a01;
-                    s.P02 = lambda*a02;
-                    s.P11 = lambda*a11 + q_freq;
-                    s.P12 = lambda*a12;
-                    s.P22 = lambda*a22 + q_accel;
-                }
-
-                if (pass2_valid[k]) {
-                    float r = raw_samples[k].is_pilot ? r_meas : r_pass2;
-                    float z = pass2_meas[k] - s.phase;
-                    while (z > (float)M_PI) z -= 2*(float)M_PI;
-                    while (z < -(float)M_PI) z += 2*(float)M_PI;
-
-                    stf_Vk2 = stf_rho * stf_Vk2 + (1.0f - stf_rho) * z * z;
-
-                    float S = s.P00 + r;
-                    float K0 = s.P00 / S;
-                    float K1 = s.P01 / S;
-                    float K2 = s.P02 / S;
-                    s.phase += K0 * z;
-                    s.freq  += K1 * z;
-                    s.accel += K2 * z;
-                    float np00 = s.P00 - K0*s.P00;
-                    float np01 = s.P01 - K0*s.P01;
-                    float np02 = s.P02 - K0*s.P02;
-                    float np11 = s.P11 - K1*s.P01;
-                    float np12 = s.P12 - K1*s.P02;
-                    float np22 = s.P22 - K2*s.P02;
-                    s.P00=np00; s.P01=np01; s.P02=np02;
-                    s.P11=np11; s.P12=np12; s.P22=np22;
-                }
-
-                p2_fwd[k] = s;
-            }
-        }
-
-        // Step 3: RTS smoother on pass-2 forward (3-state)
-        {
-            smoothed_phase[payload_symbols-1] = p2_fwd[payload_symbols-1].phase;
-            smoothed_freq[payload_symbols-1] = p2_fwd[payload_symbols-1].freq;
-            smoothed_accel[payload_symbols-1] = p2_fwd[payload_symbols-1].accel;
-
-            for (int k = payload_symbols - 2; k >= 0; k--) {
-                float p00=p2_fwd[k].P00, p01=p2_fwd[k].P01, p02=p2_fwd[k].P02;
-                float p11=p2_fwd[k].P11, p12=p2_fwd[k].P12, p22=p2_fwd[k].P22;
-
-                float pp00 = p00 + 2*p01 + 1.5f*p02 + p11 + 1.5f*p12 + 0.25f*p22 + q_phase;
-                float pp01 = p01 + p02 + p11 + 1.5f*p12 + 0.5f*p22;
-                float pp02 = p02 + p12 + 0.5f*p22;
-                float pp11 = p11 + 2*p12 + p22 + q_freq;
-                float pp12 = p12 + p22;
-                float pp22 = p22 + q_accel;
-
-                float pa00=p00+p01+0.5f*p02, pa01=p01+p02,         pa02=p02;
-                float pa10=p01+p11+0.5f*p12, pa11=p11+p12,         pa12=p12;
-                float pa20=p02+p12+0.5f*p22, pa21=p12+p22,         pa22=p22;
-
-                float det = pp00*(pp11*pp22 - pp12*pp12)
-                          - pp01*(pp01*pp22 - pp02*pp12)
-                          + pp02*(pp01*pp12 - pp02*pp11);
-                if (std::abs(det) < 1e-30f) det = 1e-30f;
-                float id = 1.0f / det;
-                float i00=(pp11*pp22-pp12*pp12)*id, i01=(pp02*pp12-pp01*pp22)*id, i02=(pp01*pp12-pp02*pp11)*id;
-                float i11=(pp00*pp22-pp02*pp02)*id, i12=(pp01*pp02-pp00*pp12)*id;
-                float i22=(pp00*pp11-pp01*pp01)*id;
-
-                float c00=pa00*i00+pa01*i01+pa02*i02, c01=pa00*i01+pa01*i11+pa02*i12, c02=pa00*i02+pa01*i12+pa02*i22;
-                float c10=pa10*i00+pa11*i01+pa12*i02, c11=pa10*i01+pa11*i11+pa12*i12, c12=pa10*i02+pa11*i12+pa12*i22;
-                float c20=pa20*i00+pa21*i01+pa22*i02, c21=pa20*i01+pa21*i11+pa22*i12, c22=pa20*i02+pa21*i12+pa22*i22;
-
-                float fp=p2_fwd[k].phase, ff=p2_fwd[k].freq, fa=p2_fwd[k].accel;
-                float dp = smoothed_phase[k+1] - (fp + ff + 0.5f*fa);
-                float df = smoothed_freq[k+1]  - (ff + fa);
-                float da = smoothed_accel[k+1] - fa;
-
-                smoothed_phase[k] = fp + c00*dp + c01*df + c02*da;
-                smoothed_freq[k]  = ff + c10*dp + c11*df + c12*da;
-                smoothed_accel[k] = fa + c20*dp + c21*df + c22*da;
-            }
+    // --- Capture Kalman trace for GUI visualization ---
+    {
+        constexpr int MAX_TRACE = 512;
+        int ds = std::max(1, payload_symbols / MAX_TRACE);
+        g_kalman_trace = KalmanTrace{};
+        g_kalman_trace.total_symbols = payload_symbols;
+        g_kalman_trace.downsample_factor = ds;
+        g_kalman_trace.fwd.reserve(payload_symbols / ds + 1);
+        g_kalman_trace.smoothed.reserve(payload_symbols / ds + 1);
+        for (int k = 0; k < payload_symbols; k += ds) {
+            g_kalman_trace.fwd.push_back({
+                fwd_state[k].phase, fwd_state[k].freq, fwd_state[k].accel,
+                raw_samples[k].is_pilot
+            });
+            g_kalman_trace.smoothed.push_back({
+                smoothed_phase[k], smoothed_freq[k], smoothed_accel[k],
+                raw_samples[k].is_pilot
+            });
         }
     }
 
@@ -1109,11 +922,11 @@ bool decode_native_frame(const float* iq_samples, size_t count,
         // Convert freq from rad/symbol to Hz (baud_rate * freq / 2pi)
         // Not available here, so report in rad/symbol and deg/symbol
         IRIS_LOG("[KALMAN] payload %d syms: fwd_drift=%.1f° smooth_drift=%.1f° "
-                 "pass2=%s STF_peak=%.1f/%.1f",
+                 "mode=%s r_meas=%.3f gain=%.3f",
                  payload_symbols,
                  fwd_drift * 180.0f / (float)M_PI,
                  smooth_drift * 180.0f / (float)M_PI,
-                 pass2_mode, max_lambda_p1, max_lambda_p2);
+                 pass2_mode, r_meas, channel_gain);
         IRIS_LOG("[KALMAN] freq: start=%.4f end=%.4f (%.2f°/sym) "
                  "accel: start=%.2e end=%.2e (rad/sym²)",
                  freq_start, freq_end,
@@ -1322,6 +1135,276 @@ bool decode_native_frame(const float* iq_samples, size_t count,
         }
 
         bits = LdpcCodec::decode_soft(llrs, fec);
+
+        // LDPC-aided iterative phase re-estimation:
+        // When initial decode fails on long frames, decode block-by-block.
+        // Successfully decoded blocks provide known symbols (virtual pilots)
+        // that dramatically improve phase tracking in the tail region where
+        // FM thermal drift causes the most phase error.
+        if (bits.empty() && payload_symbols > 512) {
+            int k_fec = LdpcCodec::block_size(fec);
+            int n_fec = LdpcCodec::codeword_size(fec);
+            int num_blocks = (int)llrs.size() / n_fec;
+
+            // Step 1: Try each LDPC block individually
+            std::vector<bool> block_ok(num_blocks, false);
+            std::vector<std::vector<uint8_t>> block_data(num_blocks);
+            int n_good = 0;
+
+            for (int b = 0; b < num_blocks; b++) {
+                std::vector<float> blk_llrs(llrs.begin() + b * n_fec,
+                                            llrs.begin() + (b + 1) * n_fec);
+                auto result = LdpcCodec::decode_soft(blk_llrs, fec);
+                if (!result.empty()) {
+                    block_ok[b] = true;
+                    block_data[b] = std::move(result);
+                    n_good++;
+                }
+            }
+
+            IRIS_LOG("[LDPC-ITER] block-by-block: %d/%d decoded", n_good, num_blocks);
+
+            if (n_good > 0 && n_good < num_blocks) {
+                // Step 2: Re-encode successful blocks → ideal transmitted symbols
+                // TX pipeline: data → LDPC encode → interleave → scramble → map
+                std::vector<uint8_t> reenc_bits(num_blocks * n_fec, 0);
+                std::vector<bool> bit_known(num_blocks * n_fec, false);
+
+                constexpr int INTERLEAVE_STRIDE = 41;
+                for (int b = 0; b < num_blocks; b++) {
+                    if (!block_ok[b]) continue;
+                    auto cw = LdpcCodec::encode(block_data[b], fec);
+                    for (int i = 0; i < n_fec; i++) {
+                        int dst = b * n_fec + (i * INTERLEAVE_STRIDE) % n_fec;
+                        reenc_bits[dst] = cw[i];
+                        bit_known[dst] = true;
+                    }
+                }
+
+                // Scramble (same LFSR as TX)
+                {
+                    uint16_t lfsr = 0x6959;
+                    for (size_t i = 0; i < reenc_bits.size(); i++) {
+                        int fb = ((lfsr >> 14) ^ (lfsr >> 13)) & 1;
+                        if (bit_known[i]) reenc_bits[i] ^= (lfsr & 1);
+                        lfsr = (lfsr >> 1) | ((uint16_t)fb << 14);
+                    }
+                }
+
+                // Build sym_to_raw mapping: data symbol index → raw_sample index
+                std::vector<int> sym_to_raw;
+                for (int k = 0; k < payload_symbols; k++) {
+                    if (!raw_samples[k].is_pilot)
+                        sym_to_raw.push_back(k);
+                }
+
+                // Create virtual pilot phase measurements from known symbols
+                int n_vp = 0;
+                std::vector<float> vp_meas(payload_symbols, 0.0f);
+                std::vector<bool> vp_valid(payload_symbols, false);
+                const float r_vp = 0.002f;  // virtual pilots: very confident
+
+                for (int s = 0; s < (int)sym_to_raw.size() &&
+                     s * bps + bps - 1 < (int)reenc_bits.size(); s++) {
+                    bool all_known = true;
+                    for (int bi = 0; bi < bps; bi++) {
+                        if (!bit_known[s * bps + bi]) { all_known = false; break; }
+                    }
+                    if (!all_known) continue;
+
+                    auto ideal = map_symbol(&reenc_bits[s * bps], mod);
+                    int ri = sym_to_raw[s];
+                    float iv = raw_samples[ri].iv;
+                    float qv = raw_samples[ri].qv;
+                    float m = std::atan2(qv, iv) - std::atan2(ideal.imag(), ideal.real());
+                    while (m > (float)M_PI) m -= 2 * (float)M_PI;
+                    while (m < -(float)M_PI) m += 2 * (float)M_PI;
+                    vp_meas[ri] = m;
+                    vp_valid[ri] = true;
+                    n_vp++;
+                }
+
+                IRIS_LOG("[LDPC-ITER] %d virtual pilots from %d good blocks", n_vp, n_good);
+
+                // Step 3: Re-run forward Kalman + RTS smoother with virtual pilots
+                {
+                    KalmanState s;
+                    s.phase = smoothed_phase[0];
+                    s.freq = smoothed_freq[0];
+                    s.accel = smoothed_accel[0];
+                    s.P00 = 0.001f; s.P01 = 0; s.P02 = 0;
+                    s.P11 = 1e-6f; s.P12 = 0;
+                    s.P22 = 1e-8f;
+
+                    std::vector<KalmanState> iter_fwd(payload_symbols);
+
+                    for (int k = 0; k < payload_symbols; k++) {
+                        if (k > 0) {
+                            s.phase += s.freq + 0.5f * s.accel;
+                            s.freq += s.accel;
+                            float p00=s.P00,p01=s.P01,p02=s.P02;
+                            float p11=s.P11,p12=s.P12,p22=s.P22;
+                            s.P00 = p00+2*p01+p02+p11+p12+0.25f*p22 + q_phase;
+                            s.P01 = p01+p02+p11+1.5f*p12+0.5f*p22;
+                            s.P02 = p02+p12+0.5f*p22;
+                            s.P11 = p11+2*p12+p22 + q_freq;
+                            s.P12 = p12+p22;
+                            s.P22 = p22 + q_accel;
+                        }
+
+                        float r = -1.0f, z = 0.0f;
+                        if (raw_samples[k].is_pilot) {
+                            z = std::atan2(raw_samples[k].qv, raw_samples[k].iv) - s.phase;
+                            r = r_meas;
+                        } else if (vp_valid[k]) {
+                            z = vp_meas[k] - s.phase;
+                            r = r_vp;
+                        }
+
+                        if (r > 0) {
+                            while (z > (float)M_PI) z -= 2 * (float)M_PI;
+                            while (z < -(float)M_PI) z += 2 * (float)M_PI;
+                            // No innovation clamping — let Kalman gain handle it
+                            float S = s.P00 + r;
+                            float K0=s.P00/S, K1=s.P01/S, K2=s.P02/S;
+                            s.phase += K0*z; s.freq += K1*z; s.accel += K2*z;
+                            float np00=s.P00-K0*s.P00, np01=s.P01-K0*s.P01, np02=s.P02-K0*s.P02;
+                            float np11=s.P11-K1*s.P01, np12=s.P12-K1*s.P02, np22=s.P22-K2*s.P02;
+                            s.P00=np00; s.P01=np01; s.P02=np02;
+                            s.P11=np11; s.P12=np12; s.P22=np22;
+                        }
+
+                        iter_fwd[k] = s;
+                    }
+
+                    // RTS backward smoother
+                    smoothed_phase[payload_symbols-1] = iter_fwd[payload_symbols-1].phase;
+                    smoothed_freq[payload_symbols-1] = iter_fwd[payload_symbols-1].freq;
+                    smoothed_accel[payload_symbols-1] = iter_fwd[payload_symbols-1].accel;
+
+                    for (int k = payload_symbols - 2; k >= 0; k--) {
+                        float p00=iter_fwd[k].P00, p01=iter_fwd[k].P01, p02=iter_fwd[k].P02;
+                        float p11=iter_fwd[k].P11, p12=iter_fwd[k].P12, p22=iter_fwd[k].P22;
+
+                        float pp00 = p00+2*p01+p02+p11+p12+0.25f*p22 + q_phase;
+                        float pp01 = p01+p02+p11+1.5f*p12+0.5f*p22;
+                        float pp02 = p02+p12+0.5f*p22;
+                        float pp11 = p11+2*p12+p22 + q_freq;
+                        float pp12 = p12+p22;
+                        float pp22 = p22 + q_accel;
+
+                        float pa00=p00+p01+0.5f*p02, pa01=p01+p02,     pa02=p02;
+                        float pa10=p01+p11+0.5f*p12, pa11=p11+p12,     pa12=p12;
+                        float pa20=p02+p12+0.5f*p22, pa21=p12+p22,     pa22=p22;
+
+                        float det = pp00*(pp11*pp22-pp12*pp12)
+                                  - pp01*(pp01*pp22-pp02*pp12)
+                                  + pp02*(pp01*pp12-pp02*pp11);
+                        if (std::abs(det) < 1e-30f) det = 1e-30f;
+                        float id = 1.0f / det;
+                        float i00=(pp11*pp22-pp12*pp12)*id, i01=(pp02*pp12-pp01*pp22)*id, i02=(pp01*pp12-pp02*pp11)*id;
+                        float i11=(pp00*pp22-pp02*pp02)*id, i12=(pp01*pp02-pp00*pp12)*id;
+                        float i22=(pp00*pp11-pp01*pp01)*id;
+
+                        float c00=pa00*i00+pa01*i01+pa02*i02, c01=pa00*i01+pa01*i11+pa02*i12, c02=pa00*i02+pa01*i12+pa02*i22;
+                        float c10=pa10*i00+pa11*i01+pa12*i02, c11=pa10*i01+pa11*i11+pa12*i12, c12=pa10*i02+pa11*i12+pa12*i22;
+                        float c20=pa20*i00+pa21*i01+pa22*i02, c21=pa20*i01+pa21*i11+pa22*i12, c22=pa20*i02+pa21*i12+pa22*i22;
+
+                        float fp=iter_fwd[k].phase, ff=iter_fwd[k].freq, fa=iter_fwd[k].accel;
+                        float dp = smoothed_phase[k+1] - (fp + ff + 0.5f*fa);
+                        float df = smoothed_freq[k+1] - (ff + fa);
+                        float da = smoothed_accel[k+1] - fa;
+
+                        smoothed_phase[k] = fp + c00*dp + c01*df + c02*da;
+                        smoothed_freq[k]  = ff + c10*dp + c11*df + c12*da;
+                        smoothed_accel[k] = fa + c20*dp + c21*df + c22*da;
+                    }
+                }
+
+                IRIS_LOG("[LDPC-ITER] phase re-estimated, re-extracting symbols");
+
+                // Step 4: Re-extract all symbols with improved phase
+                symbols.clear();
+                sym_reliability.clear();
+                for (int k = 0; k < payload_symbols; k++) {
+                    if (raw_samples[k].is_pilot) continue;
+                    float iv = raw_samples[k].iv;
+                    float qv = raw_samples[k].qv;
+                    float phase_corr = -smoothed_phase[k];
+                    float cc = std::cos(phase_corr) / channel_gain;
+                    float ss = std::sin(phase_corr) / channel_gain;
+                    symbols.push_back({iv * cc - qv * ss, iv * ss + qv * cc});
+                    sym_reliability.push_back(raw_samples[k].mag);
+                }
+
+                // Step 5: Full LLR pipeline on re-derotated symbols
+                float sigma_sq2 = 0;
+                if (mod >= Modulation::QAM16 && g_decode_snr > 0 && g_decode_snr < 50.0f) {
+                    float snr_lin = std::pow(10.0f, g_decode_snr / 10.0f);
+                    sigma_sq2 = 1.0f / snr_lin;
+                }
+                auto llrs2 = demap_soft(symbols, mod, sigma_sq2);
+
+                // Reliability weighting
+                {
+                    std::vector<float> sorted_mags(sym_reliability);
+                    std::sort(sorted_mags.begin(), sorted_mags.end());
+                    float median_mag = sorted_mags.size() > 0 ?
+                        sorted_mags[sorted_mags.size() / 2] : 1.0f;
+                    if (median_mag < 0.01f) median_mag = 0.01f;
+                    for (int si = 0; si < (int)symbols.size(); si++) {
+                        float weight = std::min(1.0f, sym_reliability[si] / median_mag);
+                        weight *= weight;
+                        for (int bi = 0; bi < bps; bi++) {
+                            int idx = si * bps + bi;
+                            if (idx < (int)llrs2.size()) llrs2[idx] *= weight;
+                        }
+                    }
+                }
+
+                scramble_soft(llrs2);
+                if ((int)llrs2.size() > encoded_bits) llrs2.resize(encoded_bits);
+
+                // De-interleave
+                {
+                    constexpr int IL_STRIDE = 41;
+                    for (size_t blk = 0; blk + n_fec <= llrs2.size(); blk += n_fec) {
+                        std::vector<float> tmp(n_fec);
+                        for (int i = 0; i < n_fec; i++)
+                            tmp[i] = llrs2[blk + (i * IL_STRIDE) % n_fec];
+                        std::copy(tmp.begin(), tmp.end(), llrs2.begin() + blk);
+                    }
+                }
+
+                // Tail hardening
+                {
+                    int total_data_bits2 = (payload_len + 4) * 8;
+                    int num_blks2 = (total_data_bits2 + k_fec - 1) / k_fec;
+                    int pad_bits2 = num_blks2 * k_fec - total_data_bits2;
+                    if (pad_bits2 > 0 && num_blks2 > 0) {
+                        int last_start = (num_blks2 - 1) * n_fec;
+                        int pad_start = last_start + (k_fec - pad_bits2);
+                        for (int i = 0; i < pad_bits2; i++) {
+                            int idx = pad_start + i;
+                            if (idx < (int)llrs2.size()) llrs2[idx] = 20.0f;
+                        }
+                    }
+                }
+
+                // LLR clamp
+                float llr_clamp2 = (mod >= Modulation::QAM16) ? 6.0f : 10.0f;
+                for (auto& l : llrs2) l = std::max(-llr_clamp2, std::min(llr_clamp2, l));
+
+                // Step 6: Re-decode with improved LLRs
+                bits = LdpcCodec::decode_soft(llrs2, fec);
+                if (!bits.empty()) {
+                    IRIS_LOG("[LDPC-ITER] re-decode SUCCEEDED after phase re-estimation");
+                } else {
+                    IRIS_LOG("[LDPC-ITER] re-decode still failed");
+                }
+            }
+        }
+
         if (bits.empty()) {
             IRIS_LOG("[DECODE] LDPC decode failed (did not converge)");
             return false;

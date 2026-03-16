@@ -10,6 +10,22 @@
 
 namespace iris {
 
+// Kalman filter state trace for GUI visualization
+// Downsampled to max ~512 points for display
+struct KalmanTracePoint {
+    float phase;    // radians
+    float freq;     // rad/symbol
+    float accel;    // rad/symbol²
+    bool is_pilot;  // true if this symbol was a pilot measurement
+};
+
+struct KalmanTrace {
+    std::vector<KalmanTracePoint> fwd;       // forward Kalman estimates
+    std::vector<KalmanTracePoint> smoothed;  // RTS smoothed estimates
+    int total_symbols = 0;                   // original symbol count before downsampling
+    int downsample_factor = 1;
+};
+
 // CRC-32 for native frames
 uint32_t crc32(const uint8_t* data, size_t len);
 
@@ -78,6 +94,12 @@ size_t decode_consumed_iq();
 // Returns SNR (dB) estimated from last decoded frame's phase-corrected preamble
 float decode_snr_db();
 float decode_snr_preamble_db();  // Preamble-only SNR (for peer feedback)
+
+// Get the Kalman trace from the last decoded frame (for GUI visualization)
+const KalmanTrace& decode_kalman_trace();
+
+// Get channel gain from last decoded frame's preamble (for auto-tune)
+float decode_channel_gain();
 
 } // namespace iris
 
