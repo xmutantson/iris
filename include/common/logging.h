@@ -56,26 +56,31 @@ public:
 
         va_list args;
 
-        // Print to stdout
+        // Print to stdout (no fflush — let stdio buffer; call flush() from tick)
         fputs(prefix, stdout);
         va_start(args, fmt);
         vfprintf(stdout, fmt, args);
         va_end(args);
         fputc('\n', stdout);
-        fflush(stdout);
 
-        // Print to file
+        // Print to file (no fflush — let stdio buffer; call flush() from tick)
         if (file_) {
             fputs(prefix, file_);
             va_start(args, fmt);
             vfprintf(file_, fmt, args);
             va_end(args);
             fputc('\n', file_);
-            fflush(file_);
         }
     }
 
     bool is_open() const { return file_ != nullptr; }
+
+    // Flush buffered output. Call from tick() or other non-real-time context.
+    void flush() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        fflush(stdout);
+        if (file_) fflush(file_);
+    }
 
 private:
     Logger() : file_(nullptr), start_(std::chrono::steady_clock::now()) {}
@@ -91,7 +96,8 @@ private:
 
 } // namespace iris
 
-// Convenience macro
+// Convenience macros
 #define IRIS_LOG(...) iris::Logger::instance().log(__VA_ARGS__)
+#define IRIS_LOG_FLUSH() iris::Logger::instance().flush()
 
 #endif

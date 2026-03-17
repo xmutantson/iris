@@ -132,6 +132,22 @@ OfdmSyncResult ofdm_detect_frame(const std::complex<float>* iq, int n_samples,
     IRIS_LOG("[OFDM-SYNC] Schmidl-Cox: M=%.4f at sample %d, CFO=%.1f Hz, SNR~%.1f dB",
              detect_metric, detect_d, result.cfo_hz, result.snr_est);
 
+    // M10: Track detection metric statistics for threshold tuning
+    {
+        static int detect_count = 0;
+        static float metric_sum = 0.0f;
+        static float metric_min = 1.0f;
+        static float metric_max = 0.0f;
+        detect_count++;
+        metric_sum += detect_metric;
+        metric_min = std::min(metric_min, detect_metric);
+        metric_max = std::max(metric_max, detect_metric);
+        if (detect_count % 50 == 0) {
+            IRIS_LOG("[OFDM-SYNC] detection stats: %d frames, M avg=%.3f min=%.3f max=%.3f",
+                     detect_count, metric_sum / detect_count, metric_min, metric_max);
+        }
+    }
+
     return result;
 }
 
@@ -393,10 +409,26 @@ void ofdm_interpolate_pilots(OfdmChannelEst& est,
 
     // Compute pilot noise_var BEFORE IIR update (residual vs current estimate).
     // After IIR, residual would be attenuated by (1-alpha), underestimating noise.
+    //
+    // M9: Separate noise from channel variation (Doppler).
+    // Compute mean phase rotation across all pilots weighted by |H_old|²,
+    // then remove it before computing residuals. This prevents common Doppler
+    // shift from inflating the noise variance estimate.
+    std::complex<float> phase_acc(0.0f, 0.0f);
+    for (int j = 0; j < (int)pilots.size(); ++j) {
+        int idx = pilots[j].used_idx;
+        float w = std::norm(est.H[idx]);  // |H_old|² weight
+        phase_acc += w * (pilots[j].H * std::conj(est.H[idx]));
+    }
+    float mean_phase_rot = std::arg(phase_acc);
+    std::complex<float> phase_correction = std::complex<float>(
+        std::cos(-mean_phase_rot), std::sin(-mean_phase_rot));
+
     std::vector<float> pilot_nv(pilots.size());
     for (int j = 0; j < (int)pilots.size(); ++j) {
         int idx = pilots[j].used_idx;
-        std::complex<float> residual = pilots[j].H - est.H[idx];
+        // Remove common phase rotation before computing residual
+        std::complex<float> residual = pilots[j].H * phase_correction - est.H[idx];
         pilot_nv[j] = std::norm(residual);
         if (pilot_nv[j] < 1e-6f)
             pilot_nv[j] = std::max(1e-6f, est.noise_var[idx]);

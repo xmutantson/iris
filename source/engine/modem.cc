@@ -173,6 +173,11 @@ bool Modem::init(const IrisConfig& config) {
             AX25_CTRL_UI, false, true);
         frame.push_back(AX25_PID_NONE);
         frame.insert(frame.end(), data, data + len);
+        constexpr size_t TX_QUEUE_MAX = 32;
+        if (ax25_tx_queue_.size() >= TX_QUEUE_MAX) {
+            IRIS_LOG("[TX] AX.25 queue full (%zu frames), dropping oldest", ax25_tx_queue_.size());
+            ax25_tx_queue_.pop();
+        }
         ax25_tx_queue_.push(std::move(frame));
     };
 
@@ -247,6 +252,11 @@ bool Modem::init(const IrisConfig& config) {
     arq_cb.send_frame = [this](const uint8_t* data, size_t len) {
         // ARQ frames go directly to TX queue (not back through ARQ)
         std::lock_guard<std::mutex> lock(tx_mutex_);
+        constexpr size_t TX_QUEUE_MAX = 32;
+        if (tx_queue_.size() >= TX_QUEUE_MAX) {
+            IRIS_LOG("[TX] queue full (%zu frames), dropping oldest", tx_queue_.size());
+            tx_queue_.pop();
+        }
         tx_queue_.push(std::vector<uint8_t>(data, data + len));
     };
     arq_cb.on_data_received = [this](const uint8_t* data, size_t len) {
@@ -434,8 +444,18 @@ bool Modem::init(const IrisConfig& config) {
                     snr_byte = (uint8_t)std::min(255.0f, std::max(1.0f, snr_db_ * 4.0f));
                 frame.push_back(snr_byte);
             }
+            constexpr size_t TX_QUEUE_MAX = 32;
+            if (tx_queue_.size() >= TX_QUEUE_MAX) {
+                IRIS_LOG("[TX] queue full (%zu frames), dropping oldest", tx_queue_.size());
+                tx_queue_.pop();
+            }
             tx_queue_.push(std::move(frame));
         } else {
+            constexpr size_t TX_QUEUE_MAX = 32;
+            if (ax25_tx_queue_.size() >= TX_QUEUE_MAX) {
+                IRIS_LOG("[TX] AX.25 queue full (%zu frames), dropping oldest", ax25_tx_queue_.size());
+                ax25_tx_queue_.pop();
+            }
             ax25_tx_queue_.push(std::vector<uint8_t>(data, data + len));
             // Buffer I-frame info fields during AFSK phase for B2F replay.
             // The B2F handler isn't initialized until OFDM-KISS activates, but
@@ -695,11 +715,15 @@ void Modem::process_rx(const float* rx_audio, int frame_count) {
         }
     }
 
-    std::vector<float> audio(rx_audio, rx_audio + frame_count);
+    // Pre-allocated RX audio buffer (avoids per-callback heap allocation)
+    if (rx_audio_tmp_.size() < (size_t)frame_count)
+        rx_audio_tmp_.resize(frame_count);
+    std::copy(rx_audio, rx_audio + frame_count, rx_audio_tmp_.data());
+    float* audio = rx_audio_tmp_.data();
     // AGC for AX.25 mode only — native mode has preamble-based gain estimation
     // AGC would distort QAM symbols within a frame (gain changes during preamble vs payload)
     if (!native_mode_)
-        agc_.process_block(audio.data(), frame_count);
+        agc_.process_block(audio, frame_count);
 
     float sum_sq = 0;
     float peak = 0;
@@ -723,24 +747,24 @@ void Modem::process_rx(const float* rx_audio, int frame_count) {
     }
 
     if (!ptt_active_)
-        compute_spectrum(audio.data(), frame_count);
+        compute_spectrum(audio, frame_count);
 
     if (state_ == ModemState::CALIBRATING) {
-        process_calibration_rx(audio.data(), frame_count);
+        process_calibration_rx(audio, frame_count);
         return;
     }
 
     if (native_mode_) {
-        process_rx_native(audio.data(), frame_count);
+        process_rx_native(audio, frame_count);
     } else {
-        process_rx_ax25(audio.data(), frame_count);
+        process_rx_ax25(audio, frame_count);
 
         // Always run native demod alongside AFSK — it's lightweight (just
         // preamble correlation until a frame arrives) and lets us detect native
         // frames at any point without waiting for the handshake to complete.
         // Self-hear is handled by native_selfhear_guard_.
         if (!config_.ax25_only && native_demod_) {
-            process_rx_native(audio.data(), frame_count);
+            process_rx_native(audio, frame_count);
         }
     }
 }
@@ -1119,18 +1143,14 @@ void Modem::process_rx_native(const float* audio, int count) {
             for (size_t i = start; i < ofdm_rx_audio_buf_.size(); i++)
                 ofdm_rx_audio_buf_[i] *= native_rx_gain_;
         }
-        // Trim to max buffer size, adjusting cached sync if needed
-        constexpr size_t OFDM_RX_MAX = 48000 * 4;  // 4 seconds
-        if (ofdm_rx_audio_buf_.size() > OFDM_RX_MAX) {
-            size_t excess = ofdm_rx_audio_buf_.size() - OFDM_RX_MAX;
+        // Trim to max buffer size
+        constexpr size_t OFDM_RX_BUF_MAX = 48000 * 10;  // 10 seconds
+        if (ofdm_rx_audio_buf_.size() > OFDM_RX_BUF_MAX) {
+            size_t excess = ofdm_rx_audio_buf_.size() - OFDM_RX_BUF_MAX;
             ofdm_rx_audio_buf_.erase(ofdm_rx_audio_buf_.begin(),
                                       ofdm_rx_audio_buf_.begin() + excess);
-            if (ofdm_sync_cached_) {
-                ofdm_pending_sync_.frame_start -= (int)excess;
-                if (ofdm_pending_sync_.frame_start < 0) {
-                    ofdm_sync_cached_ = false;  // preamble was trimmed away
-                }
-            }
+            ofdm_sync_cached_ = false;
+            IRIS_LOG("[OFDM-RX] buffer overflow: trimmed %zu samples", excess);
         }
 
         size_t n_samples = ofdm_rx_audio_buf_.size();
@@ -1311,6 +1331,9 @@ void Modem::process_rx_native(const float* audio, int count) {
             gearshift_.feed_ldpc_iters(result.worst_ldpc_iters, 50);
             int old_level = ofdm_speed_level_;
             ofdm_speed_level_ = gearshift_.ofdm_update(result.mean_channel_snr_db);
+            // Feed modem gearshift state to ARQ for conflict detection
+            arq_.set_modem_gearshift(ofdm_speed_level_, gearshift_.smoothed_snr(),
+                                     gearshift_.cooldown());
             if (ofdm_speed_level_ != old_level) {
                 IRIS_LOG("[OFDM-RX] gearshift: O%d -> O%d (ch_SNR=%.1f dB, boost=%.1f, cd=%d)",
                          old_level, ofdm_speed_level_, result.mean_channel_snr_db,
@@ -1451,9 +1474,12 @@ void Modem::process_rx_native(const float* audio, int count) {
 
     if (use_upconvert_) {
         if (rx_channel_eq_.is_configured()) {
-            std::vector<float> eq_audio(audio, audio + count);
-            rx_channel_eq_.apply(eq_audio.data(), count);
-            iq_buf = downconverter_.audio_to_iq(eq_audio.data(), count);
+            // Pre-allocated EQ scratch buffer (avoids per-callback heap allocation)
+            if (rx_eq_tmp_.size() < (size_t)count)
+                rx_eq_tmp_.resize(count);
+            std::copy(audio, audio + count, rx_eq_tmp_.data());
+            rx_channel_eq_.apply(rx_eq_tmp_.data(), count);
+            iq_buf = downconverter_.audio_to_iq(rx_eq_tmp_.data(), count);
         } else {
             iq_buf = downconverter_.audio_to_iq(audio, count);
         }
@@ -1602,6 +1628,9 @@ void Modem::process_rx_native(const float* audio, int count) {
                              snr, ldpc_iters, gearshift_.boost(),
                              gearshift_.smoothed_snr() + gearshift_.boost(),
                              old_level, new_level, gearshift_.smoothed_snr(), gearshift_.cooldown());
+                    // Feed modem gearshift state to ARQ for conflict detection
+                    arq_.set_modem_gearshift(new_level, gearshift_.smoothed_snr(),
+                                             gearshift_.cooldown());
                 } else {
                     IRIS_LOG("[SNR] est=%.1f dB, ldpc_iters=%d (tune frame, gearshift skipped)",
                              snr, ldpc_iters);
@@ -1650,6 +1679,11 @@ void Modem::process_rx_native(const float* audio, int count) {
                                 ax25_tx_queue_.pop();
                                 bool is_iframe = fr.size() > 14 && (fr[14] & 0x01) == 0;
                                 if (is_iframe) {
+                                    constexpr size_t TX_QUEUE_MAX = 32;
+                                    if (tx_queue_.size() >= TX_QUEUE_MAX) {
+                                        IRIS_LOG("[TX] queue full (%zu frames), dropping oldest", tx_queue_.size());
+                                        tx_queue_.pop();
+                                    }
                                     tx_queue_.push(std::move(fr));
                                     migrated++;
                                 } else {
@@ -2159,6 +2193,20 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                     tx_queue_.pop();
                 }
 
+                // Detect if batch contains only ARQ control frames (non-DATA).
+                // Control frames at robust rate (~20ms extra) prevents cascading
+                // retransmit timeouts when channel has degraded.
+                bool batch_is_control = false;
+                if (!ofdm_kiss_ && arq_.state() != ArqState::IDLE) {
+                    batch_is_control = true;
+                    for (auto& sub : batch) {
+                        if (!sub.empty() && sub[0] == (uint8_t)ArqType::DATA) {
+                            batch_is_control = false;
+                            break;
+                        }
+                    }
+                }
+
                 // Log OFDM-KISS frames before payload build (batch elements get moved)
                 if (ofdm_kiss_ && packet_log_) {
                     for (auto& sub : batch) {
@@ -2221,6 +2269,13 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                     ofdm_speed_level_ = gearshift_.current_ofdm_level();
                     tx_no_ack_count_++;
 
+                    // Control frames at robust rate (~20ms extra) prevents cascading
+                    // retransmit timeouts when channel has degraded.
+                    if (batch_is_control && ofdm_speed_level_ > 0) {
+                        IRIS_LOG("[TX-OFDM] control frame batch -> forcing O0 (robust)");
+                        ofdm_speed_level_ = 0;
+                    }
+
                     // TX-side override: no peer ACK for 6+ frames → force downshift
                     if (tx_no_ack_count_ >= 6 && ofdm_speed_level_ > 0) {
                         ofdm_speed_level_ = std::max(0, ofdm_speed_level_ - 1);
@@ -2271,6 +2326,13 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                     // ============ Legacy single-carrier PHY TX path ============
                     int level = gearshift_.current_level();
                     PhyConfig tx_config = phy_config_;
+
+                    // Control frames at robust rate (~20ms extra) prevents cascading
+                    // retransmit timeouts when channel has degraded.
+                    if (batch_is_control && level > 0) {
+                        IRIS_LOG("[TX] control frame batch -> forcing level 0 (robust)");
+                        level = 0;
+                    }
 
                     Modulation tx_mod;
                     int tx_fec_n, tx_fec_d;
@@ -2645,6 +2707,11 @@ void Modem::queue_tx_frame(const uint8_t* frame, size_t len) {
                                     b2f_proxy_plaintext_.begin() + offset,
                                     b2f_proxy_plaintext_.begin() + offset + chunk);
                             }
+                            constexpr size_t TX_QUEUE_MAX = 32;
+                            if (tx_queue_.size() >= TX_QUEUE_MAX) {
+                                IRIS_LOG("[TX] queue full (%zu frames), dropping oldest", tx_queue_.size());
+                                tx_queue_.pop();
+                            }
                             tx_queue_.push(std::move(b2f_frame));
                             offset += chunk;
                         }
@@ -2709,6 +2776,11 @@ void Modem::queue_tx_frame(const uint8_t* frame, size_t len) {
     }
 
     std::vector<uint8_t> tx_frame(frame, frame + len);
+    constexpr size_t TX_QUEUE_MAX = 32;
+    if (tx_queue_.size() >= TX_QUEUE_MAX) {
+        IRIS_LOG("[TX] queue full (%zu frames), dropping oldest", tx_queue_.size());
+        tx_queue_.pop();
+    }
     tx_queue_.push(std::move(tx_frame));
     if (gui_log_ && len >= 14)
         gui_log_("[TX] " + describe_ax25(frame, len));
@@ -3170,12 +3242,12 @@ void Modem::tick() {
 
                 // FM-optimized: short CP (16 samples = 0.33ms) by default
                 int cp = config_.ofdm_cp_samples;
-                if (cp <= 0 || cp == 64) cp = 16;  // FM default: minimal multipath (64 is HF default, not FM)
+                if (cp <= 0 || cp == 64) cp = 32;  // 0.67ms — adequate for FM radio IF group delay
 
                 // Auto-train pilot spacing: measure channel flatness from probe tones.
                 // Flat channels (VB-Cable, clean FM) can use sparse pilots (1:12) for
                 // more data carriers. Frequency-selective channels need dense pilots (1:4).
-                int carrier_pilot_spacing = 8;  // Default: moderate density
+                int carrier_pilot_spacing = 6;   // 1:6 default — ensures >=4 pilots in narrow 2kHz BW
                 int block_pilot_spacing = 16;
                 if (config_.ofdm_auto_spacing) {
                     const ProbeResult& rx_probe = probe_.their_tx_result();
@@ -3209,6 +3281,18 @@ void Modem::tick() {
                 }
                 ofdm_config_ = ofdm_config_from_probe(ofdm_pb, config_.ofdm_nfft, cp,
                                                        carrier_pilot_spacing, block_pilot_spacing);
+
+                // Minimum pilot check: ensure at least 4 pilots for reliable channel estimation
+                {
+                    int n_used = ofdm_config_.n_used_carriers;
+                    int n_pilots = n_used / carrier_pilot_spacing + 1;
+                    if (n_pilots < 4 && carrier_pilot_spacing > 2) {
+                        carrier_pilot_spacing = std::max(2, n_used / 3);  // force at least 4 pilots
+                        IRIS_LOG("[OFDM] pilot spacing reduced to 1:%d for minimum 4 pilots", carrier_pilot_spacing);
+                        ofdm_config_ = ofdm_config_from_probe(ofdm_pb, config_.ofdm_nfft, cp,
+                                                               carrier_pilot_spacing, block_pilot_spacing);
+                    }
+                }
 
                 ofdm_mod_ = std::make_unique<OfdmModulator>(ofdm_config_);
                 ofdm_demod_ = std::make_unique<OfdmDemodulator>(ofdm_config_);
@@ -3336,6 +3420,11 @@ void Modem::tick() {
                     ax25_tx_queue_.pop();
                     bool is_iframe = frame.size() > 14 && (frame[14] & 0x01) == 0;
                     if (is_iframe) {
+                        constexpr size_t TX_QUEUE_MAX = 32;
+                        if (tx_queue_.size() >= TX_QUEUE_MAX) {
+                            IRIS_LOG("[TX] queue full (%zu frames), dropping oldest", tx_queue_.size());
+                            tx_queue_.pop();
+                        }
                         tx_queue_.push(std::move(frame));
                         migrated++;
                     } else {
@@ -3538,6 +3627,11 @@ void Modem::send_tune_ui(const char* payload) {
     size_t plen = strlen(payload);
     frame.insert(frame.end(), (const uint8_t*)payload, (const uint8_t*)payload + plen);
     std::lock_guard<std::mutex> lock(tx_mutex_);
+    constexpr size_t TX_QUEUE_MAX = 32;
+    if (ax25_tx_queue_.size() >= TX_QUEUE_MAX) {
+        IRIS_LOG("[TX] AX.25 queue full (%zu frames), dropping oldest", ax25_tx_queue_.size());
+        ax25_tx_queue_.pop();
+    }
     ax25_tx_queue_.push(std::move(frame));
 }
 
@@ -3876,6 +3970,11 @@ void Modem::send_cal_ui(const char* payload) {
     size_t plen = strlen(payload);
     frame.insert(frame.end(), (const uint8_t*)payload, (const uint8_t*)payload + plen);
     std::lock_guard<std::mutex> lock(tx_mutex_);
+    constexpr size_t TX_QUEUE_MAX = 32;
+    if (ax25_tx_queue_.size() >= TX_QUEUE_MAX) {
+        IRIS_LOG("[TX] AX.25 queue full (%zu frames), dropping oldest", ax25_tx_queue_.size());
+        ax25_tx_queue_.pop();
+    }
     ax25_tx_queue_.push(std::move(frame));
 }
 
@@ -3944,6 +4043,11 @@ void Modem::send_probe_start_ui() {
     const char* payload = "PROBE:START";
     frame.insert(frame.end(), (const uint8_t*)payload, (const uint8_t*)payload + 11);
     std::lock_guard<std::mutex> lock(tx_mutex_);
+    constexpr size_t TX_QUEUE_MAX = 32;
+    if (ax25_tx_queue_.size() >= TX_QUEUE_MAX) {
+        IRIS_LOG("[TX] AX.25 queue full (%zu frames), dropping oldest", ax25_tx_queue_.size());
+        ax25_tx_queue_.pop();
+    }
     ax25_tx_queue_.push(std::move(frame));
 }
 

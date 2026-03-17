@@ -137,8 +137,8 @@ bool OfdmDemodulator::decode_header(
 
             float denom = H_mag2 + nv;
             std::complex<float> eq;
-            if (H_mag2 < nv) {
-                // Deep fade: zero this carrier (unreliable)
+            if (H_mag2 < 1e-4f * nv) {
+                // Deep fade: zero this carrier (numerical safety only)
                 eq = {0.0f, 0.0f};
             } else if (denom > 1e-12f) {
                 eq = std::conj(H) * sym[i] / denom;
@@ -263,8 +263,8 @@ std::vector<std::complex<float>> OfdmDemodulator::equalize_mmse(
         float H_mag2 = std::norm(H);
         float nv = (i < (int)est.noise_var.size()) ? est.noise_var[i] : 1e-6f;
 
-        if (H_mag2 < nv) {
-            // Deep fade: zero this carrier
+        if (H_mag2 < 1e-4f * nv) {
+            // Deep fade: zero this carrier (numerical safety only)
             eq.push_back({0.0f, 0.0f});
         } else {
             // MMSE: X_hat = conj(H) * Y / (|H|^2 + noise_var)
@@ -437,8 +437,10 @@ OfdmDemodResult OfdmDemodulator::demodulate(
     constexpr float BOOST_SQ = PREAMBLE_BOOST * PREAMBLE_BOOST;  // 2.0
     for (auto& h : channel_est_.H)
         h /= PREAMBLE_BOOST;
-    for (auto& nv : channel_est_.noise_var)
+    for (auto& nv : channel_est_.noise_var) {
         nv /= BOOST_SQ;
+        if (nv < 1e-6f) nv = 1e-6f;
+    }
     pos += sym_len;  // advance past training symbol 2
 
     // ---- 4b. Fine CFO: differential phase between training symbols ----
@@ -482,8 +484,10 @@ OfdmDemodResult OfdmDemodulator::demodulate(
         // Compensate preamble boost again after re-estimation
         for (auto& h : channel_est_.H)
             h /= PREAMBLE_BOOST;
-        for (auto& nv : channel_est_.noise_var)
+        for (auto& nv : channel_est_.noise_var) {
             nv /= BOOST_SQ;
+            if (nv < 1e-6f) nv = 1e-6f;
+        }
 
         IRIS_LOG("[OFDM-RX] CFO refined: coarse=%.1f Hz + fine=%.2f Hz = %.2f Hz",
                  sync.cfo_hz, fine_cfo, total_cfo);
@@ -606,6 +610,14 @@ OfdmDemodResult OfdmDemodulator::demodulate(
 
     int data_sym_count = 0;  // count of data symbols received so far
 
+    // H8: SFO tracking — save initial channel estimate for phase drift measurement
+    std::vector<std::complex<float>> H_initial = channel_est_.H;
+    float sfo_ppm_estimate = 0.0f;       // current SFO estimate (ppm)
+    int sfo_block_pilot_count = 0;        // number of block pilots seen
+    float sfo_cumulative_phase = 0.0f;    // sum of mean phase drifts
+    float sfo_cumulative_weight = 0.0f;   // sum of symbol indices (for weighted slope)
+    int total_symbols_elapsed = 0;        // total symbols since training (incl. header)
+
     for (int s = 0; s < n_data_symbols; s++) {
         // Check for block pilot: every pilot_symbol_spacing data symbols
         if (data_sym_count > 0 &&
@@ -626,7 +638,47 @@ OfdmDemodResult OfdmDemodulator::demodulate(
             // Update channel estimate from block pilot
             ofdm_update_channel(channel_est_, pilot_fft.data(), config_);
 
+            // H8: SFO estimation from block pilot phase drift
+            {
+                float phase_sum = 0.0f;
+                float weight_sum = 0.0f;
+                for (int i = 0; i < n_used; i++) {
+                    float w = std::norm(H_initial[i]);
+                    if (w < 1e-12f) continue;
+                    // Phase difference between current H and initial H
+                    float dp = std::arg(channel_est_.H[i] * std::conj(H_initial[i]));
+                    phase_sum += w * dp;
+                    weight_sum += w;
+                }
+                if (weight_sum > 0.0f) {
+                    float mean_phase = phase_sum / weight_sum;
+                    // Symbol index relative to training symbol 2
+                    int sym_idx = n_hdr_sym + data_sym_count + sfo_block_pilot_count + 1;
+                    sfo_block_pilot_count++;
+                    sfo_cumulative_phase += mean_phase * sym_idx;
+                    sfo_cumulative_weight += (float)(sym_idx * sym_idx);
+
+                    if (sfo_cumulative_weight > 0.0f) {
+                        // Linear fit: phase = slope * sym_idx
+                        // slope = sum(phase_i * sym_idx_i) / sum(sym_idx_i^2)
+                        float slope = sfo_cumulative_phase / sfo_cumulative_weight;
+                        // SFO in ppm: slope / (2*pi * sym_len/sample_rate) * 1e-6
+                        // Actually: sfo_ppm = slope / (2*pi) * sample_rate / sym_len * 1e6
+                        // But: slope is phase per symbol, and each symbol is sym_len samples
+                        float sfo_ppm_raw = slope * (float)config_.sample_rate
+                                          / (2.0f * (float)M_PI * (float)sym_len) * 1e6f;
+                        // Only apply if > 5 ppm threshold (avoid correcting noise)
+                        if (std::abs(sfo_ppm_raw) > 5.0f) {
+                            sfo_ppm_estimate = sfo_ppm_raw;
+                            IRIS_LOG("[OFDM-RX] SFO estimate: %.1f ppm (sym_idx=%d, slope=%.5f rad/sym)",
+                                     sfo_ppm_estimate, sym_idx, slope);
+                        }
+                    }
+                }
+            }
+
             pos += sym_len;
+            total_symbols_elapsed++;
             // Do not increment data_sym_count for block pilot
         }
 
@@ -652,6 +704,50 @@ OfdmDemodResult OfdmDemodulator::demodulate(
             used_carriers[i] = sym_fft[bin];
         }
 
+        // H8: Apply SFO correction if estimate exceeds threshold
+        if (std::abs(sfo_ppm_estimate) > 5.0f) {
+            int sym_idx = n_hdr_sym + total_symbols_elapsed + 1;
+            float elapsed_samples = (float)(sym_idx * sym_len);
+            float sfo_frac = sfo_ppm_estimate * 1e-6f;  // fractional SFO
+            for (int i = 0; i < n_used; i++) {
+                int bin = config_.used_carrier_bins[i];
+                float phase_corr = -2.0f * (float)M_PI * (float)bin
+                                   * sfo_frac * elapsed_samples / (float)nfft;
+                std::complex<float> rot(std::cos(phase_corr), std::sin(phase_corr));
+                used_carriers[i] *= rot;
+            }
+        }
+
+        // H2: Common Phase Error (CPE) correction from comb pilots
+        {
+            float cpe_num = 0.0f;   // weighted phase sum
+            float cpe_den = 0.0f;   // weight sum
+            for (int i = 0; i < n_used; i += config_.pilot_carrier_spacing) {
+                // Pilot position: every pilot_carrier_spacing-th used carrier
+                std::complex<float> Y_pilot = used_carriers[i];
+                std::complex<float> H = channel_est_.H[i];
+                float H_mag2 = std::norm(H);
+                if (H_mag2 < 1e-12f) continue;
+
+                // Phase difference: arg(Y_pilot * conj(H))
+                float phase_diff = std::arg(Y_pilot * std::conj(H));
+                cpe_num += H_mag2 * phase_diff;
+                cpe_den += H_mag2;
+            }
+            if (cpe_den > 0.0f) {
+                float cpe = cpe_num / cpe_den;
+                // Apply conjugate rotation to all used carriers
+                std::complex<float> cpe_rot(std::cos(-cpe), std::sin(-cpe));
+                for (int i = 0; i < n_used; i++) {
+                    used_carriers[i] *= cpe_rot;
+                }
+                if (data_sym_count % 20 == 0 || std::abs(cpe) > 0.1f) {
+                    IRIS_LOG("[OFDM-RX] CPE sym %d: %.4f rad (%.2f deg)",
+                             data_sym_count, cpe, cpe * 180.0f / (float)M_PI);
+                }
+            }
+        }
+
         // Extract data carriers (skip pilot positions)
         std::vector<std::complex<float>> data_carriers =
             extract_data_carriers(used_carriers.data(), n_used);
@@ -669,6 +765,7 @@ OfdmDemodResult OfdmDemodulator::demodulate(
 
         pos += sym_len;
         data_sym_count++;
+        total_symbols_elapsed++;
     }
 
     // Skip tail symbol (1 block-pilot)

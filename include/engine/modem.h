@@ -480,6 +480,10 @@ private:
     float rx_peak_ = 0;  // Peak sample value (decays over time)
     int rx_diag_counter_ = 0;  // Periodic RX diagnostic counter
 
+    // Pre-allocated RX audio working buffer (avoids per-callback heap allocation)
+    std::vector<float> rx_audio_tmp_;
+    std::vector<float> rx_eq_tmp_;   // Pre-allocated EQ scratch buffer
+
     // RX overlap buffer for native mode
     std::vector<float> rx_overlap_buf_;
     static constexpr size_t RX_OVERLAP_MAX = 48000 * 40;  // 20 seconds of IQ (floats=IQ×2)

@@ -85,14 +85,22 @@ int Gearshift::update(float snr_db) {
         // Upshift: hold for stability (suppressed during cooldown)
         hold_count_++;
         if (hold_count_ >= HOLD_FRAMES) {
+            int old = current_level_;
             current_level_++;  // Step up one level at a time
             hold_count_ = 0;
+            printf("[GEARSHIFT] modem upshift: A%d -> A%d (SNR=%.1f dB, avg=%.1f, boost=%.1f)\n",
+                   old, current_level_, snr_db, snr_avg_, ldpc_boost_);
+            fflush(stdout);
         }
     } else if (target < current_level_) {
         // Downshift: immediate
+        int old = current_level_;
         current_level_ = target;
         hold_count_ = 0;
         fail_count_ = 0;
+        printf("[GEARSHIFT] modem downshift: A%d -> A%d (SNR=%.1f dB, avg=%.1f, target=%d)\n",
+               old, current_level_, snr_db, snr_avg_, target);
+        fflush(stdout);
     } else {
         // Target == current: don't reset hold_count_ — a single frame at
         // current level between two "above threshold" frames shouldn't
@@ -125,13 +133,21 @@ int Gearshift::ofdm_update(float snr_db) {
     if (target > ofdm_level_ && cooldown_ == 0) {
         hold_count_++;
         if (hold_count_ >= HOLD_FRAMES) {
+            int old = ofdm_level_;
             ofdm_level_++;
             hold_count_ = 0;
+            printf("[GEARSHIFT] modem OFDM upshift: O%d -> O%d (SNR=%.1f dB, avg=%.1f, boost=%.1f)\n",
+                   old, ofdm_level_, snr_db, snr_avg_, ldpc_boost_);
+            fflush(stdout);
         }
     } else if (target < ofdm_level_) {
+        int old = ofdm_level_;
         ofdm_level_ = target;
         hold_count_ = 0;
         fail_count_ = 0;
+        printf("[GEARSHIFT] modem OFDM downshift: O%d -> O%d (SNR=%.1f dB, avg=%.1f, target=%d)\n",
+               old, ofdm_level_, snr_db, snr_avg_, target);
+        fflush(stdout);
     }
 
     return ofdm_level_;
@@ -145,11 +161,16 @@ void Gearshift::report_failure() {
     ldpc_boost_ = 0;
 
     if (fail_count_ >= FAIL_THRESHOLD) {
+        int old_level = current_level_;
+        int old_ofdm = ofdm_level_;
         if (current_level_ > 0) current_level_--;
         if (ofdm_level_ > 0) ofdm_level_--;
         hold_count_ = 0;
         fail_count_ = 0;
         cooldown_ = COOLDOWN_FRAMES;  // Suppress re-upshift for N frames
+        printf("[GEARSHIFT] modem failure downshift: A%d->A%d O%d->O%d (cooldown=%d frames)\n",
+               old_level, current_level_, old_ofdm, ofdm_level_, cooldown_);
+        fflush(stdout);
     }
 }
 

@@ -583,8 +583,10 @@ int main(int argc, char** argv) {
             if (channels == 1) {
                 modem.process_rx(samples, frame_count);
             } else {
-                // Downmix to mono
-                std::vector<float> mono(frame_count);
+                // Downmix to mono (pre-allocated to avoid heap alloc per callback)
+                static std::vector<float> mono;
+                if (mono.size() < (size_t)frame_count)
+                    mono.resize(frame_count);
                 for (int i = 0; i < frame_count; i++) {
                     float sum = 0;
                     for (int ch = 0; ch < channels; ch++)
@@ -600,8 +602,10 @@ int main(int argc, char** argv) {
             if (channels == 1) {
                 modem.process_tx(samples, frame_count);
             } else {
-                // Generate mono, then duplicate to all channels
-                std::vector<float> mono(frame_count);
+                // Generate mono, then duplicate to all channels (pre-allocated)
+                static std::vector<float> mono;
+                if (mono.size() < (size_t)frame_count)
+                    mono.resize(frame_count);
                 modem.process_tx(mono.data(), frame_count);
                 for (int i = 0; i < frame_count; i++) {
                     for (int ch = 0; ch < channels; ch++)

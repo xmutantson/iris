@@ -127,6 +127,11 @@ public:
     void set_callsign(const std::string& cs) { callsign_ = cs; }
     void set_local_capabilities(uint16_t caps) { local_caps_ = caps; }
     void set_local_snr(float snr) { local_snr_ = snr; }
+    void set_modem_gearshift(int level, float snr, int cooldown) {
+        modem_recommended_level_ = level;
+        modem_recommended_snr_ = snr;
+        modem_cooldown_ = cooldown;
+    }
     void set_local_x25519_pubkey(const uint8_t key[32]) { memcpy(local_x25519_pub_, key, 32); has_local_x25519_ = true; }
 
     // Commander: start a connection and queue data for transfer
@@ -297,6 +302,11 @@ private:
     int consec_data_nacks_ = 0;
     bool gearshift_just_applied_ = false;  // safety net for upshift failures
     int gearshift_cooldown_ = 0;          // blocks to wait before next upshift
+
+    // Modem-level gearshift recommendation (for conflict detection)
+    int modem_recommended_level_ = 0;
+    float modem_recommended_snr_ = 0;
+    int modem_cooldown_ = 0;
 
     // Multi-phase BREAK recovery
     BreakPhase break_phase_ = BreakPhase::NONE;

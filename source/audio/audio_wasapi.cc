@@ -6,11 +6,15 @@
 #include <windows.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
+#include <ksmedia.h>
 #include <functiondiscoverykeys_devpkey.h>
 #include <thread>
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
+#include <chrono>
+#include <deque>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 
@@ -23,6 +27,21 @@ struct ComInit {
     ComInit()  { CoInitializeEx(nullptr, COINIT_MULTITHREADED); }
     ~ComInit() { CoUninitialize(); }
 };
+
+// KSDATAFORMAT_SUBTYPE_IEEE_FLOAT GUID — defined inline to avoid ksuser.lib dependency
+static const GUID kIeeeFloat = {0x00000003,0x0000,0x0010,{0x80,0x00,0x00,0xaa,0x00,0x38,0x9b,0x71}};
+
+// Check whether a WAVEFORMATEX describes 32-bit IEEE float
+static bool is_float32_format(const WAVEFORMATEX* fmt) {
+    if (!fmt) return false;
+    if (fmt->wBitsPerSample != 32) return false;
+    if (fmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) return true;
+    if (fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE && fmt->cbSize >= 22) {
+        auto* ext = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(fmt);
+        return IsEqualGUID(ext->SubFormat, kIeeeFloat);
+    }
+    return false;
+}
 
 // WASAPI Capture implementation
 // Audio capture and decode are on SEPARATE threads to prevent decode latency
@@ -172,6 +191,24 @@ private:
         printf("[Audio] Capture dev %d: %d ch, %d Hz, %d bit\n",
                device_id_, actual_channels, actual_rate, mix_fmt->wBitsPerSample);
 
+        // Fix C2: Sample rate validation
+        if (actual_rate != sample_rate_) {
+            printf("[AUDIO] FATAL: device sample rate %d != expected %d — OFDM will not work\n",
+                   actual_rate, sample_rate_);
+            CoTaskMemFree(mix_fmt);
+            client->Release(); device->Release(); enumerator->Release();
+            running_ = false; return;
+        }
+
+        // Fix H5: Audio format validation — must be 32-bit float
+        if (!is_float32_format(mix_fmt)) {
+            printf("[AUDIO] FATAL: capture device not 32-bit float (tag=0x%04x, bits=%d)\n",
+                   mix_fmt->wFormatTag, mix_fmt->wBitsPerSample);
+            CoTaskMemFree(mix_fmt);
+            client->Release(); device->Release(); enumerator->Release();
+            running_ = false; return;
+        }
+
         REFERENCE_TIME duration = (REFERENCE_TIME)(10000000.0 * buffer_frames_ / actual_rate);
         hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, duration, 0, mix_fmt, nullptr);
         if (FAILED(hr)) {
@@ -197,11 +234,29 @@ private:
 
         client->Start();
 
+        auto last_packet_time = std::chrono::steady_clock::now();
+
         while (running_) {
             Sleep(5);  // ~5ms polling
 
             UINT32 packet_length = 0;
-            capture->GetNextPacketSize(&packet_length);
+            hr = capture->GetNextPacketSize(&packet_length);
+            if (hr == AUDCLNT_E_DEVICE_INVALIDATED) {
+                printf("[AUDIO] device disconnected\n");
+                running_ = false; break;
+            }
+
+            // Fix H6: Watchdog — no packets for >2 seconds means device is gone
+            if (packet_length == 0) {
+                auto now = std::chrono::steady_clock::now();
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - last_packet_time).count();
+                if (elapsed > 2000) {
+                    printf("[AUDIO] capture watchdog: no packets for %lld ms, breaking\n",
+                           (long long)elapsed);
+                    running_ = false; break;
+                }
+            }
 
             while (packet_length > 0 && running_) {
                 BYTE* data = nullptr;
@@ -209,7 +264,13 @@ private:
                 DWORD flags = 0;
 
                 hr = capture->GetBuffer(&data, &frames_available, &flags, nullptr, nullptr);
+                if (hr == AUDCLNT_E_DEVICE_INVALIDATED) {
+                    printf("[AUDIO] device disconnected\n");
+                    running_ = false; break;
+                }
                 if (SUCCEEDED(hr) && frames_available > 0) {
+                    last_packet_time = std::chrono::steady_clock::now();
+
                     if (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) {
                         discont_count_++;
                         if (discont_count_ <= 10)
@@ -223,7 +284,11 @@ private:
                     capture->ReleaseBuffer(frames_available);
                 }
 
-                capture->GetNextPacketSize(&packet_length);
+                hr = capture->GetNextPacketSize(&packet_length);
+                if (hr == AUDCLNT_E_DEVICE_INVALIDATED) {
+                    printf("[AUDIO] device disconnected\n");
+                    running_ = false; break;
+                }
             }
         }
 
@@ -418,6 +483,24 @@ private:
         printf("[Audio] Playback dev %d: %d ch, %d Hz, %d bit\n",
                device_id_, channels, rate, mix_fmt->wBitsPerSample);
 
+        // Fix C2: Sample rate validation
+        if (rate != sample_rate_) {
+            printf("[AUDIO] FATAL: device sample rate %d != expected %d — OFDM will not work\n",
+                   rate, sample_rate_);
+            CoTaskMemFree(mix_fmt);
+            client->Release(); device->Release(); enumerator->Release();
+            running_ = false; return;
+        }
+
+        // Fix H5: Audio format validation — must be 32-bit float
+        if (!is_float32_format(mix_fmt)) {
+            printf("[AUDIO] FATAL: playback device not 32-bit float (tag=0x%04x, bits=%d)\n",
+                   mix_fmt->wFormatTag, mix_fmt->wBitsPerSample);
+            CoTaskMemFree(mix_fmt);
+            client->Release(); device->Release(); enumerator->Release();
+            running_ = false; return;
+        }
+
         // Request 50ms buffer for comfortable margin
         REFERENCE_TIME duration = 500000;  // 50ms in 100ns units
         hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, duration, 0, mix_fmt, nullptr);
@@ -452,25 +535,33 @@ private:
             Sleep(2);  // ~2ms polling — finer than 5ms, still low CPU
 
             UINT32 padding = 0;
-            client->GetCurrentPadding(&padding);
+            hr = client->GetCurrentPadding(&padding);
+            if (hr == AUDCLNT_E_DEVICE_INVALIDATED) {
+                printf("[AUDIO] device disconnected\n");
+                running_ = false; break;
+            }
             UINT32 available = buffer_size - padding;
 
             if (available == 0) continue;
 
             BYTE* data = nullptr;
             hr = render->GetBuffer(available, &data);
+            if (hr == AUDCLNT_E_DEVICE_INVALIDATED) {
+                printf("[AUDIO] device disconnected\n");
+                running_ = false; break;
+            }
             if (FAILED(hr)) continue;
 
             float* fdata = (float*)data;
             size_t samples_needed = (size_t)available * channels;
 
-            // Drain from FIFO
+            // Drain from FIFO (deque — no .data(), copy via iterator)
             size_t copied = 0;
             {
                 std::lock_guard<std::mutex> lock(fifo_mutex_);
                 copied = std::min(fifo_.size(), samples_needed);
                 if (copied > 0) {
-                    std::memcpy(fdata, fifo_.data(), copied * sizeof(float));
+                    std::copy(fifo_.begin(), fifo_.begin() + copied, fdata);
                     fifo_.erase(fifo_.begin(), fifo_.begin() + copied);
                 }
             }
@@ -511,7 +602,7 @@ private:
     mutable std::mutex fifo_mutex_;
     std::condition_variable fifo_cv_;
     std::condition_variable producer_cv_;
-    std::vector<float> fifo_;
+    std::deque<float> fifo_;  // Fix M12: deque for O(1) front erase
     std::atomic<int64_t> frames_produced_{0};
     std::atomic<int64_t> frames_rendered_{0};
     std::atomic<int64_t> drain_mark_{-1};  // -1 = no drain pending

@@ -81,6 +81,9 @@ void ArqSession::reset() {
     consec_data_nacks_ = 0;
     gearshift_just_applied_ = false;
     gearshift_cooldown_ = 0;
+    modem_recommended_level_ = 0;
+    modem_recommended_snr_ = 0;
+    modem_cooldown_ = 0;
 
     break_phase_ = BreakPhase::NONE;
     break_recovery_speed_ = 0;
@@ -613,8 +616,24 @@ void ArqSession::handle_ack(const ArqFrame& frame) {
 
     // SNR-based gearshift ladder (post-turboshift)
     if (turbo_phase_ == TurboPhase::DONE || turbo_phase_ == TurboPhase::NONE) {
-        if (gearshift_cooldown_ > 0)
+        if (gearshift_cooldown_ > 0) {
             gearshift_cooldown_--;
+            // Conflict: modem recommends upshift but ARQ is in cooldown
+            if (modem_recommended_level_ > speed_level_ && gearshift_cooldown_ > 0) {
+                printf("[GEARSHIFT] conflict: modem recommends level %d (SNR %.1f dB) but ARQ in cooldown (%d blocks remaining)\n",
+                       modem_recommended_level_, modem_recommended_snr_, gearshift_cooldown_);
+                fflush(stdout);
+            }
+        }
+        // Conflict: ARQ wants upshift (enough acks) but modem is in cooldown
+        if (consec_data_acks_ >= TURBO_CONSEC_ACKS_TO_UPSHIFT &&
+            speed_level_ < NUM_SPEED_LEVELS - 1 &&
+            gearshift_cooldown_ <= 0 &&
+            modem_cooldown_ > 0) {
+            printf("[GEARSHIFT] conflict: ARQ ready to upshift (acks=%d) but modem in cooldown (%d frames remaining)\n",
+                   consec_data_acks_, modem_cooldown_);
+            fflush(stdout);
+        }
 
         if (consec_data_acks_ >= TURBO_CONSEC_ACKS_TO_UPSHIFT &&
             speed_level_ < NUM_SPEED_LEVELS - 1 &&
@@ -622,17 +641,37 @@ void ArqSession::handle_ack(const ArqFrame& frame) {
             // SNR-based: use SNR to suggest target, upshift by 1
             int snr_suggested = snr_to_speed_level(remote_snr_);
             if (snr_suggested > speed_level_) {
+                int old = speed_level_;
                 set_speed(speed_level_ + 1);
                 consec_data_acks_ = 0;
                 gearshift_just_applied_ = true;
+                printf("[GEARSHIFT] ARQ upshift: A%d -> A%d (remote_SNR=%.1f, snr_suggested=%d, acks=%d)\n",
+                       old, speed_level_, remote_snr_, snr_suggested, TURBO_CONSEC_ACKS_TO_UPSHIFT);
+                fflush(stdout);
+                // Conflict detection: modem says downshift but ARQ is upshifting
+                if (modem_recommended_level_ < old) {
+                    printf("[GEARSHIFT] WARNING: conflict: ARQ upshifted to %d but modem recommends level %d (SNR %.1f dB)\n",
+                           speed_level_, modem_recommended_level_, modem_recommended_snr_);
+                    fflush(stdout);
+                }
             }
         }
 
         if (consec_data_nacks_ >= 2 && speed_level_ > 0) {
+            int old = speed_level_;
             set_speed(speed_level_ - 1);
             consec_data_nacks_ = 0;
             gearshift_just_applied_ = false;
             gearshift_cooldown_ = 3;  // wait 3 blocks before upshifting again
+            printf("[GEARSHIFT] ARQ downshift: A%d -> A%d (nacks=%d, cooldown=%d)\n",
+                   old, speed_level_, 2, gearshift_cooldown_);
+            fflush(stdout);
+            // Conflict detection: modem says upshift but ARQ is downshifting
+            if (modem_recommended_level_ > old) {
+                printf("[GEARSHIFT] WARNING: conflict: ARQ downshifted to %d but modem recommends level %d (SNR %.1f dB)\n",
+                       speed_level_, modem_recommended_level_, modem_recommended_snr_);
+                fflush(stdout);
+            }
         }
 
         // Safety net: first NACK after an upshift triggers BREAK
@@ -894,7 +933,13 @@ void ArqSession::break_probe_recovery() {
     if (target <= speed_level_) {
         // At ceiling already, settle
         break_phase_ = BreakPhase::NONE;
-        printf("[ARQ] BREAK recovery complete at speed %d\n", speed_level_);
+        if (speed_level_ < break_recovery_speed_) {
+            gearshift_cooldown_ = 10;  // settled below original — suppress rapid re-escalation
+            printf("[ARQ] BREAK recovery complete at speed %d (below original %d, cooldown=%d)\n",
+                   speed_level_, break_recovery_speed_, gearshift_cooldown_);
+        } else {
+            printf("[ARQ] BREAK recovery complete at speed %d\n", speed_level_);
+        }
         fflush(stdout);
         return;
     }
@@ -910,10 +955,16 @@ void ArqSession::break_probe_recovery() {
 
 void ArqSession::break_exhausted() {
     // Fallback: stay at lowest working speed
-    printf("[ARQ] BREAK exhausted, settling at speed %d\n", speed_level_);
-    fflush(stdout);
     break_phase_ = BreakPhase::NONE;
     break_drop_step_ = std::min(break_drop_step_ * 2, 4);  // escalate for next BREAK
+    if (speed_level_ < break_recovery_speed_) {
+        gearshift_cooldown_ = 10;  // settled below original — suppress rapid re-escalation
+        printf("[ARQ] BREAK exhausted, settling at speed %d (below original %d, cooldown=%d)\n",
+               speed_level_, break_recovery_speed_, gearshift_cooldown_);
+    } else {
+        printf("[ARQ] BREAK exhausted, settling at speed %d\n", speed_level_);
+    }
+    fflush(stdout);
 }
 
 void ArqSession::handle_break(const ArqFrame&) {

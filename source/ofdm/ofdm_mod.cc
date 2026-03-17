@@ -442,6 +442,61 @@ std::vector<std::complex<float>> OfdmModulator::build_ofdm_frame(
         }
     }
 
+    // ---- 6b. Per-carrier power normalization (M7) ----
+    // Different modulations have different average constellation energies
+    // (BPSK ~1, QPSK ~1, 16QAM ~10, 64QAM ~42, 256QAM ~170 for integer grids).
+    // Normalize each carrier's symbol to unit average power so all carriers
+    // contribute equally to total deviation regardless of modulation order.
+    for (int s = 0; s < n_data_symbols; s++) {
+        for (int k = 0; k < tone_map.n_data_carriers; k++) {
+            int bpc = tone_map.bits_per_carrier[k];
+            if (bpc == 0) continue;
+            // Average energy for standard QAM: E = 2/3 * (M-1) where M = constellation size
+            int M_order = 1 << bpc;
+            float avg_energy = (M_order <= 2) ? 1.0f : (2.0f/3.0f) * (M_order - 1);
+            float norm = std::sqrt(avg_energy);
+            data_sym_carriers[s][k] /= norm;
+        }
+    }
+
+    // ---- 6c. TX pre-emphasis compensation (M1) ----
+    // FM de-emphasis causes higher-frequency carriers to lose power at the
+    // receiver (6 dB/octave rolloff). Pre-compensate by boosting higher carriers
+    // so all carriers arrive at roughly equal power after de-emphasis.
+    // Applied to DATA symbols only — training symbols use known amplitudes for
+    // channel estimation and already have their own PREAMBLE_BOOST.
+    {
+        float sr = (float)config_.sample_rate;
+        int nfft = config_.nfft;
+        constexpr float F_CORNER = 2120.0f;  // 300 us time constant for FM
+        for (int s = 0; s < n_data_symbols; s++) {
+            for (int k = 0; k < tone_map.n_data_carriers; k++) {
+                if (tone_map.bits_per_carrier[k] == 0) continue;
+                // Map data carrier index to its FFT bin to get actual frequency
+                // Data carriers are a subset of used_carrier_bins (skipping pilots)
+                // We need the bin for this data carrier — compute from used_carrier_bins
+                // by walking past pilots
+                int used_idx = 0;
+                int data_count = 0;
+                for (int i = 0; i < (int)config_.used_carrier_bins.size(); i++) {
+                    bool pilot = (i % config_.pilot_carrier_spacing == 0);
+                    if (!pilot) {
+                        if (data_count == k) { used_idx = i; break; }
+                        data_count++;
+                    }
+                }
+                int bin = config_.used_carrier_bins[used_idx];
+                float freq_hz = (float)bin * sr / (float)nfft;
+                // 6 dB/octave de-emphasis: power drops as 1/(1 + (f/f_corner)^2)
+                // Pre-compensate by boosting: gain = sqrt(1 + (f/f_corner)^2)
+                // Cap at +6 dB (2x) to avoid excessive boosting at band edges
+                float gain = std::sqrt(1.0f + (freq_hz / F_CORNER) * (freq_hz / F_CORNER));
+                gain = std::min(gain, 2.0f);
+                data_sym_carriers[s][k] *= gain;
+            }
+        }
+    }
+
     // ---- 7. Insert pilot carriers ----
     // For each OFDM data symbol, build the full n_used_carriers vector:
     // pilot positions get +1, data positions get their constellation point.
@@ -549,19 +604,15 @@ std::vector<std::complex<float>> OfdmModulator::build_ofdm_frame(
     frame.insert(frame.end(), tail.begin(), tail.end());
 
     // ---- 13. Iterative clip-and-filter for FM PAPR control ----
-    // FM radios hard-clip at deviation limit (~8-10 dB above RMS).
-    // We clip at 2.5x RMS (8 dB) so the radio operates in its linear range.
-    // Two iterations: clip, filter (removes spectral splatter), clip again.
+    // Soft clip at 2.5x RMS (8 dB). The FM radio's audio input IS amplitude-
+    // sensitive — its deviation limiter hard-clips uncontrolled peaks, destroying
+    // subcarrier orthogonality. Controlled soft clipping is much less harmful
+    // than uncontrolled hard clipping.
+    // Three iterations of clip-and-filter to better control spectral regrowth.
     int n_clipped = 0;
 
-    // Post-clip FIR filtering removed: the 15-tap lowpass was too short for
-    // wideband OFDM (distorted higher-order modulations like 64QAM/256QAM).
-    // FM radios have their own bandwidth limiting, so spectral regrowth from
-    // clipping is handled by the radio's IF filter. Clipping alone is sufficient.
-    bool have_fir = false;
-
-    constexpr float CLIP_RATIO = 99.0f;  // FM is constant-envelope — no PAPR clipping needed
-    constexpr int CLIP_ITERS = 1;
+    constexpr float CLIP_RATIO = 2.5f;  // 8 dB PAPR — keeps signal within FM radio's linear deviation range
+    constexpr int CLIP_ITERS = 3;
 
     for (int iter = 0; iter < CLIP_ITERS; iter++) {
         n_clipped += soft_clip(frame, CLIP_RATIO);
