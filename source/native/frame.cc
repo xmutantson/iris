@@ -338,7 +338,7 @@ float decode_channel_gain() { return g_decode_channel_gain; }
 // LLRs before feeding to LDPC — equivalent to MRC, +3 dB per combine.
 static std::vector<float> g_chase_llrs;
 static int g_chase_combines = 0;
-static bool g_chase_active = false;
+static bool g_chase_active = true;  // Always active — PHY-layer combining is harmless when no stored LLRs exist
 
 void chase_enable() { g_chase_active = true; }
 void chase_disable() { g_chase_active = false; g_chase_llrs.clear(); g_chase_combines = 0; }
@@ -816,94 +816,10 @@ bool decode_native_frame(const float* iq_samples, size_t count,
             raw_samples[k2].is_pilot = true;
     }
 
-    // --- Adaptive FIR Equalizer (zero-delay, NLMS) ---
-    // Compensates FM group delay ISI using a 3-tap linear FIR.
-    // Zero-delay: taps span [k-1, k, k+1] centered on current symbol.
-    // NLMS normalization prevents divergence on high-gain channels.
-    // No feedback taps — pure FIR avoids DFE error propagation.
-    // Trained on pilot symbols (known +1 BPSK), DD mode between pilots.
-    if (use_pilots && payload_symbols > 64) {
-        constexpr int N_FF = 3;   // taps: pre, center, post
-        constexpr int CENTER = N_FF / 2;  // = 1
-        constexpr float MU = 0.01f;  // NLMS step size (normalized by input power)
-        constexpr float LEAK = 0.999f;  // leaky regularization
-
-        std::complex<float> ff[N_FF] = {};
-        ff[CENTER] = {1.0f, 0.0f};  // center tap = unity (passthrough)
-
-        std::vector<std::complex<float>> eq_out(payload_symbols);
-        int n_updates = 0;
-
-        for (int k = 0; k < payload_symbols; k++) {
-            // Load tap buffer centered on k: [k-1, k, k+1]
-            std::complex<float> ff_buf[N_FF];
-            float input_power = 1e-6f;
-            for (int t = 0; t < N_FF; t++) {
-                int idx = k + t - CENTER;
-                if (idx >= 0 && idx < payload_symbols)
-                    ff_buf[t] = {raw_samples[idx].iv, raw_samples[idx].qv};
-                else
-                    ff_buf[t] = {0.0f, 0.0f};
-                input_power += std::norm(ff_buf[t]);
-            }
-
-            // FIR output: y = FF' * x
-            std::complex<float> y = {0.0f, 0.0f};
-            for (int t = 0; t < N_FF; t++)
-                y += std::conj(ff[t]) * ff_buf[t];
-
-            eq_out[k] = y;
-
-            // Determine reference symbol for NLMS update
-            std::complex<float> d;
-            bool do_update = false;
-
-            if (raw_samples[k].is_pilot) {
-                d = {1.0f, 0.0f};  // known pilot
-                do_update = true;
-            }
-            // No DD: pilot-only training avoids error propagation from
-            // wrong decisions.  With pilot spacing 16, the FIR tracks
-            // ISI changes smoothly without needing inter-pilot updates.
-
-            if (do_update) {
-                std::complex<float> e = d - y;
-                float mu_n = MU / input_power;
-                for (int t = 0; t < N_FF; t++)
-                    ff[t] = LEAK * ff[t] + mu_n * e * std::conj(ff_buf[t]);
-                // NaN guard
-                bool ok = true;
-                for (int t = 0; t < N_FF; t++)
-                    if (!std::isfinite(ff[t].real()) || !std::isfinite(ff[t].imag())) ok = false;
-                if (!ok) {
-                    for (int t = 0; t < N_FF; t++) ff[t] = {0.0f, 0.0f};
-                    ff[CENTER] = {1.0f, 0.0f};
-                }
-                n_updates++;
-            }
-        }
-
-        // Write back equalized samples
-        for (int k = 0; k < payload_symbols; k++) {
-            raw_samples[k].iv = eq_out[k].real();
-            raw_samples[k].qv = eq_out[k].imag();
-            raw_samples[k].mag = std::sqrt(eq_out[k].real() * eq_out[k].real() +
-                                            eq_out[k].imag() * eq_out[k].imag());
-        }
-
-        if (n_updates > 0) {
-            float ff_energy = 0;
-            for (int t = 0; t < N_FF; t++)
-                ff_energy += std::norm(ff[t]);
-            // EQ tap delta: how far off-center taps are from zero (ISI severity)
-            for (int t = 0; t < N_FF; t++)
-                if (t != CENTER) diag_eq_delta += std::abs(ff[t]);
-            IRIS_LOG("[EQ] %d updates, energy=%.3f, taps=(%.3f,%.3f) (%.3f,%.3f) (%.3f,%.3f)",
-                     n_updates, ff_energy,
-                     ff[0].real(), ff[0].imag(), ff[1].real(), ff[1].imag(),
-                     ff[2].real(), ff[2].imag());
-        }
-    }
+    // NOTE: Adaptive FIR equalizer runs AFTER Kalman phase correction
+    // (see post-Kalman EQ section below).  Running it here would force the
+    // EQ taps to learn phase rotation + ISI combined, causing the center
+    // tap to chase phase drift on long frames instead of correcting ISI.
 
     // --- Kalman filter parameters ---
     // 3-state model: [phase, freq, accel] tracks thermal frequency drift
@@ -1021,6 +937,12 @@ bool decode_native_frame(const float* iq_samples, size_t count,
                 }
             }
 
+            // Accel mean-reversion: decay toward zero every symbol.
+            // Prevents noise-induced accel spikes from corrupting the rest
+            // of long frames.  Half-life ~700 symbols (~44 pilot intervals).
+            // Real thermal drift (changes over seconds) is barely affected.
+            s.accel *= 0.999f;
+
             fwd_state[k] = s;
         }
     }
@@ -1032,10 +954,19 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     std::vector<float> smoothed_phase(payload_symbols);
     std::vector<float> smoothed_freq(payload_symbols);
     std::vector<float> smoothed_accel(payload_symbols);
+    std::vector<float> smoothed_P00(payload_symbols);  // smoothed phase variance for CSI
     {
         smoothed_phase[payload_symbols-1] = fwd_state[payload_symbols-1].phase;
         smoothed_freq[payload_symbols-1] = fwd_state[payload_symbols-1].freq;
         smoothed_accel[payload_symbols-1] = fwd_state[payload_symbols-1].accel;
+        // Initialize smoothed covariance at last symbol = forward covariance
+        float sp00_c = fwd_state[payload_symbols-1].P00;
+        float sp01_c = fwd_state[payload_symbols-1].P01;
+        float sp02_c = fwd_state[payload_symbols-1].P02;
+        float sp11_c = fwd_state[payload_symbols-1].P11;
+        float sp12_c = fwd_state[payload_symbols-1].P12;
+        float sp22_c = fwd_state[payload_symbols-1].P22;
+        smoothed_P00[payload_symbols-1] = sp00_c;
 
         for (int k = payload_symbols - 2; k >= 0; k--) {
             float p00=fwd_state[k].P00, p01=fwd_state[k].P01, p02=fwd_state[k].P02;
@@ -1077,6 +1008,22 @@ bool decode_native_frame(const float* iq_samples, size_t count,
             float c10=pa10*i00+pa11*i01+pa12*i02, c11=pa10*i01+pa11*i11+pa12*i12, c12=pa10*i02+pa11*i12+pa12*i22;
             float c20=pa20*i00+pa21*i01+pa22*i02, c21=pa20*i01+pa21*i11+pa22*i12, c22=pa20*i02+pa21*i12+pa22*i22;
 
+            // Smoothed covariance: P_s[k] = P[k] + C*(P_s[k+1] - P_pred)*C'
+            // D = P_smooth[k+1] - P_pred (symmetric)
+            float d00=sp00_c-pp00, d01=sp01_c-pp01, d02=sp02_c-pp02;
+            float d11=sp11_c-pp11, d12=sp12_c-pp12, d22=sp22_c-pp22;
+            // E = C * D
+            float e00=c00*d00+c01*d01+c02*d02, e01=c00*d01+c01*d11+c02*d12, e02=c00*d02+c01*d12+c02*d22;
+            float e10=c10*d00+c11*d01+c12*d02, e11=c10*d01+c11*d11+c12*d12, e12=c10*d02+c11*d12+c12*d22;
+            float e20=c20*d00+c21*d01+c22*d02, e21=c20*d01+c21*d11+c22*d12, e22=c20*d02+c21*d12+c22*d22;
+            // P_s[k] = P_fwd[k] + E * C'  (symmetric, store all 6 elements)
+            sp00_c = p00 + e00*c00+e01*c01+e02*c02;
+            sp01_c = p01 + e00*c10+e01*c11+e02*c12;
+            sp02_c = p02 + e00*c20+e01*c21+e02*c22;
+            sp11_c = p11 + e10*c10+e11*c11+e12*c12;
+            sp12_c = p12 + e10*c20+e11*c21+e12*c22;
+            sp22_c = p22 + e20*c20+e21*c21+e22*c22;
+
             // Innovation: x_smooth[k+1] - A * x_fwd[k]
             float fp=fwd_state[k].phase, ff=fwd_state[k].freq, fa=fwd_state[k].accel;
             float dp = smoothed_phase[k+1] - (fp + ff + 0.5f*fa);
@@ -1086,6 +1033,7 @@ bool decode_native_frame(const float* iq_samples, size_t count,
             smoothed_phase[k] = fp + c00*dp + c01*df + c02*da;
             smoothed_freq[k]  = ff + c10*dp + c11*df + c12*da;
             smoothed_accel[k] = fa + c20*dp + c21*df + c22*da;
+            smoothed_P00[k] = sp00_c;
         }
     }
 
@@ -1270,6 +1218,7 @@ bool decode_native_frame(const float* iq_samples, size_t count,
                     }
                 }
 
+                s.accel *= 0.999f;  // match pass-1 mean-reversion
                 p2_fwd[k] = s;
             }
         }
@@ -1329,24 +1278,105 @@ bool decode_native_frame(const float* iq_samples, size_t count,
         }
     }
 
-    // --- Pass 5: Apply smoothed phase corrections, extract symbols ---
-    std::vector<std::complex<float>> symbols;
-    std::vector<float> sym_reliability;
-    std::vector<float> sym_phase_var;  // Kalman P00 per data symbol (for CSI weighting)
+    // --- Pass 5a: Apply smoothed phase correction to ALL samples ---
+    // Phase-correct everything (including pilots) so the EQ sees
+    // phase-clean symbols and can learn pure ISI correction.
     for (int k = 0; k < payload_symbols; k++) {
-        if (raw_samples[k].is_pilot) continue;  // skip pilots
-
         float iv = raw_samples[k].iv;
         float qv = raw_samples[k].qv;
         float phase_corr = -smoothed_phase[k];
         float cc = std::cos(phase_corr) / channel_gain;
         float ss = std::sin(phase_corr) / channel_gain;
-        float re = iv * cc - qv * ss;
-        float im = iv * ss + qv * cc;
+        raw_samples[k].iv = iv * cc - qv * ss;
+        raw_samples[k].qv = iv * ss + qv * cc;
+        raw_samples[k].mag = std::sqrt(raw_samples[k].iv * raw_samples[k].iv +
+                                        raw_samples[k].qv * raw_samples[k].qv);
+    }
 
-        symbols.push_back({re, im});
+    // --- Pass 5b: Adaptive FIR Equalizer (post-Kalman, zero-delay, NLMS) ---
+    // Runs AFTER phase correction so pilots are at ~{1,0}.  Taps learn
+    // pure ISI correction, not phase rotation + ISI combined.  This prevents
+    // the center tap from chasing phase drift on long frames.
+    if (use_pilots && payload_symbols > 64) {
+        constexpr int N_FF = 3;
+        constexpr int CENTER = N_FF / 2;
+        constexpr float MU = 0.01f;
+        constexpr float LEAK = 0.999f;
+
+        std::complex<float> ff[N_FF] = {};
+        ff[CENTER] = {1.0f, 0.0f};
+
+        std::vector<std::complex<float>> eq_out(payload_symbols);
+        int n_updates = 0;
+
+        for (int k = 0; k < payload_symbols; k++) {
+            std::complex<float> ff_buf[N_FF];
+            float input_power = 1e-6f;
+            for (int t = 0; t < N_FF; t++) {
+                int idx = k + t - CENTER;
+                if (idx >= 0 && idx < payload_symbols)
+                    ff_buf[t] = {raw_samples[idx].iv, raw_samples[idx].qv};
+                else
+                    ff_buf[t] = {0.0f, 0.0f};
+                input_power += std::norm(ff_buf[t]);
+            }
+
+            std::complex<float> y = {0.0f, 0.0f};
+            for (int t = 0; t < N_FF; t++)
+                y += std::conj(ff[t]) * ff_buf[t];
+            eq_out[k] = y;
+
+            if (raw_samples[k].is_pilot) {
+                std::complex<float> d = {1.0f, 0.0f};
+                std::complex<float> e = d - y;
+                float mu_n = MU / input_power;
+                for (int t = 0; t < N_FF; t++) {
+                    // Only leak off-center taps — leaking the center tap
+                    // decays it to ~0.77 steady-state, costing 2.3 dB of
+                    // signal attenuation that cascades into LLR/SNR bias.
+                    float lk = (t == CENTER) ? 1.0f : LEAK;
+                    ff[t] = lk * ff[t] + mu_n * e * std::conj(ff_buf[t]);
+                }
+                bool ok = true;
+                for (int t = 0; t < N_FF; t++)
+                    if (!std::isfinite(ff[t].real()) || !std::isfinite(ff[t].imag())) ok = false;
+                if (!ok) {
+                    for (int t = 0; t < N_FF; t++) ff[t] = {0.0f, 0.0f};
+                    ff[CENTER] = {1.0f, 0.0f};
+                }
+                n_updates++;
+            }
+        }
+
+        for (int k = 0; k < payload_symbols; k++) {
+            raw_samples[k].iv = eq_out[k].real();
+            raw_samples[k].qv = eq_out[k].imag();
+            raw_samples[k].mag = std::sqrt(eq_out[k].real() * eq_out[k].real() +
+                                            eq_out[k].imag() * eq_out[k].imag());
+        }
+
+        if (n_updates > 0) {
+            float ff_energy = 0;
+            for (int t = 0; t < N_FF; t++)
+                ff_energy += std::norm(ff[t]);
+            for (int t = 0; t < N_FF; t++)
+                if (t != CENTER) diag_eq_delta += std::abs(ff[t]);
+            IRIS_LOG("[EQ] %d updates, energy=%.3f, taps=(%.3f,%.3f) (%.3f,%.3f) (%.3f,%.3f)",
+                     n_updates, ff_energy,
+                     ff[0].real(), ff[0].imag(), ff[1].real(), ff[1].imag(),
+                     ff[2].real(), ff[2].imag());
+        }
+    }
+
+    // --- Pass 5c: Extract data symbols (skip pilots) ---
+    std::vector<std::complex<float>> symbols;
+    std::vector<float> sym_reliability;
+    std::vector<float> sym_phase_var;  // smoothed P00 per data symbol (for CSI weighting)
+    for (int k = 0; k < payload_symbols; k++) {
+        if (raw_samples[k].is_pilot) continue;
+        symbols.push_back({raw_samples[k].iv, raw_samples[k].qv});
         sym_reliability.push_back(raw_samples[k].mag);
-        sym_phase_var.push_back(fwd_state[k].P00);
+        sym_phase_var.push_back(smoothed_P00[k]);
     }
 
     // Symbol de-interleaving: reverse the TX congruential permutation.
@@ -1501,25 +1531,28 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     std::vector<uint8_t> bits;
 
     if (fec != LdpcRate::NONE) {
-        // Soft-decision path: noise-variance-scaled LLRs for all modulations.
-        // sigma_sq is now safe for BPSK/QPSK because per-symbol Kalman P00
-        // weighting (below) attenuates LLRs from poorly-tracked symbols,
-        // preventing the over-confident wrong-sign problem that previously
-        // caused sigma_sq to be disabled for BPSK/QPSK.
+        // Soft-decision path: noise-variance-scaled LLRs.
+        // Use preamble-only SNR for base sigma_sq — the DD estimator biases
+        // upward at low SNR (hard-decides to wrong point, underestimates error)
+        // and the old max(preamble, DD) made LLRs overconfident.
+        // DD SNR is still used for gearshift reporting (above) but not here.
         float sigma_sq = 0;
-        if (g_decode_snr > 0 && g_decode_snr < 50.0f) {
-            float snr_lin = std::pow(10.0f, g_decode_snr / 10.0f);
-            sigma_sq = 1.0f / snr_lin;
+        float snr_preamble_lin = 1.0f;
+        if (g_decode_snr_preamble > 0 && g_decode_snr_preamble < 50.0f) {
+            snr_preamble_lin = std::pow(10.0f, g_decode_snr_preamble / 10.0f);
+            sigma_sq = 1.0f / snr_preamble_lin;
         }
         auto llrs = demap_soft(symbols, mod, sigma_sq);
 
-        // Combined reliability weighting: magnitude + Kalman P00 CSI.
-        // 1) Magnitude: symbols with low magnitude get erased (fading, echo).
-        // 2) P00 (phase variance): symbols with poor phase tracking get
-        //    attenuated — tells LDPC "I don't know" instead of injecting
-        //    confidently-wrong LLRs from residual phase rotation.
-        //    w_csi = 1 / (1 + SNR_linear * P00) — when P00 is small (good
-        //    tracking), w≈1; when P00 is large, w→0.
+        // Per-symbol reliability weighting: magnitude + Kalman P00 CSI.
+        // 1) Magnitude: symbols with low amplitude get soft-erased (fading).
+        // 2) P00 CSI: smooth information-theoretic weight that accounts for
+        //    per-symbol phase uncertainty. w = 1 / (1 + SNR * P00).
+        //    When tracking is good (P00 ~ 0.001), w ≈ 1.
+        //    When tracking is poor (P00 ~ 0.1), w → 0.
+        //    This replaces the old 3×-median outlier-only threshold which
+        //    had a large dead zone where moderately unreliable symbols
+        //    passed through at full weight.
         {
             std::vector<float> sorted_mags(sym_reliability);
             std::sort(sorted_mags.begin(), sorted_mags.end());
@@ -1527,34 +1560,17 @@ bool decode_native_frame(const float* iq_samples, size_t count,
                 sorted_mags[sorted_mags.size() / 2] : 1.0f;
             if (median_mag < 0.01f) median_mag = 0.01f;
 
-            // Median P00 for CSI outlier detection
-            float median_p00 = 0.0f;
-            if (!sym_phase_var.empty()) {
-                std::vector<float> sorted_p00(sym_phase_var);
-                std::sort(sorted_p00.begin(), sorted_p00.end());
-                median_p00 = sorted_p00[sorted_p00.size() / 2];
-            }
-
-            float snr_lin = (g_decode_snr > 0 && g_decode_snr < 50.0f) ?
-                std::pow(10.0f, g_decode_snr / 10.0f) : 1.0f;
-
             int n_attenuated = 0, n_phase_attenuated = 0;
             for (int si = 0; si < (int)symbols.size(); si++) {
-                // Magnitude weight (squared, as before)
+                // Magnitude weight (squared)
                 float w_mag = std::min(1.0f, sym_reliability[si] / median_mag);
                 w_mag *= w_mag;
 
-                // Kalman P00 CSI weight: only attenuate symbols with P00
-                // significantly above median (outliers from channel disturbance).
-                // Normal P00 cycling between pilots is NOT penalized.
+                // Kalman P00 CSI: smooth w = 1 / (1 + SNR_lin * P00)
                 float w_csi = 1.0f;
-                if (si < (int)sym_phase_var.size() && median_p00 > 1e-10f) {
-                    float ratio = sym_phase_var[si] / median_p00;
-                    // Soft attenuation: ramps down when P00 > 3× median
-                    if (ratio > 3.0f) {
-                        w_csi = 3.0f / ratio;
-                        w_csi = std::max(0.05f, w_csi);
-                    }
+                if (si < (int)sym_phase_var.size()) {
+                    w_csi = 1.0f / (1.0f + snr_preamble_lin * sym_phase_var[si]);
+                    w_csi = std::max(0.05f, w_csi);
                 }
 
                 float weight = w_mag * w_csi;
@@ -1604,13 +1620,14 @@ bool decode_native_frame(const float* iq_samples, size_t count,
             }
         }
 
-        // Clamp LLR magnitude to prevent decoder overflow.
-        // QAM16+: tighter clamp (6) — sigma_sq scaling at moderate SNR
-        // produces over-confident LLRs that the min-sum decoder can't flip.
-        // BPSK/QPSK: wider clamp (10) — fixed scaling keeps LLRs moderate.
-        float llr_clamp = (mod >= Modulation::QAM16) ? 6.0f : 10.0f;
+        // LLR clamp: generous ±20 to prevent float overflow in decoder.
+        // The old tight clamps (±6/±8/±10) were a band-aid for overconfident
+        // LLRs from the DD-inflated sigma_sq. Now that sigma_sq uses
+        // preamble-only SNR and per-symbol P00 CSI weighting is smooth,
+        // LLR magnitudes are properly calibrated and min-sum's internal
+        // min() operation naturally limits strong beliefs.
         for (auto& l : llrs) {
-            l = std::max(-llr_clamp, std::min(llr_clamp, l));
+            l = std::max(-20.0f, std::min(20.0f, l));
         }
 
         // LDPC tail hardening: bias padding bits toward known-zero value.
@@ -1681,29 +1698,36 @@ bool decode_native_frame(const float* iq_samples, size_t count,
         }
 
         // Chase combining: if active and we have stored LLRs from a previous
-        // failed decode of the same frame, element-wise add them to the new LLRs.
-        // This is MRC (Maximum Ratio Combining) in LLR domain: +3 dB per combine.
+        // failed decode, element-wise add them to the new LLRs (MRC in LLR
+        // domain: +3 dB per combine).  Keep a copy of the fresh LLRs so we
+        // can store them (not the combined version) on failure.
+        bool chase_attempted = false;
+        std::vector<float> fresh_llrs;
         if (g_chase_active && !g_chase_llrs.empty() &&
             g_chase_llrs.size() == llrs.size()) {
+            fresh_llrs = llrs;               // snapshot before combining
             for (size_t i = 0; i < llrs.size(); i++)
                 llrs[i] += g_chase_llrs[i];
             g_chase_combines++;
+            chase_attempted = true;
             IRIS_LOG("[DECODE] Chase combine #%d: added stored LLRs (%zu floats)",
                      g_chase_combines, llrs.size());
         }
 
-        // Use SPA decoder for rate 3/4 — exact check-node messages gain
-        // ~0.2 dB at the coding cliff vs min-sum approximation.
-        // At N=1600 the compute cost is negligible.
-        LdpcDecoder ldpc_algo = (fec == LdpcRate::RATE_3_4) ? LdpcDecoder::SPA
-                                                             : LdpcDecoder::MIN_SUM;
+        // Min-sum for all rates.  SPA's theoretical 0.2 dB gain at rate 3/4
+        // is negated by overconfident LLRs (DD SNR bias + sigma_sq scaling),
+        // and tanh saturation at |LLR|>5 makes strong beliefs unflippable.
+        // Min-sum with scale 0.80 is robust to LLR magnitude errors.
+        LdpcDecoder ldpc_algo = LdpcDecoder::MIN_SUM;
         bits = LdpcCodec::decode_soft(llrs, fec, ldpc_algo);
         if (bits.empty()) {
-            // Store LLRs for potential Chase combining on retransmit
+            // Store FRESH (uncombined) LLRs for Chase combining on retransmit.
+            // Never store combined LLRs — if we combined with the wrong frame's
+            // buffer the result is garbage and would corrupt future combines.
             if (g_chase_active) {
-                g_chase_llrs = llrs;  // store combined (or first-attempt) LLRs
+                g_chase_llrs = chase_attempted ? std::move(fresh_llrs) : llrs;
                 IRIS_LOG("[DECODE] LDPC failed — stored %zu LLRs for Chase combining",
-                         llrs.size());
+                         g_chase_llrs.size());
             }
             IRIS_LOG("[DECODE] LDPC decode failed (did not converge)");
             IRIS_LOG("[FRAME] FAIL/LDPC mod=%d fec=%d len=%d snr=%.1f eq=%.3f hampel=%d chase=%d",
@@ -1711,11 +1735,12 @@ bool decode_native_frame(const float* iq_samples, size_t count,
                      diag_eq_delta, diag_hampel_blanked, g_chase_combines);
             return false;
         }
-        // Decode succeeded — clear Chase buffer
-        if (g_chase_active) {
+        // Decode succeeded — only clear Chase buffer if we actually used it.
+        // Don't clear on regular success: the stored LLRs belong to a
+        // different (failed) frame and must survive until its retransmit.
+        if (g_chase_active && chase_attempted) {
             g_chase_llrs.clear();
-            if (g_chase_combines > 0)
-                IRIS_LOG("[DECODE] Chase combining succeeded after %d combines", g_chase_combines);
+            IRIS_LOG("[DECODE] Chase combining succeeded after %d combines", g_chase_combines);
             g_chase_combines = 0;
         }
     } else {
