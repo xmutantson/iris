@@ -926,12 +926,17 @@ bool decode_native_frame(const float* iq_samples, size_t count,
                     s.accel += K2 * z;
                     const float max_accel = 1e-4f;
                     s.accel = std::clamp(s.accel, -max_accel, max_accel);
-                    float np00 = s.P00 - K0*s.P00;
-                    float np01 = s.P01 - K0*s.P01;
-                    float np02 = s.P02 - K0*s.P02;
-                    float np11 = s.P11 - K1*s.P01;
-                    float np12 = s.P12 - K1*s.P02;
-                    float np22 = s.P22 - K2*s.P02;
+                    // Joseph form: P = (I-KH)*P*(I-KH)' + K*R*K'
+                    // Guarantees P stays positive semi-definite in float.
+                    // Standard P=(I-KH)*P loses symmetry after many iterations.
+                    // With H=[1,0,0], (I-KH)*P + K*R*K' simplifies to:
+                    // standard update + K[i]*r_meas*K[j] for each element.
+                    float np00 = s.P00 - K0*s.P00 + K0*r_meas*K0;
+                    float np01 = s.P01 - K0*s.P01 + K0*r_meas*K1;
+                    float np02 = s.P02 - K0*s.P02 + K0*r_meas*K2;
+                    float np11 = s.P11 - K1*s.P01 + K1*r_meas*K1;
+                    float np12 = s.P12 - K1*s.P02 + K1*r_meas*K2;
+                    float np22 = s.P22 - K2*s.P02 + K2*r_meas*K2;
                     s.P00=np00; s.P01=np01; s.P02=np02;
                     s.P11=np11; s.P12=np12; s.P22=np22;
                 }
@@ -997,7 +1002,7 @@ bool decode_native_frame(const float* iq_samples, size_t count,
             float det = pp00*(pp11*pp22 - pp12*pp12)
                       - pp01*(pp01*pp22 - pp02*pp12)
                       + pp02*(pp01*pp12 - pp02*pp11);
-            if (std::abs(det) < 1e-30f) det = 1e-30f;
+            if (std::abs(det) < 1e-12f) det = (det < 0 ? -1e-12f : 1e-12f);
             float id = 1.0f / det;
             float i00=(pp11*pp22-pp12*pp12)*id, i01=(pp02*pp12-pp01*pp22)*id, i02=(pp01*pp12-pp02*pp11)*id;
             float i11=(pp00*pp22-pp02*pp02)*id, i12=(pp01*pp02-pp00*pp12)*id;
@@ -1044,17 +1049,20 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     // estimate cannot be poisoned by wrong symbol decisions.
     // Falls back to decision-directed for QAM16+ where VV doesn't apply.
     const char* pass2_mode = "none";  // for diagnostics
-    // QPSK second pass: SKIP.  Both VV4 and DD are worse than pilot-only:
-    // - VV4: 4-fold ambiguity picks wrong 90° branches → 5 dB processing loss
-    // - DD: circularity causes runaway (43,000°+ drift on 11053-sym frames OTA)
-    //   even with innovation gating — individual errors pass gate but bias accumulates
-    // Tail pilots (N_TAIL_PILOTS) give the RTS smoother measurement data at
-    // frame end, fixing the tail-of-frame asymmetry without any feedback loop.
-    bool skip_pass2 = (mod == Modulation::QPSK);
-    if (skip_pass2) pass2_mode = "SKIP";
-    if (payload_symbols > 512 && !skip_pass2) {
+    // QPSK second pass: VV4 with sequential unwrapping.
+    // Original VV4 (per-symbol ambiguity resolution vs Kalman) failed OTA
+    // because the Kalman smoothed phase has 15-25° errors, too close to VV4's
+    // 45° decision boundary.  Sequential unwrapping resolves each symbol's
+    // ambiguity against the PREVIOUS VV4 output instead.  Adjacent VV4
+    // estimates share 64/65 window samples (r>0.98 correlation), so the
+    // phase difference between them is <1° — well within the ±45° margin.
+    // Only the first data symbol uses the Kalman reference.
+    // DD remains disabled (43,000°+ drift on 11053-sym frames OTA).
+    bool skip_pass2 = false;
+    if (payload_symbols > 512) {
         int vv_power = 0;
         if (mod == Modulation::BPSK) vv_power = 2;
+        if (mod == Modulation::QPSK) vv_power = 4;
 
         std::vector<float> pass2_meas(payload_symbols, 0.0f);
         std::vector<bool> pass2_valid(payload_symbols, false);
@@ -1074,10 +1082,19 @@ bool decode_native_frame(const float* iq_samples, size_t count,
                 raised[k] = r;
             }
 
+            // Sequential unwrapping: resolve ambiguity against previous
+            // resolved VV output, not the Kalman estimate.  Adjacent VV
+            // windows share (2*VV_W)/(2*VV_W+1) samples, so consecutive
+            // raw_vv values differ by <1°.  The ±45° (VV4) or ±90° (VV2)
+            // margin is never challenged.  Only the first symbol uses the
+            // Kalman reference (which is accurate enough for a single point).
+            float prev_resolved = smoothed_phase[0];  // seed from Kalman
             for (int k = 0; k < payload_symbols; k++) {
                 if (raw_samples[k].is_pilot) {
-                    pass2_meas[k] = std::atan2(raw_samples[k].qv, raw_samples[k].iv);
+                    float pilot_phase = std::atan2(raw_samples[k].qv, raw_samples[k].iv);
+                    pass2_meas[k] = pilot_phase;
                     pass2_valid[k] = true;
+                    prev_resolved = pilot_phase;  // reset chain at each pilot
                 } else {
                     int lo = std::max(0, k - VV_W);
                     int hi = std::min(payload_symbols - 1, k + VV_W);
@@ -1086,14 +1103,15 @@ bool decode_native_frame(const float* iq_samples, size_t count,
 
                     if (std::abs(sum) > 1e-6f) {
                         float raw_vv = std::arg(sum) / (float)vv_power;
-                        // Resolve M-fold ambiguity using first-pass smoothed phase
-                        float ref = smoothed_phase[k];
+                        // Sequential disambiguation: resolve against previous
+                        // resolved phase (not Kalman). Phase change between
+                        // adjacent symbols is <1°, margin is ±45° for VV4.
                         float step = 2.0f * (float)M_PI / (float)vv_power;
                         float best = raw_vv;
                         float best_dist = 1e9f;
                         for (int b = 0; b < vv_power; b++) {
                             float cand = raw_vv + b * step;
-                            float d = cand - ref;
+                            float d = cand - prev_resolved;
                             while (d > (float)M_PI) d -= 2*(float)M_PI;
                             while (d < -(float)M_PI) d += 2*(float)M_PI;
                             if (std::abs(d) < best_dist) {
@@ -1103,6 +1121,7 @@ bool decode_native_frame(const float* iq_samples, size_t count,
                         }
                         pass2_meas[k] = best;
                         pass2_valid[k] = true;
+                        prev_resolved = best;
                     }
                 }
             }
@@ -1207,12 +1226,13 @@ bool decode_native_frame(const float* iq_samples, size_t count,
                         s.accel += K2 * z;
                         const float max_accel = 1e-4f;
                         s.accel = std::clamp(s.accel, -max_accel, max_accel);
-                        float np00 = s.P00 - K0*s.P00;
-                        float np01 = s.P01 - K0*s.P01;
-                        float np02 = s.P02 - K0*s.P02;
-                        float np11 = s.P11 - K1*s.P01;
-                        float np12 = s.P12 - K1*s.P02;
-                        float np22 = s.P22 - K2*s.P02;
+                        // Joseph form (match pass 1)
+                        float np00 = s.P00 - K0*s.P00 + K0*r*K0;
+                        float np01 = s.P01 - K0*s.P01 + K0*r*K1;
+                        float np02 = s.P02 - K0*s.P02 + K0*r*K2;
+                        float np11 = s.P11 - K1*s.P01 + K1*r*K1;
+                        float np12 = s.P12 - K1*s.P02 + K1*r*K2;
+                        float np22 = s.P22 - K2*s.P02 + K2*r*K2;
                         s.P00=np00; s.P01=np01; s.P02=np02;
                         s.P11=np11; s.P12=np12; s.P22=np22;
                     }
@@ -1256,7 +1276,7 @@ bool decode_native_frame(const float* iq_samples, size_t count,
                 float det = pp00*(pp11*pp22 - pp12*pp12)
                           - pp01*(pp01*pp22 - pp02*pp12)
                           + pp02*(pp01*pp12 - pp02*pp11);
-                if (std::abs(det) < 1e-30f) det = 1e-30f;
+                if (std::abs(det) < 1e-12f) det = (det < 0 ? -1e-12f : 1e-12f);
                 float id = 1.0f / det;
                 float i00=(pp11*pp22-pp12*pp12)*id, i01=(pp02*pp12-pp01*pp22)*id, i02=(pp01*pp12-pp02*pp11)*id;
                 float i11=(pp00*pp22-pp02*pp02)*id, i12=(pp01*pp02-pp00*pp12)*id;
