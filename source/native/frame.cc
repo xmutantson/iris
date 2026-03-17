@@ -1293,80 +1293,12 @@ bool decode_native_frame(const float* iq_samples, size_t count,
                                         raw_samples[k].qv * raw_samples[k].qv);
     }
 
-    // --- Pass 5b: Adaptive FIR Equalizer (post-Kalman, zero-delay, NLMS) ---
-    // Runs AFTER phase correction so pilots are at ~{1,0}.  Taps learn
-    // pure ISI correction, not phase rotation + ISI combined.  This prevents
-    // the center tap from chasing phase drift on long frames.
-    if (use_pilots && payload_symbols > 64) {
-        constexpr int N_FF = 3;
-        constexpr int CENTER = N_FF / 2;
-        constexpr float MU = 0.01f;
-        constexpr float LEAK = 0.999f;
-
-        std::complex<float> ff[N_FF] = {};
-        ff[CENTER] = {1.0f, 0.0f};
-
-        std::vector<std::complex<float>> eq_out(payload_symbols);
-        int n_updates = 0;
-
-        for (int k = 0; k < payload_symbols; k++) {
-            std::complex<float> ff_buf[N_FF];
-            float input_power = 1e-6f;
-            for (int t = 0; t < N_FF; t++) {
-                int idx = k + t - CENTER;
-                if (idx >= 0 && idx < payload_symbols)
-                    ff_buf[t] = {raw_samples[idx].iv, raw_samples[idx].qv};
-                else
-                    ff_buf[t] = {0.0f, 0.0f};
-                input_power += std::norm(ff_buf[t]);
-            }
-
-            std::complex<float> y = {0.0f, 0.0f};
-            for (int t = 0; t < N_FF; t++)
-                y += std::conj(ff[t]) * ff_buf[t];
-            eq_out[k] = y;
-
-            if (raw_samples[k].is_pilot) {
-                std::complex<float> d = {1.0f, 0.0f};
-                std::complex<float> e = d - y;
-                float mu_n = MU / input_power;
-                for (int t = 0; t < N_FF; t++) {
-                    // Only leak off-center taps — leaking the center tap
-                    // decays it to ~0.77 steady-state, costing 2.3 dB of
-                    // signal attenuation that cascades into LLR/SNR bias.
-                    float lk = (t == CENTER) ? 1.0f : LEAK;
-                    ff[t] = lk * ff[t] + mu_n * e * std::conj(ff_buf[t]);
-                }
-                bool ok = true;
-                for (int t = 0; t < N_FF; t++)
-                    if (!std::isfinite(ff[t].real()) || !std::isfinite(ff[t].imag())) ok = false;
-                if (!ok) {
-                    for (int t = 0; t < N_FF; t++) ff[t] = {0.0f, 0.0f};
-                    ff[CENTER] = {1.0f, 0.0f};
-                }
-                n_updates++;
-            }
-        }
-
-        for (int k = 0; k < payload_symbols; k++) {
-            raw_samples[k].iv = eq_out[k].real();
-            raw_samples[k].qv = eq_out[k].imag();
-            raw_samples[k].mag = std::sqrt(eq_out[k].real() * eq_out[k].real() +
-                                            eq_out[k].imag() * eq_out[k].imag());
-        }
-
-        if (n_updates > 0) {
-            float ff_energy = 0;
-            for (int t = 0; t < N_FF; t++)
-                ff_energy += std::norm(ff[t]);
-            for (int t = 0; t < N_FF; t++)
-                if (t != CENTER) diag_eq_delta += std::abs(ff[t]);
-            IRIS_LOG("[EQ] %d updates, energy=%.3f, taps=(%.3f,%.3f) (%.3f,%.3f) (%.3f,%.3f)",
-                     n_updates, ff_energy,
-                     ff[0].real(), ff[0].imag(), ff[1].real(), ff[1].imag(),
-                     ff[2].real(), ff[2].imag());
-        }
-    }
+    // Adaptive EQ disabled: OTA testing shows the 3-tap NLMS diverges on
+    // long frames (500+ pilots), with off-center taps growing to 0.3-0.6
+    // and stealing energy from the center tap.  FM single-carrier has
+    // negligible ISI (off-center taps ~0.003 on short frames), so the EQ
+    // was fitting noise, not correcting ISI.  Net effect was signal
+    // attenuation and LLR degradation on the frames that matter most.
 
     // --- Pass 5c: Extract data symbols (skip pilots) ---
     std::vector<std::complex<float>> symbols;
