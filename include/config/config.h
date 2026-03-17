@@ -109,6 +109,14 @@ struct IrisConfig {
     // Logging
     bool log_enabled = false;    // Auto-log to AppData/Iris/logs/
 
+    // OFDM PHY settings
+    bool ofdm_enable = true;           // Master OFDM enable/disable
+    int ofdm_nfft = 512;              // FFT size (256, 512, or 1024)
+    int ofdm_cp_samples = 64;         // Cyclic prefix samples
+    bool ofdm_auto_spacing = false;   // Auto-train subcarrier spacing
+    bool ofdm_waterfill = true;       // Per-subcarrier adaptive bit loading
+    bool ofdm_nuc = true;             // Non-uniform constellations
+
     // GUI
     bool show_constellation = true;
     bool show_waterfall = true;

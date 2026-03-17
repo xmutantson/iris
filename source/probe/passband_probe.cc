@@ -1,4 +1,5 @@
 #include "probe/passband_probe.h"
+#include "common/fft.h"
 #include <cmath>
 #include <cstring>
 #include <algorithm>
@@ -71,39 +72,6 @@ int probe_generate(float* out, int max_samples, int sample_rate,
 // Analyze received probe signal
 // -----------------------------------------------------------------------
 
-// Simple power-of-2 FFT (Cooley-Tukey, in-place, radix-2 DIT)
-static void fft_inplace(float* re, float* im, int n) {
-    // Bit-reversal permutation
-    for (int i = 1, j = 0; i < n; i++) {
-        int bit = n >> 1;
-        for (; j & bit; bit >>= 1) j ^= bit;
-        j ^= bit;
-        if (i < j) {
-            std::swap(re[i], re[j]);
-            std::swap(im[i], im[j]);
-        }
-    }
-    // Butterfly
-    for (int len = 2; len <= n; len <<= 1) {
-        float ang = -2.0f * (float)M_PI / len;
-        float wR = std::cos(ang), wI = std::sin(ang);
-        for (int i = 0; i < n; i += len) {
-            float curR = 1.0f, curI = 0.0f;
-            for (int j = 0; j < len / 2; j++) {
-                float uR = re[i + j], uI = im[i + j];
-                float vR = re[i + j + len / 2] * curR - im[i + j + len / 2] * curI;
-                float vI = re[i + j + len / 2] * curI + im[i + j + len / 2] * curR;
-                re[i + j] = uR + vR;
-                im[i + j] = uI + vI;
-                re[i + j + len / 2] = uR - vR;
-                im[i + j + len / 2] = uI - vI;
-                float tmpR = curR * wR - curI * wI;
-                curI = curR * wI + curI * wR;
-                curR = tmpR;
-            }
-        }
-    }
-}
 
 ProbeResult probe_analyze(const float* samples, int n_samples, int sample_rate) {
     ProbeResult result;
@@ -139,7 +107,7 @@ ProbeResult probe_analyze(const float* samples, int n_samples, int sample_rate) 
             re[i] = samples[offset + i] * w;
         }
 
-        fft_inplace(re.data(), im.data(), fft_n);
+        iris::fft(re.data(), im.data(), fft_n);
 
         // Dual-merge: max for tone detection, sum for mean (null validation)
         float norm2 = (float)fft_n * (float)fft_n;
@@ -161,7 +129,7 @@ ProbeResult probe_analyze(const float* samples, int n_samples, int sample_rate) 
             float w = 0.5f * (1.0f - std::cos(2.0 * M_PI * i / (copy_n - 1)));
             re[i] = samples[i] * w;
         }
-        fft_inplace(re.data(), im.data(), fft_n);
+        iris::fft(re.data(), im.data(), fft_n);
         float norm2 = (float)fft_n * (float)fft_n;
         for (int i = 0; i < n_pos; i++) {
             float mag2 = re[i] * re[i] + im[i] * im[i];

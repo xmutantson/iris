@@ -18,6 +18,27 @@ const SpeedLevel SPEED_LEVELS[NUM_SPEED_LEVELS] = {
     {"A7",  Modulation::QAM256,  7, 8,  25.0f,  0},   // 256QAM 7/8
 };
 
+// OFDM O-levels: FEC rate only (modulation determined by waterfilling)
+// Modulation field is BPSK as placeholder — not used for OFDM.
+const SpeedLevel OFDM_SPEED_LEVELS[NUM_OFDM_SPEED_LEVELS] = {
+    // name   mod               num den  min_snr  net_bits/baud
+    {"O0",  Modulation::BPSK,  1, 2,   3.0f,  0},   // Rate 1/2, most robust
+    {"O1",  Modulation::BPSK,  5, 8,   8.0f,  0},   // Rate 5/8
+    {"O2",  Modulation::BPSK,  3, 4,  12.0f,  0},   // Rate 3/4, default
+    {"O3",  Modulation::BPSK,  7, 8,  18.0f,  0},   // Rate 7/8, max throughput
+};
+
+int ofdm_snr_to_speed_level(float snr_db) {
+    int level = 0;
+    for (int i = NUM_OFDM_SPEED_LEVELS - 1; i >= 0; i--) {
+        if (snr_db >= OFDM_SPEED_LEVELS[i].min_snr_db + 1.0f) {
+            level = i;
+            break;
+        }
+    }
+    return level;
+}
+
 int snr_to_speed_level(float snr_db) {
     int level = 0;
     for (int i = NUM_SPEED_LEVELS - 1; i >= 0; i--) {

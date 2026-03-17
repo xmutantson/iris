@@ -147,7 +147,7 @@ def main():
     parser = argparse.ArgumentParser(description="Half-duplex two-instance Iris test")
     parser.add_argument("--capture", default="12",
                         help="VB-Cable capture device ID (both instances)")
-    parser.add_argument("--playback", default="1006",
+    parser.add_argument("--playback", default="1004",
                         help="VB-Cable playback device ID (both instances)")
     parser.add_argument("--call-a", default="TSTA", help="Callsign for instance A")
     parser.add_argument("--call-b", default="TSTB", help="Callsign for instance B")
@@ -173,6 +173,13 @@ def main():
 
     log_a = "halfduplex_a.log"
     log_b = "halfduplex_b.log"
+
+    # Remove stale logs so burst holdoff analysis only sees this run
+    for f in [log_a, log_b,
+              log_a.replace(".log", "_stdout.log"),
+              log_b.replace(".log", "_stdout.log")]:
+        if os.path.isfile(f):
+            os.remove(f)
 
     # Both instances share the SAME cable — half-duplex shared medium
     common_args = [

@@ -23,6 +23,11 @@
 #include "radio/rigctl.h"
 #include "probe/passband_probe.h"
 #include "probe/probe_controller.h"
+#include "ofdm/ofdm_config.h"
+#include "ofdm/ofdm_mod.h"
+#include "ofdm/ofdm_demod.h"
+#include "ofdm/ofdm_sync.h"
+#include "ofdm/ofdm_frame.h"
 #include <vector>
 #include <mutex>
 #include <queue>
@@ -252,10 +257,25 @@ private:
     std::vector<uint8_t> last_rx_frame_;  // Dedup: last dispatched frame content
     int dedup_cooldown_ = 0;              // Samples remaining for dedup window
 
-    // Native PHY
+    // Native PHY (legacy single-carrier)
     PhyConfig phy_config_;
     std::unique_ptr<NativeModulator> native_mod_;
     std::unique_ptr<NativeDemodulator> native_demod_;
+
+    // OFDM PHY (default, high-throughput multi-carrier)
+    bool ofdm_phy_active_ = false;                     // OFDM PHY in use (after probe)
+    OfdmConfig ofdm_config_;                            // Current OFDM configuration
+    std::unique_ptr<OfdmModulator> ofdm_mod_;           // OFDM modulator
+    std::unique_ptr<OfdmDemodulator> ofdm_demod_;       // OFDM demodulator
+    ToneMap ofdm_tone_map_;                             // Current tone map (from gearshift)
+    int ofdm_speed_level_ = 0;                          // Current OFDM speed level (O0-O3)
+    std::vector<std::complex<float>> ofdm_rx_iq_;       // OFDM RX working buffer (complex)
+    std::vector<float> ofdm_rx_audio_buf_;              // OFDM RX raw audio buffer (bypass downconverter)
+    std::vector<float> ofdm_chase_llrs_;                // Stored LLRs for OFDM Chase combining
+    int ofdm_chase_combines_ = 0;                       // Chase combine counter
+    OfdmSyncResult ofdm_pending_sync_;                   // Cached sync for "frame incomplete" retry
+    bool ofdm_sync_cached_ = false;                      // Valid cached sync exists
+    int ofdm_redetect_count_ = 0;                        // Re-detection counter for diagnostics
 
     // Mode A upconversion
     Upconverter upconverter_;

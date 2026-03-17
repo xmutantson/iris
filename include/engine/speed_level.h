@@ -19,8 +19,16 @@ struct SpeedLevel {
 constexpr int NUM_SPEED_LEVELS = 8;
 extern const SpeedLevel SPEED_LEVELS[NUM_SPEED_LEVELS];
 
+// OFDM O-level speed levels (FEC-rate-only, modulation set by waterfilling)
+constexpr int NUM_OFDM_SPEED_LEVELS = 4;
+extern const SpeedLevel OFDM_SPEED_LEVELS[NUM_OFDM_SPEED_LEVELS];
+
 // Get the speed level index appropriate for a given SNR
 int snr_to_speed_level(float snr_db);
+
+// Get the OFDM O-level index appropriate for a given SNR
+// Picks highest O-level where SNR exceeds threshold + 1 dB margin
+int ofdm_snr_to_speed_level(float snr_db);
 
 // Calculate net throughput for a speed level at a given baud rate
 int net_throughput(int level, int baud_rate);

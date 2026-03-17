@@ -1,4 +1,6 @@
 #include "native/constellation.h"
+#include "native/nuc_tables.h"
+#include "common/logging.h"
 #include <cmath>
 #include <algorithm>
 
@@ -228,6 +230,136 @@ std::vector<float> demap_soft(const std::vector<std::complex<float>>& symbols, M
     }
 
     return llrs;
+}
+
+// ============================================================================
+//  NUC table lookup
+// ============================================================================
+
+// Static NucTable descriptors — one per (order, rate) pair
+static const NucTable nuc_table_16_r8  = { 16,  8, false, nuc16_r8_points,  16, nullptr, 0 };
+static const NucTable nuc_table_16_r12 = { 16, 12, false, nuc16_r12_points, 16, nullptr, 0 };
+static const NucTable nuc_table_16_r14 = { 16, 14, false, nuc16_r14_points, 16, nullptr, 0 };
+static const NucTable nuc_table_64_r8  = { 64,  8, false, nuc64_r8_points,  64, nullptr, 0 };
+static const NucTable nuc_table_64_r12 = { 64, 12, false, nuc64_r12_points, 64, nullptr, 0 };
+static const NucTable nuc_table_64_r14 = { 64, 14, false, nuc64_r14_points, 64, nullptr, 0 };
+static const NucTable nuc_table_256_r12 = { 256, 12, true, nullptr, 0, nuc256_r12_axis, 16 };
+static const NucTable nuc_table_256_r14 = { 256, 14, true, nullptr, 0, nuc256_r14_axis, 16 };
+
+const NucTable* get_nuc_table(Modulation mod, int fec_rate_num_16) {
+    switch (mod) {
+        case Modulation::QAM16:
+            if (fec_rate_num_16 == 8)  return &nuc_table_16_r8;
+            if (fec_rate_num_16 == 12) return &nuc_table_16_r12;
+            if (fec_rate_num_16 == 14) return &nuc_table_16_r14;
+            break;
+        case Modulation::QAM64:
+            if (fec_rate_num_16 == 8)  return &nuc_table_64_r8;
+            if (fec_rate_num_16 == 12) return &nuc_table_64_r12;
+            if (fec_rate_num_16 == 14) return &nuc_table_64_r14;
+            break;
+        case Modulation::QAM256:
+            if (fec_rate_num_16 == 12) return &nuc_table_256_r12;
+            if (fec_rate_num_16 == 14) return &nuc_table_256_r14;
+            break;
+        default:
+            break;
+    }
+    return nullptr;
+}
+
+// ============================================================================
+//  NUC mapper
+// ============================================================================
+
+std::complex<float> map_symbol_nuc(int symbol_index, const NucTable* nuc) {
+    if (!nuc) return {0.0f, 0.0f};
+
+    if (!nuc->separable) {
+        // 2D-NUC: direct lookup
+        if (symbol_index < 0 || symbol_index >= nuc->n_points_2d)
+            return {0.0f, 0.0f};
+        return nuc->points_2d[symbol_index];
+    } else {
+        // 1D-NUC (256QAM): Cartesian product of axis values
+        // symbol_index = i_idx * n_axis + q_idx (upper bits = I, lower bits = Q)
+        int side = nuc->n_axis_1d;
+        int i_idx = (symbol_index >> (side > 0 ? (int)std::log2((float)side) : 0)) & (side - 1);
+        int q_idx = symbol_index & (side - 1);
+        if (i_idx >= side || q_idx >= side) return {0.0f, 0.0f};
+        return {nuc->axis_1d[i_idx], nuc->axis_1d[q_idx]};
+    }
+}
+
+// ============================================================================
+//  NUC soft demapper
+// ============================================================================
+
+void demap_soft_nuc(const std::complex<float>& sym, float sigma_sq,
+                    const NucTable* nuc, float* llrs) {
+    if (!nuc) return;
+
+    int nbits = (int)std::log2((float)nuc->order);
+
+    if (!nuc->separable) {
+        // ------------------------------------------------------------------
+        //  2D-NUC (16-NUC, 64-NUC): full search over all constellation points
+        //  max-log-MAP: LLR(b) = min_{s: b=0} |y-s|^2 - min_{s: b=1} |y-s|^2
+        //               all divided by sigma_sq
+        // ------------------------------------------------------------------
+        float denom = (sigma_sq > 0) ? sigma_sq : 1.0f;
+
+        for (int b = 0; b < nbits; b++) {
+            float min_d0 = 1e30f;
+            float min_d1 = 1e30f;
+
+            for (int s = 0; s < nuc->n_points_2d; s++) {
+                float di = sym.real() - nuc->points_2d[s].real();
+                float dq = sym.imag() - nuc->points_2d[s].imag();
+                float dist_sq = di * di + dq * dq;
+
+                if ((s >> b) & 1)
+                    min_d1 = std::min(min_d1, dist_sq);
+                else
+                    min_d0 = std::min(min_d0, dist_sq);
+            }
+
+            // LLR > 0 means bit more likely 0
+            llrs[b] = (min_d1 - min_d0) / denom;
+        }
+    } else {
+        // ------------------------------------------------------------------
+        //  1D-NUC (256-NUC): separable I/Q axes
+        //  Compute per-axis LLRs independently — same complexity as uniform QAM
+        // ------------------------------------------------------------------
+        int side = nuc->n_axis_1d;          // 16 for 256QAM
+        int nbits_axis = nbits / 2;        // 4 bits per axis
+        float denom = (sigma_sq > 0) ? sigma_sq : 1.0f;
+
+        // I-axis LLRs (upper bits), then Q-axis LLRs (lower bits)
+        float axes[2] = {sym.real(), sym.imag()};
+        for (int ax = 0; ax < 2; ax++) {
+            float v = axes[ax];
+            for (int b = 0; b < nbits_axis; b++) {
+                float min_d0 = 1e30f;
+                float min_d1 = 1e30f;
+
+                for (int idx = 0; idx < side; idx++) {
+                    float point = nuc->axis_1d[idx];
+                    float dist_sq = (v - point) * (v - point);
+
+                    if ((idx >> b) & 1)
+                        min_d1 = std::min(min_d1, dist_sq);
+                    else
+                        min_d0 = std::min(min_d0, dist_sq);
+                }
+
+                // I-axis bits are the upper half, Q-axis bits are the lower half
+                int bit_index = (ax == 0) ? (nbits_axis + b) : b;
+                llrs[bit_index] = (min_d1 - min_d0) / denom;
+            }
+        }
+    }
 }
 
 } // namespace iris

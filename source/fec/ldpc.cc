@@ -1,6 +1,9 @@
 #include "fec/ldpc.h"
 #include "common/logging.h"
+#include "fec/mercury_normal_4_16.h"
+#include "fec/mercury_normal_6_16.h"
 #include "fec/mercury_normal_8_16.h"
+#include "fec/mercury_normal_10_16.h"
 #include "fec/mercury_normal_12_16.h"
 #include "fec/mercury_normal_14_16.h"
 #include <cstring>
@@ -54,6 +57,24 @@ static IraMatrix get_ira_matrix(LdpcRate rate) {
     m.n = LDPC_N;
 
     switch (rate) {
+        case LdpcRate::RATE_4_16:
+            m.k = 400; m.p = 1200;
+            m.cwidth = mercury_normal_Cwidth_4_16;
+            m.vwidth = mercury_normal_Vwidth_4_16;
+            m.QCmatrixC = &mercury_normal_QCmatrixC_4_16[0][0];
+            m.QCmatrixV = &mercury_normal_QCmatrixV_4_16[0][0];
+            m.QCmatrixEnc = &mercury_normal_QCmatrixEnc_4_16[0][0];
+            IRIS_LOG("[LDPC] loaded rate 4/16 matrix: k=%d n=%d", m.k, m.n);
+            break;
+        case LdpcRate::RATE_6_16:
+            m.k = 600; m.p = 1000;
+            m.cwidth = mercury_normal_Cwidth_6_16;
+            m.vwidth = mercury_normal_Vwidth_6_16;
+            m.QCmatrixC = &mercury_normal_QCmatrixC_6_16[0][0];
+            m.QCmatrixV = &mercury_normal_QCmatrixV_6_16[0][0];
+            m.QCmatrixEnc = &mercury_normal_QCmatrixEnc_6_16[0][0];
+            IRIS_LOG("[LDPC] loaded rate 6/16 matrix: k=%d n=%d", m.k, m.n);
+            break;
         case LdpcRate::RATE_1_2:
             m.k = 800; m.p = 800;
             m.cwidth = mercury_normal_Cwidth_8_16;
@@ -61,6 +82,15 @@ static IraMatrix get_ira_matrix(LdpcRate rate) {
             m.QCmatrixC = &mercury_normal_QCmatrixC_8_16[0][0];
             m.QCmatrixV = &mercury_normal_QCmatrixV_8_16[0][0];
             m.QCmatrixEnc = &mercury_normal_QCmatrixEnc_8_16[0][0];
+            break;
+        case LdpcRate::RATE_5_8:
+            m.k = 1000; m.p = 600;
+            m.cwidth = mercury_normal_Cwidth_10_16;
+            m.vwidth = mercury_normal_Vwidth_10_16;
+            m.QCmatrixC = &mercury_normal_QCmatrixC_10_16[0][0];
+            m.QCmatrixV = &mercury_normal_QCmatrixV_10_16[0][0];
+            m.QCmatrixEnc = &mercury_normal_QCmatrixEnc_10_16[0][0];
+            IRIS_LOG("[LDPC] loaded rate 10/16 matrix: k=%d n=%d", m.k, m.n);
             break;
         case LdpcRate::RATE_3_4:
             m.k = 1200; m.p = 400;
@@ -93,7 +123,10 @@ static IraMatrix get_ira_matrix(LdpcRate rate) {
 
 static LdpcRate effective_rate(LdpcRate rate) {
     switch (rate) {
+        case LdpcRate::RATE_4_16:
+        case LdpcRate::RATE_6_16:
         case LdpcRate::RATE_1_2:
+        case LdpcRate::RATE_5_8:
         case LdpcRate::RATE_3_4:
         case LdpcRate::RATE_7_8:
             return rate;

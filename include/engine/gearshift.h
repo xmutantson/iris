@@ -13,9 +13,15 @@ public:
 
     // Set maximum allowed speed level (from config/negotiation)
     void set_max_level(int max_level);
+    void set_max_ofdm_level(int max_level);
 
-    // Feed SNR measurement, returns recommended speed level
+    // Feed SNR measurement, returns recommended speed level (Mode A)
     int update(float snr_db);
+
+    // Feed SNR measurement for OFDM O-levels (O0-O3). Same adaptive logic
+    // (smoothing, LDPC boost, failure downshift, cooldown) but uses OFDM
+    // speed level thresholds instead of Mode A.
+    int ofdm_update(float snr_db);
 
     // Feed LDPC iteration count from last decoded frame.
     // Low iteration count = channel has margin beyond what SNR says.
@@ -23,6 +29,7 @@ public:
 
     // Force a specific level (e.g., after negotiation)
     void force_level(int level);
+    void force_ofdm_level(int level);
 
     // Lock level — force_level + disable gearshift updates
     void lock_level(int level);
@@ -33,6 +40,7 @@ public:
 
     // Get current level
     int current_level() const { return current_level_; }
+    int current_ofdm_level() const { return ofdm_level_; }
 
     // Get smoothed SNR estimate
     float smoothed_snr() const { return snr_avg_; }
@@ -53,6 +61,8 @@ public:
 private:
     int current_level_;
     int max_level_;
+    int ofdm_level_;             // Current OFDM O-level (O0-O3)
+    int max_ofdm_level_;
     bool locked_ = false;
     bool initialized_ = false;
     float snr_avg_;

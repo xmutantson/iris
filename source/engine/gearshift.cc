@@ -11,6 +11,8 @@ Gearshift::Gearshift() { reset(); }
 void Gearshift::reset() {
     current_level_ = 0;
     max_level_ = NUM_SPEED_LEVELS - 1;
+    ofdm_level_ = 0;
+    max_ofdm_level_ = NUM_OFDM_SPEED_LEVELS - 1;
     locked_ = false;
     initialized_ = false;
     snr_avg_ = 0;
@@ -26,8 +28,20 @@ void Gearshift::set_max_level(int max_level) {
         current_level_ = max_level_;
 }
 
+void Gearshift::set_max_ofdm_level(int max_level) {
+    max_ofdm_level_ = std::clamp(max_level, 0, NUM_OFDM_SPEED_LEVELS - 1);
+    if (ofdm_level_ > max_ofdm_level_)
+        ofdm_level_ = max_ofdm_level_;
+}
+
 void Gearshift::force_level(int level) {
     current_level_ = std::clamp(level, 0, max_level_);
+    hold_count_ = 0;
+    fail_count_ = 0;
+}
+
+void Gearshift::force_ofdm_level(int level) {
+    ofdm_level_ = std::clamp(level, 0, max_ofdm_level_);
     hold_count_ = 0;
     fail_count_ = 0;
 }
@@ -88,6 +102,41 @@ int Gearshift::update(float snr_db) {
     return current_level_;
 }
 
+int Gearshift::ofdm_update(float snr_db) {
+    if (locked_) return ofdm_level_;
+
+    // Reuse the same smoothed SNR — it's one physical channel
+    if (!initialized_) {
+        snr_avg_ = snr_db;
+        initialized_ = true;
+    } else {
+        snr_avg_ = SNR_ALPHA * snr_db + (1.0f - SNR_ALPHA) * snr_avg_;
+    }
+
+    int target = ofdm_snr_to_speed_level(snr_avg_ + ldpc_boost_);
+    target = std::min(target, max_ofdm_level_);
+
+    if (cooldown_ > 0) {
+        int drain = (ofdm_level_ <= 1) ? 2 : 1;
+        cooldown_ = std::max(0, cooldown_ - drain);
+    }
+    if (fail_count_ > 0) fail_count_--;
+
+    if (target > ofdm_level_ && cooldown_ == 0) {
+        hold_count_++;
+        if (hold_count_ >= HOLD_FRAMES) {
+            ofdm_level_++;
+            hold_count_ = 0;
+        }
+    } else if (target < ofdm_level_) {
+        ofdm_level_ = target;
+        hold_count_ = 0;
+        fail_count_ = 0;
+    }
+
+    return ofdm_level_;
+}
+
 void Gearshift::report_failure() {
     if (locked_) return;
 
@@ -95,8 +144,9 @@ void Gearshift::report_failure() {
     // Kill boost immediately — the channel can't handle this speed
     ldpc_boost_ = 0;
 
-    if (fail_count_ >= FAIL_THRESHOLD && current_level_ > 0) {
-        current_level_--;
+    if (fail_count_ >= FAIL_THRESHOLD) {
+        if (current_level_ > 0) current_level_--;
+        if (ofdm_level_ > 0) ofdm_level_--;
         hold_count_ = 0;
         fail_count_ = 0;
         cooldown_ = COOLDOWN_FRAMES;  // Suppress re-upshift for N frames

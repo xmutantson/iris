@@ -7,6 +7,9 @@
 
 namespace iris {
 
+// Forward declaration
+struct NucTable;
+
 enum class Modulation : uint8_t {
     BPSK   = 0,   // 1 bit/symbol
     QPSK   = 1,   // 2 bits/symbol
@@ -35,6 +38,18 @@ std::vector<uint8_t> demap_bits(const std::vector<std::complex<float>>& symbols,
 // 0 = use fixed normalization (legacy behavior).
 std::vector<float> demap_soft(const std::vector<std::complex<float>>& symbols, Modulation mod,
                               float sigma_sq = 0.0f);
+
+// ---- Non-Uniform Constellation (NUC) functions ----
+
+// Map a symbol index (0..order-1) to its NUC coordinate
+std::complex<float> map_symbol_nuc(int symbol_index, const NucTable* nuc);
+
+// Soft demap a single received symbol using NUC coordinates (max-log-MAP LLRs).
+// For 2D-NUC (16/64): full search over all constellation points.
+// For 1D-NUC (256): decompose into per-axis LLR computation (same complexity as uniform QAM).
+// llrs: output array, must have room for log2(order) floats.
+void demap_soft_nuc(const std::complex<float>& sym, float sigma_sq,
+                    const NucTable* nuc, float* llrs);
 
 } // namespace iris
 
