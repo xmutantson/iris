@@ -39,12 +39,14 @@ uint32_t crc32(const uint8_t* data, size_t len);
 
 // Mid-frame pilot spacing (symbols between pilots, 0 = disabled)
 // Pilots are known +1 BPSK symbols inserted after constellation mapping.
-// All modulations use spacing 16 (~6% overhead).  BPSK/QPSK was previously
-// 32, but OTA testing showed cumulative PLL drift on long frames (16000 sym)
-// causing LDPC tail failures.  Tighter pilots give the PLL a ground-truth
-// phase reset every 7.7ms (at 2086 baud), preventing random-walk divergence.
+// BPSK/QPSK uses spacing 8 (~12.5% overhead) because VV4 second-pass
+// phase correction fails on FM channels (all variants tested OTA), so
+// these modulations rely entirely on pilot-only Kalman + RTS smoother.
+// Denser pilots halve the interpolation midpoint phase error variance
+// (σ²_mid ≈ D·S/4), giving ~3 dB effective phase-noise improvement.
+// QAM16+ keeps spacing 16 (~6% overhead) since it uses DD second pass.
 constexpr int PILOT_SPACING_QAM = 16;   // QAM16 and above: 1 pilot every 16 symbols (~6% overhead)
-constexpr int PILOT_SPACING_LOW = 16;   // BPSK/QPSK: 1 pilot every 16 symbols (was 32)
+constexpr int PILOT_SPACING_LOW = 8;    // BPSK/QPSK: 1 pilot every 8 symbols (~12.5% overhead)
 
 // Returns the pilot spacing for the given modulation
 inline int pilot_spacing_for(int mod_int) {
@@ -69,8 +71,8 @@ std::vector<std::complex<float>> generate_sync_word();
 
 // Header: encodes modulation type, payload byte count, and FEC rate
 // Format: [4 bits modulation][12 bits payload_len][2 bits fec_rate][6 bits reserved][8 bits CRC-8]
-std::vector<uint8_t> encode_header(Modulation mod, uint16_t payload_len, LdpcRate fec = LdpcRate::NONE);
-bool decode_header(const std::vector<uint8_t>& bits, Modulation& mod, uint16_t& payload_len, LdpcRate& fec);
+std::vector<uint8_t> encode_header(Modulation mod, uint16_t payload_len, LdpcRate fec = LdpcRate::NONE, bool harq_flag = false);
+bool decode_header(const std::vector<uint8_t>& bits, Modulation& mod, uint16_t& payload_len, LdpcRate& fec, bool& harq_flag);
 
 // Build a complete native frame from payload bytes
 // Returns IQ samples ready for transmission
@@ -114,6 +116,61 @@ void chase_enable();    // Enable Chase combining mode
 void chase_disable();   // Disable and clear stored LLRs
 void chase_clear();     // Clear stored LLRs (keep enabled)
 int chase_combine_count();  // Number of successful combines so far
+
+// --- Per-symbol soft HARQ with piggybacked retransmissions ---
+
+// Region of LDPC codeword bits to retransmit
+struct HarqRetxRegion {
+    uint8_t block_index;   // LDPC block within original frame (0-based)
+    uint16_t bit_start;    // Start bit position within codeword (0-1599)
+    uint16_t bit_count;    // Number of bits to retransmit
+};
+
+// Retransmit descriptor: packed into payload prefix of HARQ frames
+struct HarqRetxDescriptor {
+    uint8_t original_seq;                    // ARQ sequence of original failed frame
+    std::vector<HarqRetxRegion> regions;     // Which regions to retransmit
+    std::vector<uint8_t> retx_bits;          // The actual encoded bits to retransmit
+};
+
+// Serialize descriptor + retx bits into bytes for payload prefix
+std::vector<uint8_t> serialize_retx_descriptor(const HarqRetxDescriptor& desc);
+
+// Deserialize from payload prefix. Returns bytes consumed, 0 on error.
+size_t deserialize_retx_descriptor(const uint8_t* data, size_t len, HarqRetxDescriptor& desc);
+
+// Result of per-block HARQ decode
+struct HarqDecodeResult {
+    bool any_failed = false;                          // true if at least one block failed
+    bool all_failed = false;                          // true if every block failed
+    int num_blocks = 0;
+    std::vector<LdpcCodec::BlockResult> blocks;       // per-block decode results
+    std::vector<float> stored_llrs;                   // full frame LLRs (for combining)
+    std::vector<float> sym_phase_var;                 // per-data-symbol P00 (for region selection)
+    Modulation mod = Modulation::BPSK;
+    LdpcRate fec = LdpcRate::NONE;
+    uint16_t payload_len = 0;
+    bool harq_flag = false;                           // frame had HARQ retx prefix
+    HarqRetxDescriptor retx_desc;                     // parsed retx descriptor (if harq_flag)
+    std::vector<uint8_t> new_data;                    // new data portion (if harq_flag)
+    std::vector<uint8_t> payload;                     // full reassembled payload (if all blocks OK)
+};
+
+// Build a HARQ frame: retx descriptor + retx bits + new data, all FEC-protected
+std::vector<float> build_native_frame_harq(const uint8_t* new_payload, size_t new_len,
+                                            const HarqRetxDescriptor& retx_desc,
+                                            const PhyConfig& config,
+                                            LdpcRate fec = LdpcRate::RATE_1_2);
+
+// Decode with per-block results for HARQ (does not use global chase state)
+HarqDecodeResult decode_native_frame_harq(const float* iq_samples, size_t count,
+                                           int frame_start, const PhyConfig& default_config);
+
+// Get per-data-symbol phase variance from last decode (Kalman P00)
+const std::vector<float>& decode_sym_phase_var();
+
+// Was the last decoded frame a HARQ frame (retx prefix present)?
+bool decode_last_harq_flag();
 
 } // namespace iris
 

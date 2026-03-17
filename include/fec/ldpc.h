@@ -60,6 +60,22 @@ public:
                                              int max_iter = 50,
                                              std::atomic<bool>* abort_flag = nullptr);
 
+    // Per-block result for HARQ partial decode
+    struct BlockResult {
+        bool converged;
+        int iterations;
+        std::vector<uint8_t> data_bits;  // k bits if converged, empty if not
+    };
+
+    // Per-block soft decode: returns results for each LDPC block independently.
+    // Unlike decode_soft() which returns {} on ANY block failure, this continues
+    // decoding all blocks so successfully decoded blocks can be kept for HARQ.
+    static std::vector<BlockResult> decode_soft_per_block(
+        const std::vector<float>& llrs, LdpcRate rate,
+        LdpcDecoder algo = LdpcDecoder::MIN_SUM,
+        int max_iter = 50,
+        std::atomic<bool>* abort_flag = nullptr);
+
     // Get code parameters
     static int block_size(LdpcRate rate);      // Data bits per block (K)
     static int codeword_size(LdpcRate rate);   // Total codeword bits (N=1600)

@@ -138,12 +138,13 @@ static LdpcRate field_to_fec(uint8_t field) {
     return LdpcRate::NONE;
 }
 
-std::vector<uint8_t> encode_header(Modulation mod, uint16_t payload_len, LdpcRate fec) {
+std::vector<uint8_t> encode_header(Modulation mod, uint16_t payload_len, LdpcRate fec, bool harq_flag) {
     // 32 bits: [4 mod][12 payload_len][4 fec][4 reserved][8 crc8]
+    // reserved bit 0 = HARQ flag (retx prefix present in payload)
     uint8_t header_bytes[4];
     header_bytes[0] = ((uint8_t)mod << 4) | ((payload_len >> 8) & 0x0F);
     header_bytes[1] = payload_len & 0xFF;
-    header_bytes[2] = (fec_to_field(fec) << 4);
+    header_bytes[2] = (fec_to_field(fec) << 4) | (harq_flag ? 0x01 : 0x00);
     header_bytes[3] = crc8(header_bytes, 3);
 
     std::vector<uint8_t> bits(32);
@@ -155,7 +156,8 @@ std::vector<uint8_t> encode_header(Modulation mod, uint16_t payload_len, LdpcRat
     return bits;
 }
 
-bool decode_header(const std::vector<uint8_t>& bits, Modulation& mod, uint16_t& payload_len, LdpcRate& fec) {
+bool decode_header(const std::vector<uint8_t>& bits, Modulation& mod, uint16_t& payload_len,
+                   LdpcRate& fec, bool& harq_flag) {
     if (bits.size() < 32) return false;
 
     uint8_t header_bytes[4] = {};
@@ -175,17 +177,18 @@ bool decode_header(const std::vector<uint8_t>& bits, Modulation& mod, uint16_t& 
     mod = (Modulation)mod_val;
     payload_len = ((header_bytes[0] & 0x0F) << 8) | header_bytes[1];
     fec = field_to_fec(header_bytes[2] >> 4);
+    harq_flag = (header_bytes[2] & 0x01) != 0;
     return true;
 }
 
-std::vector<float> build_native_frame(const uint8_t* payload, size_t len,
-                                       const PhyConfig& config,
-                                       LdpcRate fec) {
+std::vector<float> build_native_frame_internal(const uint8_t* payload, size_t len,
+                                                const PhyConfig& config,
+                                                LdpcRate fec, bool harq_flag) {
     NativeModulator mod(config);
 
     auto preamble = generate_preamble();
     auto sync = generate_sync_word();
-    auto header_bits = encode_header(config.modulation, (uint16_t)len, fec);
+    auto header_bits = encode_header(config.modulation, (uint16_t)len, fec, harq_flag);
 
     // Payload + CRC32
     std::vector<uint8_t> payload_with_crc(len + 4);
@@ -312,6 +315,29 @@ std::vector<float> build_native_frame(const uint8_t* payload, size_t len,
     return mod.modulate_symbols(all_symbols);
 }
 
+// Public build_native_frame: delegates to internal with harq_flag=false
+std::vector<float> build_native_frame(const uint8_t* payload, size_t len,
+                                       const PhyConfig& config,
+                                       LdpcRate fec) {
+    return build_native_frame_internal(payload, len, config, fec, false);
+}
+
+// HARQ build: prepend retx descriptor to payload, set harq_flag in header
+std::vector<float> build_native_frame_harq(const uint8_t* new_payload, size_t new_len,
+                                            const HarqRetxDescriptor& retx_desc,
+                                            const PhyConfig& config,
+                                            LdpcRate fec) {
+    auto retx_prefix = serialize_retx_descriptor(retx_desc);
+
+    std::vector<uint8_t> combined;
+    combined.reserve(retx_prefix.size() + new_len);
+    combined.insert(combined.end(), retx_prefix.begin(), retx_prefix.end());
+    if (new_payload && new_len > 0)
+        combined.insert(combined.end(), new_payload, new_payload + new_len);
+
+    return build_native_frame_internal(combined.data(), combined.size(), config, fec, true);
+}
+
 // Track best correlation for diagnostics
 static float g_last_best_corr = 0;
 float detect_best_corr() { return g_last_best_corr; }
@@ -344,6 +370,69 @@ void chase_enable() { g_chase_active = true; }
 void chase_disable() { g_chase_active = false; g_chase_llrs.clear(); g_chase_combines = 0; }
 void chase_clear() { g_chase_llrs.clear(); g_chase_combines = 0; }
 int chase_combine_count() { return g_chase_combines; }
+
+// Per-data-symbol phase variance from last decode (Kalman P00)
+static std::vector<float> g_sym_phase_var;
+const std::vector<float>& decode_sym_phase_var() { return g_sym_phase_var; }
+
+// Last decoded frame's header info (for HARQ decode to access)
+static LdpcRate g_last_fec = LdpcRate::NONE;
+static Modulation g_last_mod = Modulation::BPSK;
+static uint16_t g_last_payload_len = 0;
+static bool g_last_harq_flag = false;
+bool decode_last_harq_flag() { return g_last_harq_flag; }
+
+// --- HARQ retransmit descriptor serialization ---
+// Format: [4:n_regions | 4:original_seq] then per region 3 bytes:
+//   [block_index:8][bit_start_hi:4 | bit_count_div8_minus1:4][bit_start_lo:8]
+std::vector<uint8_t> serialize_retx_descriptor(const HarqRetxDescriptor& desc) {
+    std::vector<uint8_t> out;
+    uint8_t header = ((uint8_t)desc.regions.size() << 4) | (desc.original_seq & 0x0F);
+    out.push_back(header);
+    for (auto& r : desc.regions) {
+        out.push_back(r.block_index);
+        uint8_t count_field = (r.bit_count / 8) - 1;  // 0-15 → 8-128 bits
+        if (count_field > 15) count_field = 15;
+        uint8_t start_hi = (r.bit_start >> 8) & 0x0F;
+        out.push_back((start_hi << 4) | (count_field & 0x0F));
+        out.push_back(r.bit_start & 0xFF);
+    }
+    // Append retx bits as packed bytes
+    size_t total_bits = 0;
+    for (auto& r : desc.regions) total_bits += r.bit_count;
+    size_t retx_bytes = (total_bits + 7) / 8;
+    out.insert(out.end(), desc.retx_bits.begin(),
+               desc.retx_bits.begin() + std::min(retx_bytes, desc.retx_bits.size()));
+    return out;
+}
+
+size_t deserialize_retx_descriptor(const uint8_t* data, size_t len, HarqRetxDescriptor& desc) {
+    if (len < 1) return 0;
+    desc.regions.clear();
+    desc.retx_bits.clear();
+
+    int n_regions = (data[0] >> 4) & 0x0F;
+    desc.original_seq = data[0] & 0x0F;
+
+    size_t pos = 1;
+    size_t total_bits = 0;
+    for (int i = 0; i < n_regions; i++) {
+        if (pos + 3 > len) return 0;
+        HarqRetxRegion r;
+        r.block_index = data[pos++];
+        uint8_t byte2 = data[pos++];
+        uint8_t byte3 = data[pos++];
+        r.bit_count = ((byte2 & 0x0F) + 1) * 8;
+        r.bit_start = ((uint16_t)(byte2 >> 4) << 8) | byte3;
+        desc.regions.push_back(r);
+        total_bits += r.bit_count;
+    }
+
+    size_t retx_bytes = (total_bits + 7) / 8;
+    if (pos + retx_bytes > len) return 0;
+    desc.retx_bits.assign(data + pos, data + pos + retx_bytes);
+    return pos + retx_bytes;
+}
 
 int detect_frame_start(const float* iq_samples, size_t count, int sps) {
     auto preamble = generate_preamble();
@@ -684,14 +773,21 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     Modulation mod;
     uint16_t payload_len;
     LdpcRate fec;
-    if (!decode_header(header_bits, mod, payload_len, fec)) {
+    bool harq_flag = false;
+    if (!decode_header(header_bits, mod, payload_len, fec, harq_flag)) {
         IRIS_LOG("[DECODE] header decode failed (frame_start=%d, header_start=%d)", frame_start, header_start);
         return false;
     }
 
     // Header decoded: mod, payload_len, fec known. Continue to payload decode.
-    IRIS_LOG("[DECODE] RX header: mod=%d fec=%d payload=%d bytes",
-             (int)mod, (int)fec, payload_len);
+    IRIS_LOG("[DECODE] RX header: mod=%d fec=%d payload=%d bytes harq=%d",
+             (int)mod, (int)fec, payload_len, harq_flag);
+
+    // Store header info for HARQ decode access
+    g_last_fec = fec;
+    g_last_mod = mod;
+    g_last_payload_len = payload_len;
+    g_last_harq_flag = harq_flag;
 
     if (payload_len > NATIVE_MAX_PAYLOAD) {
         IRIS_LOG("[DECODE] payload_len %d too large (max %d)", payload_len, NATIVE_MAX_PAYLOAD);
@@ -1647,6 +1743,9 @@ bool decode_native_frame(const float* iq_samples, size_t count,
                      n_unsatisfied, n_checks, n_checks > 0 ? 100.0f * n_unsatisfied / n_checks : 0.0f);
         }
 
+        // Store per-symbol phase variance for HARQ region selection
+        g_sym_phase_var = sym_phase_var;
+
         // Chase combining: if active and we have stored LLRs from a previous
         // failed decode, element-wise add them to the new LLRs (MRC in LLR
         // domain: +3 dB per combine).  Keep a copy of the fresh LLRs so we
@@ -1736,6 +1835,71 @@ bool decode_native_frame(const float* iq_samples, size_t count,
              (int)mod, (int)fec, payload_len, g_decode_snr,
              diag_eq_delta, diag_hampel_blanked, ldpc_last_max_iters(), g_chase_combines);
     return true;
+}
+
+// --- HARQ decode: per-block results with stored LLRs for combining ---
+HarqDecodeResult decode_native_frame_harq(const float* iq_samples, size_t count,
+                                           int frame_start, const PhyConfig& default_config) {
+    HarqDecodeResult result;
+
+    // Use the standard decode path — it stores LLRs in g_chase_llrs on failure,
+    // g_sym_phase_var always, and header info in g_last_* globals.
+    std::vector<uint8_t> payload;
+    bool ok = decode_native_frame(iq_samples, count, frame_start, default_config, payload);
+
+    result.mod = g_last_mod;
+    result.fec = g_last_fec;
+    result.payload_len = g_last_payload_len;
+    result.harq_flag = g_last_harq_flag;
+    result.sym_phase_var = g_sym_phase_var;
+
+    if (ok) {
+        result.payload = payload;
+        result.any_failed = false;
+        result.all_failed = false;
+
+        // If HARQ frame, parse retx descriptor from payload prefix
+        if (g_last_harq_flag && !payload.empty()) {
+            size_t consumed = deserialize_retx_descriptor(
+                payload.data(), payload.size(), result.retx_desc);
+            if (consumed > 0 && consumed < payload.size()) {
+                result.new_data.assign(payload.begin() + consumed, payload.end());
+            } else {
+                result.new_data = payload;  // Couldn't parse descriptor, treat as all new data
+            }
+        }
+        return result;
+    }
+
+    // Decode failed — get the stored LLRs for HARQ per-block decode
+    result.stored_llrs = g_chase_llrs;
+    result.any_failed = true;
+
+    if (!result.stored_llrs.empty() && g_last_fec != LdpcRate::NONE) {
+        int n_fec = LdpcCodec::codeword_size(g_last_fec);
+        result.num_blocks = (int)result.stored_llrs.size() / n_fec;
+
+        // Per-block decode: salvage blocks that converged
+        auto block_results = LdpcCodec::decode_soft_per_block(
+            result.stored_llrs, g_last_fec, LdpcDecoder::MIN_SUM);
+
+        result.blocks = block_results;
+        result.all_failed = true;
+        for (auto& br : block_results) {
+            if (br.converged) result.all_failed = false;
+        }
+
+        int n_ok = 0, n_fail = 0;
+        for (auto& br : block_results) {
+            if (br.converged) n_ok++; else n_fail++;
+        }
+        IRIS_LOG("[HARQ] per-block: %d/%d converged, %d failed",
+                 n_ok, (int)block_results.size(), n_fail);
+    } else {
+        result.all_failed = true;
+    }
+
+    return result;
 }
 
 } // namespace iris

@@ -513,4 +513,70 @@ std::vector<uint8_t> LdpcCodec::decode_soft(const std::vector<float>& llrs, Ldpc
     return output;
 }
 
+std::vector<LdpcCodec::BlockResult> LdpcCodec::decode_soft_per_block(
+    const std::vector<float>& llrs, LdpcRate rate,
+    LdpcDecoder algo, int max_iter,
+    std::atomic<bool>* abort_flag) {
+
+    g_ldpc_max_iters = 0;
+
+    if (rate == LdpcRate::NONE) {
+        // No FEC: single "block" with hard decisions
+        BlockResult br;
+        br.converged = true;
+        br.iterations = 0;
+        br.data_bits.resize(llrs.size());
+        for (size_t i = 0; i < llrs.size(); i++)
+            br.data_bits[i] = llrs[i] < 0 ? 1 : 0;
+        return {br};
+    }
+
+    LdpcRate eff = effective_rate(rate);
+    auto M = get_ira_matrix(eff);
+    int k = M.k;
+    int n = M.n;
+    if ((int)llrs.size() % n != 0) return {};
+
+    DecoderWorkspace ws;
+    ws.init(M);
+
+    size_t num_blocks = llrs.size() / n;
+    std::vector<BlockResult> results(num_blocks);
+
+    for (size_t b = 0; b < num_blocks; b++) {
+        size_t offset = b * n;
+        std::vector<float> llr(llrs.begin() + offset, llrs.begin() + offset + n);
+
+        int result;
+        switch (algo) {
+            case LdpcDecoder::SPA:
+                result = decode_spa(llr, M, ws, max_iter, abort_flag);
+                break;
+            case LdpcDecoder::GBF:
+                result = decode_gbf(llr, M, ws, max_iter, abort_flag);
+                break;
+            default:
+                result = decode_min_sum(llr, M, ws, max_iter, abort_flag);
+                break;
+        }
+
+        if (result < 0 || !ws.check_syndrome(M)) {
+            results[b].converged = false;
+            results[b].iterations = (result < 0) ? max_iter : result;
+            IRIS_LOG("[LDPC] block %zu did not converge after %d iters", b, results[b].iterations);
+            g_ldpc_max_iters = max_iter;
+        } else {
+            results[b].converged = true;
+            results[b].iterations = result;
+            results[b].data_bits.resize(k);
+            for (int i = 0; i < k; i++)
+                results[b].data_bits[i] = ws.posterior[i] < 0 ? 1 : 0;
+            IRIS_LOG("[LDPC] block %zu converged in %d/%d iters", b, result, max_iter);
+            if (result > g_ldpc_max_iters)
+                g_ldpc_max_iters = result;
+        }
+    }
+    return results;
+}
+
 } // namespace iris

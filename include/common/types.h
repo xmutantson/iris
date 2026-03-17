@@ -64,6 +64,7 @@ constexpr uint16_t CAP_COMPRESSION = 0x0010;
 constexpr uint16_t CAP_B2F_UNROLL  = 0x0020;
 constexpr uint16_t CAP_STREAMING   = 0x0040;  // Streaming compression context
 constexpr uint16_t CAP_PQ_CRYPTO   = 0x0080;  // Post-quantum ML-KEM-768
+constexpr uint16_t CAP_HARQ        = 0x0100;  // Per-symbol soft HARQ with piggybacked retx
 
 // OFDM-KISS transport layer markers
 constexpr uint8_t COMPRESSED_PAYLOAD_MAGIC = 0xCC;  // Batch-compressed OFDM-KISS payload

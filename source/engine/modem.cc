@@ -128,7 +128,7 @@ bool Modem::init(const IrisConfig& config) {
     afsk_demod_.set_preemph_alpha(config_.preemph_alpha);
 
     local_cap_.version = XID_VERSION;
-    local_cap_.capabilities = CAP_MODE_A | CAP_COMPRESSION | CAP_STREAMING;
+    local_cap_.capabilities = CAP_MODE_A | CAP_COMPRESSION | CAP_STREAMING | CAP_HARQ;
     if (config_.mode == "B" || config_.mode == "b")
         local_cap_.capabilities |= CAP_MODE_B;
     if (config_.mode == "C" || config_.mode == "c")
@@ -1416,7 +1416,24 @@ void Modem::process_rx_native(const float* audio, int count) {
                 }
             }
 
-            if (payload.size() >= 3 && payload[0] == MULTI_PAYLOAD_MAGIC) {
+            // HARQ frame: strip retx descriptor, apply combining, deliver new data only
+            if (decode_last_harq_flag() && arq_.negotiated(CAP_HARQ) && !payload.empty()) {
+                HarqRetxDescriptor retx_desc;
+                size_t consumed = deserialize_retx_descriptor(
+                    payload.data(), payload.size(), retx_desc);
+                if (consumed > 0 && consumed <= payload.size()) {
+                    // TODO: apply retx bits to stored HARQ RX state for LLR combining
+                    // For now, log and deliver the new data portion
+                    IRIS_LOG("[HARQ] RX retx descriptor: seq=%d, %zu regions, %zu retx bytes",
+                             retx_desc.original_seq, retx_desc.regions.size(),
+                             retx_desc.retx_bits.size());
+                    std::vector<uint8_t> new_data(payload.begin() + consumed, payload.end());
+                    if (!new_data.empty())
+                        deliver(new_data.data(), new_data.size());
+                } else {
+                    deliver(payload.data(), payload.size());
+                }
+            } else if (payload.size() >= 3 && payload[0] == MULTI_PAYLOAD_MAGIC) {
                 // Multi-payload frame: [magic][2-byte LE len][data]...
                 size_t pos = 1;
                 int sub_count = 0;
@@ -1470,6 +1487,22 @@ void Modem::process_rx_native(const float* audio, int count) {
             // retransmits without waiting for T1 timeout (~30s).
             if (ofdm_kiss_ && ax25_session_.is_active()) {
                 ax25_session_.request_retransmit();
+            }
+            // Native ARQ NACK: tell commander to retransmit immediately.
+            {
+                ArqState arq_st = arq_.state();
+                if (!ofdm_kiss_ && arq_st != ArqState::IDLE) {
+                    if (arq_.negotiated(CAP_HARQ)) {
+                        // HARQ: per-block decode with LLR storage + extended NACK
+                        auto harq_result = decode_native_frame_harq(
+                            rx_overlap_buf_.data(), rx_overlap_buf_.size(),
+                            start, phy_config_);
+                        arq_.on_decode_failed_harq(harq_result);
+                    } else {
+                        // Legacy: full Chase combining
+                        arq_.on_decode_failed();
+                    }
+                }
             }
             // Skip past the estimated frame to avoid re-detecting its remnants.
             // Use the consumed_iq from the decoder if available, else estimate.
@@ -1853,7 +1886,18 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                 }
                 tx_config.modulation = tx_mod;
                 LdpcRate fec = fec_to_ldpc_rate(tx_fec_n, tx_fec_d);
-                auto iq = build_native_frame(frame_data.data(), frame_data.size(), tx_config, fec);
+                std::vector<float> iq;
+                if (arq_.harq_has_pending_retx() && arq_.negotiated(CAP_HARQ)) {
+                    // HARQ: piggyback retransmit symbols into this frame
+                    iq = build_native_frame_harq(frame_data.data(), frame_data.size(),
+                                                  arq_.harq_pending_retx_desc(),
+                                                  tx_config, fec);
+                    arq_.harq_clear_pending_retx();
+                    IRIS_LOG("[TX] HARQ frame: retx piggybacked + %zu bytes new data",
+                             frame_data.size());
+                } else {
+                    iq = build_native_frame(frame_data.data(), frame_data.size(), tx_config, fec);
+                }
 
                 // Raise T1 floor to account for this frame's airtime.
                 // IQ samples / 2 = audio samples (interleaved I/Q), / sample_rate = seconds.

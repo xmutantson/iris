@@ -2,6 +2,7 @@
 #define IRIS_ARQ_H
 
 #include "engine/speed_level.h"
+#include "native/frame.h"
 #include "common/types.h"
 #include <vector>
 #include <cstdint>
@@ -138,6 +139,23 @@ public:
     // Process a received ARQ frame (called by modem when frame arrives)
     // Returns true if frame was handled as ARQ, false if not an ARQ frame
     bool on_frame_received(const uint8_t* data, size_t len);
+
+    // Notify ARQ that a native frame decode failed (LDPC non-convergence).
+    // Responder sends NACK to trigger immediate retransmit + Chase combining.
+    void on_decode_failed();
+
+    // HARQ: notify ARQ of per-block decode results from a failed frame.
+    // Stores LLRs for combining, sends extended NACK with region info.
+    void on_decode_failed_harq(const HarqDecodeResult& decode_result);
+
+    // HARQ: store encoded bits for a TX frame (for retransmit generation)
+    void harq_store_tx(uint8_t seq, const std::vector<uint8_t>& encoded_bits,
+                       Modulation mod, LdpcRate fec, uint16_t payload_len);
+
+    // HARQ: check if there's a pending retransmit descriptor for the next TX frame
+    bool harq_has_pending_retx() const { return harq_pending_retx_; }
+    const HarqRetxDescriptor& harq_pending_retx_desc() const { return harq_retx_desc_; }
+    void harq_clear_pending_retx() { harq_pending_retx_ = false; }
 
     // Timer tick — call periodically (~100ms) for retransmit/timeout logic
     void tick();
@@ -290,6 +308,46 @@ private:
     // Role-switch protection
     bool rx_mute_ = false;
     Clock::time_point rx_mute_until_;
+
+    // --- Per-symbol soft HARQ state ---
+    static constexpr int HARQ_MAX_RETRIES = 5;
+
+    // TX side: stored encoded bits for retransmit generation
+    struct HarqTxSlot {
+        std::vector<uint8_t> encoded_bits;
+        Modulation mod = Modulation::BPSK;
+        LdpcRate fec = LdpcRate::NONE;
+        uint16_t payload_len = 0;
+        bool active = false;
+    };
+    HarqTxSlot harq_tx_[ARQ_WINDOW_SIZE];
+
+    // RX side: stored LLRs and per-block decode status for combining
+    struct HarqRxSlot {
+        std::vector<float> stored_llrs;
+        std::vector<bool> block_decoded;
+        std::vector<std::vector<uint8_t>> block_data;
+        std::vector<float> sym_phase_var;
+        int num_blocks = 0;
+        LdpcRate fec = LdpcRate::NONE;
+        Modulation mod = Modulation::BPSK;
+        uint16_t payload_len = 0;
+        int combine_count = 0;
+        int retx_attempts = 0;
+        bool active = false;
+    };
+    HarqRxSlot harq_rx_[ARQ_WINDOW_SIZE];
+
+    // Pending retransmit descriptor for next TX frame
+    bool harq_pending_retx_ = false;
+    HarqRetxDescriptor harq_retx_desc_;
+
+    void handle_harq_nack(const ArqFrame& frame);
+    void clear_harq_state();
+    std::vector<HarqRetxRegion> select_bad_regions(
+        const std::vector<float>& sym_phase_var,
+        const std::vector<LdpcCodec::BlockResult>& blocks,
+        LdpcRate fec, int bps);
 };
 
 } // namespace iris
