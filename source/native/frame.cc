@@ -1049,20 +1049,18 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     // estimate cannot be poisoned by wrong symbol decisions.
     // Falls back to decision-directed for QAM16+ where VV doesn't apply.
     const char* pass2_mode = "none";  // for diagnostics
-    // QPSK second pass: VV4 with sequential unwrapping.
-    // Original VV4 (per-symbol ambiguity resolution vs Kalman) failed OTA
-    // because the Kalman smoothed phase has 15-25° errors, too close to VV4's
-    // 45° decision boundary.  Sequential unwrapping resolves each symbol's
-    // ambiguity against the PREVIOUS VV4 output instead.  Adjacent VV4
-    // estimates share 64/65 window samples (r>0.98 correlation), so the
-    // phase difference between them is <1° — well within the ±45° margin.
-    // Only the first data symbol uses the Kalman reference.
-    // DD remains disabled (43,000°+ drift on 11053-sym frames OTA).
-    bool skip_pass2 = false;
-    if (payload_symbols > 512) {
+    // QPSK second pass: SKIP.  All variants tested and failed OTA:
+    // - VV4 per-symbol (vs Kalman): 4-fold ambiguity branch flipping, ~4 dB loss
+    // - VV4 sequential unwrapping: 4th-power amplifies FM noise by 6 dB,
+    //   inter-symbol VV4 phase change exceeds ±45° boundary on real FM channels.
+    //   OTA showed 60-90° phase swings between adjacent symbols.
+    // - DD: circularity causes 43,000°+ drift on long frames even with gating.
+    // QPSK relies on pilot-only Kalman + RTS smoother + LLR calibration.
+    bool skip_pass2 = (mod == Modulation::QPSK);
+    if (skip_pass2) pass2_mode = "SKIP";
+    if (payload_symbols > 512 && !skip_pass2) {
         int vv_power = 0;
         if (mod == Modulation::BPSK) vv_power = 2;
-        if (mod == Modulation::QPSK) vv_power = 4;
 
         std::vector<float> pass2_meas(payload_symbols, 0.0f);
         std::vector<bool> pass2_valid(payload_symbols, false);
