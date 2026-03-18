@@ -1,10 +1,13 @@
 #include "common/fft.h"
 #include "common/logging.h"
+
+#define POCKETFFT_NO_MULTITHREADING
+#include "common/pocketfft_hdronly.h"
+
 #include <cmath>
-#include <algorithm>
-#include <unordered_set>
 #include <vector>
 #include <mutex>
+#include <unordered_set>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -21,7 +24,7 @@ static void log_fft_once(int n) {
     std::lock_guard<std::mutex> lock(s_log_mutex);
     if (s_fft_logged_sizes.find(n) == s_fft_logged_sizes.end()) {
         s_fft_logged_sizes.insert(n);
-        IRIS_LOG("[FFT] fft(%d) called", n);
+        IRIS_LOG("[FFT] fft(%d) called [pocketfft]", n);
     }
 }
 
@@ -29,98 +32,73 @@ static void log_ifft_once(int n) {
     std::lock_guard<std::mutex> lock(s_log_mutex);
     if (s_ifft_logged_sizes.find(n) == s_ifft_logged_sizes.end()) {
         s_ifft_logged_sizes.insert(n);
-        IRIS_LOG("[FFT] ifft(%d) called", n);
+        IRIS_LOG("[FFT] ifft(%d) called [pocketfft]", n);
     }
 }
 
-// Radix-2 Cooley-Tukey DIT FFT, in-place.
+// Split real/imag forward FFT (used by passband_probe.cc).
 void fft(float* re, float* im, int n) {
     log_fft_once(n);
 
-    // Bit-reversal permutation
-    for (int i = 1, j = 0; i < n; i++) {
-        int bit = n >> 1;
-        for (; j & bit; bit >>= 1) j ^= bit;
-        j ^= bit;
-        if (i < j) {
-            std::swap(re[i], re[j]);
-            std::swap(im[i], im[j]);
-        }
-    }
+    // Pack into interleaved complex, run pocketfft, unpack
+    thread_local std::vector<std::complex<float>> buf;
+    buf.resize(n);
+    for (int i = 0; i < n; i++)
+        buf[i] = std::complex<float>(re[i], im[i]);
 
-    // Butterfly stages
-    for (int len = 2; len <= n; len <<= 1) {
-        float ang = -2.0f * (float)M_PI / len;
-        float wR = std::cos(ang), wI = std::sin(ang);
-        for (int i = 0; i < n; i += len) {
-            float curR = 1.0f, curI = 0.0f;
-            for (int j = 0; j < len / 2; j++) {
-                float uR = re[i + j], uI = im[i + j];
-                float vR = re[i + j + len / 2] * curR - im[i + j + len / 2] * curI;
-                float vI = re[i + j + len / 2] * curI + im[i + j + len / 2] * curR;
-                re[i + j] = uR + vR;
-                im[i + j] = uI + vI;
-                re[i + j + len / 2] = uR - vR;
-                im[i + j + len / 2] = uI - vI;
-                float tmpR = curR * wR - curI * wI;
-                curI = curR * wI + curI * wR;
-                curR = tmpR;
-            }
-        }
+    pocketfft::shape_t shape{(size_t)n};
+    pocketfft::stride_t stride{(ptrdiff_t)sizeof(std::complex<float>)};
+    pocketfft::shape_t axes{0};
+    pocketfft::c2c(shape, stride, stride, axes, pocketfft::FORWARD,
+                    buf.data(), buf.data(), 1.0f);
+
+    for (int i = 0; i < n; i++) {
+        re[i] = buf[i].real();
+        im[i] = buf[i].imag();
     }
 }
 
-// Inverse FFT: conjugate, forward FFT, conjugate, scale by 1/n.
+// Split real/imag inverse FFT.
 void ifft(float* re, float* im, int n) {
     log_ifft_once(n);
 
-    // Conjugate inputs
-    for (int i = 0; i < n; i++) im[i] = -im[i];
+    thread_local std::vector<std::complex<float>> buf;
+    buf.resize(n);
+    for (int i = 0; i < n; i++)
+        buf[i] = std::complex<float>(re[i], im[i]);
 
-    // Forward FFT
-    fft(re, im, n);
+    pocketfft::shape_t shape{(size_t)n};
+    pocketfft::stride_t stride{(ptrdiff_t)sizeof(std::complex<float>)};
+    pocketfft::shape_t axes{0};
+    pocketfft::c2c(shape, stride, stride, axes, pocketfft::BACKWARD,
+                    buf.data(), buf.data(), 1.0f / (float)n);
 
-    // Conjugate outputs and scale by 1/n
-    float inv_n = 1.0f / n;
     for (int i = 0; i < n; i++) {
-        re[i] *= inv_n;
-        im[i] = -im[i] * inv_n;
+        re[i] = buf[i].real();
+        im[i] = buf[i].imag();
     }
 }
 
-// Complex interleaved forward FFT.
+// Complex interleaved forward FFT — zero heap allocation (pocketfft in-place).
 void fft_complex(std::complex<float>* data, int n) {
-    // std::complex<float> is guaranteed contiguous {re, im} pairs.
-    // Extract to separate arrays, run FFT, write back.
-    // Using reinterpret_cast on the interleaved layout directly would require
-    // stride-2 access; separate arrays are simpler and cache-friendlier for
-    // the butterfly.
-    std::vector<float> re(n), im(n);
-    for (int i = 0; i < n; i++) {
-        re[i] = data[i].real();
-        im[i] = data[i].imag();
-    }
+    log_fft_once(n);
 
-    fft(re.data(), im.data(), n);
-
-    for (int i = 0; i < n; i++) {
-        data[i] = std::complex<float>(re[i], im[i]);
-    }
+    pocketfft::shape_t shape{(size_t)n};
+    pocketfft::stride_t stride{(ptrdiff_t)sizeof(std::complex<float>)};
+    pocketfft::shape_t axes{0};
+    pocketfft::c2c(shape, stride, stride, axes, pocketfft::FORWARD,
+                    data, data, 1.0f);
 }
 
-// Complex interleaved inverse FFT.
+// Complex interleaved inverse FFT — divides by n (matches old behavior).
 void ifft_complex(std::complex<float>* data, int n) {
-    std::vector<float> re(n), im(n);
-    for (int i = 0; i < n; i++) {
-        re[i] = data[i].real();
-        im[i] = data[i].imag();
-    }
+    log_ifft_once(n);
 
-    ifft(re.data(), im.data(), n);
-
-    for (int i = 0; i < n; i++) {
-        data[i] = std::complex<float>(re[i], im[i]);
-    }
+    pocketfft::shape_t shape{(size_t)n};
+    pocketfft::stride_t stride{(ptrdiff_t)sizeof(std::complex<float>)};
+    pocketfft::shape_t axes{0};
+    pocketfft::c2c(shape, stride, stride, axes, pocketfft::BACKWARD,
+                    data, data, 1.0f / (float)n);
 }
 
 } // namespace iris

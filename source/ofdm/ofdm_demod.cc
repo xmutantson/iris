@@ -32,20 +32,20 @@ OfdmDemodulator::OfdmDemodulator(const OfdmConfig& config)
 }
 
 // ----------------------------------------------------------------------------
-//  extract_data_carriers: from n_used used-carrier values, return data only
+//  extract_data_carriers: from n_used used-carrier values, write data only
+//  into pre-allocated output buffer. Returns count of data carriers written.
 // ----------------------------------------------------------------------------
-std::vector<std::complex<float>> OfdmDemodulator::extract_data_carriers(
-    const std::complex<float>* symbol_freq, int n_used)
+int OfdmDemodulator::extract_data_carriers(
+    const std::complex<float>* symbol_freq, int n_used,
+    std::vector<std::complex<float>>& out)
 {
-    std::vector<std::complex<float>> data;
-    data.reserve(config_.n_data_carriers);
-
+    int count = 0;
     for (int i = 0; i < n_used; i++) {
         // Pilots are at every pilot_carrier_spacing-th position (0, 4, 8, ...)
         if (i % config_.pilot_carrier_spacing == 0) continue;
-        data.push_back(symbol_freq[i]);
+        out[count++] = symbol_freq[i];
     }
-    return data;
+    return count;
 }
 
 // ----------------------------------------------------------------------------
@@ -53,18 +53,18 @@ std::vector<std::complex<float>> OfdmDemodulator::extract_data_carriers(
 //
 //  Data carrier index d maps to used carrier index via the pilot skip pattern.
 //  We need to find the correct H[i] and noise_var[i] for each data carrier.
+//  Writes into pre-allocated output buffer (must have capacity >= n_data).
 // ----------------------------------------------------------------------------
-std::vector<std::complex<float>> OfdmDemodulator::equalize_mmse(
-    const std::vector<std::complex<float>>& data_carriers,
-    const OfdmChannelEst& est)
+void OfdmDemodulator::equalize_mmse(
+    const std::vector<std::complex<float>>& data_carriers, int n_data,
+    const OfdmChannelEst& est,
+    std::vector<std::complex<float>>& out)
 {
     const int n_used = config_.n_used_carriers;
-    std::vector<std::complex<float>> eq;
-    eq.reserve(data_carriers.size());
 
     // Build mapping from data carrier index -> used carrier index
     int d = 0;
-    for (int i = 0; i < n_used && d < (int)data_carriers.size(); i++) {
+    for (int i = 0; i < n_used && d < n_data; i++) {
         if (i % config_.pilot_carrier_spacing == 0) continue;  // skip pilot
 
         std::complex<float> Y = data_carriers[d];
@@ -74,23 +74,20 @@ std::vector<std::complex<float>> OfdmDemodulator::equalize_mmse(
 
         if (H_mag2 < 1e-4f * nv) {
             // Deep fade: zero this carrier (numerical safety only)
-            eq.push_back({0.0f, 0.0f});
+            out[d] = {0.0f, 0.0f};
         } else {
             // MMSE: X_hat = conj(H) * Y / (|H|^2 + noise_var)
-            std::complex<float> X_hat = std::conj(H) * Y / (H_mag2 + nv);
-            eq.push_back(X_hat);
+            out[d] = std::conj(H) * Y / (H_mag2 + nv);
         }
         d++;
     }
-
-    return eq;
 }
 
 // ----------------------------------------------------------------------------
 //  demap_to_llrs: soft-demap equalized data carriers to LLRs
 // ----------------------------------------------------------------------------
 void OfdmDemodulator::demap_to_llrs(
-    const std::vector<std::complex<float>>& eq_carriers,
+    const std::vector<std::complex<float>>& eq_carriers, int n_data,
     const ToneMap& tone_map,
     const OfdmChannelEst& est,
     std::vector<float>& llrs)
@@ -109,9 +106,14 @@ void OfdmDemodulator::demap_to_llrs(
     };
     int fec_r16 = fec_to_rate16(tone_map.fec_rate);
 
+    // Pre-allocate reusable buffers for demap_soft (Issue 1: avoid per-carrier heap allocs)
+    std::vector<std::complex<float>> sym_vec(1);
+    std::vector<float> carrier_llrs;
+    carrier_llrs.reserve(8);  // max bits per carrier (QAM256)
+
     int data_idx = 0;
 
-    for (int i = 0; i < n_used && data_idx < (int)eq_carriers.size(); i++) {
+    for (int i = 0; i < n_used && data_idx < n_data; i++) {
         if (i % config_.pilot_carrier_spacing == 0) continue;  // skip pilot
 
         int bpc = (data_idx < tone_map.n_data_carriers)
@@ -151,9 +153,9 @@ void OfdmDemodulator::demap_to_llrs(
             for (int b = 0; b < bpc; b++)
                 llrs[llr_start + b] *= reliability;
         } else {
-            // Standard uniform QAM soft demapper
-            std::vector<std::complex<float>> sym_vec(1, eq_carriers[data_idx]);
-            std::vector<float> carrier_llrs = demap_soft(sym_vec, mod, sigma_sq);
+            // Standard uniform QAM soft demapper (reuse pre-allocated buffers)
+            sym_vec[0] = eq_carriers[data_idx];
+            carrier_llrs = demap_soft(sym_vec, mod, sigma_sq);
             // Apply reliability weight
             for (auto& l : carrier_llrs)
                 l *= reliability;
@@ -360,6 +362,12 @@ OfdmDemodResult OfdmDemodulator::demodulate(
     float sfo_cumulative_weight = 0.0f;   // sum of symbol indices (for weighted slope)
     int total_symbols_elapsed = 0;        // total symbols since training (incl. header)
 
+    // Pre-allocate reusable buffers for the hot loop (avoid per-symbol heap allocs)
+    std::vector<std::complex<float>> fft_buf(nfft);          // Issue 2+3: shared FFT buffer
+    std::vector<std::complex<float>> used_carriers_buf(n_used);
+    std::vector<std::complex<float>> data_carriers_buf(n_data);
+    std::vector<std::complex<float>> eq_carriers_buf(n_data);
+
     for (int s = 0; s < n_data_symbols; s++) {
         // Check for block pilot: every pilot_symbol_spacing data symbols
         if (data_sym_count > 0 &&
@@ -371,14 +379,13 @@ OfdmDemodResult OfdmDemodulator::demodulate(
                 return result;
             }
 
-            // FFT the block pilot
+            // FFT the block pilot (reuse pre-allocated fft_buf)
             const std::complex<float>* pilot_body = iq_corrected.data() + pos + cp;
-            std::vector<std::complex<float>> pilot_fft(nfft);
-            std::copy(pilot_body, pilot_body + nfft, pilot_fft.data());
-            fft_complex(pilot_fft.data(), nfft);
+            std::copy(pilot_body, pilot_body + nfft, fft_buf.data());
+            fft_complex(fft_buf.data(), nfft);
 
             // Update channel estimate from block pilot
-            ofdm_update_channel(channel_est_, pilot_fft.data(), config_);
+            ofdm_update_channel(channel_est_, fft_buf.data(), config_);
 
             // H8: SFO estimation from block pilot phase drift
             {
@@ -430,20 +437,18 @@ OfdmDemodResult OfdmDemodulator::demodulate(
             return result;
         }
 
-        // Skip CP, FFT
+        // Skip CP, FFT (reuse pre-allocated fft_buf)
         const std::complex<float>* sym_body = iq_corrected.data() + pos + cp;
-        std::vector<std::complex<float>> sym_fft(nfft);
-        std::copy(sym_body, sym_body + nfft, sym_fft.data());
-        fft_complex(sym_fft.data(), nfft);
+        std::copy(sym_body, sym_body + nfft, fft_buf.data());
+        fft_complex(fft_buf.data(), nfft);
 
         // Update channel estimate from comb pilots in this data symbol
-        ofdm_interpolate_pilots(channel_est_, sym_fft.data(), config_);
+        ofdm_interpolate_pilots(channel_est_, fft_buf.data(), config_);
 
-        // Extract values at used carrier bins
-        std::vector<std::complex<float>> used_carriers(n_used);
+        // Extract values at used carrier bins (reuse pre-allocated buffer)
         for (int i = 0; i < n_used; i++) {
             int bin = config_.used_carrier_bins[i];
-            used_carriers[i] = sym_fft[bin];
+            used_carriers_buf[i] = fft_buf[bin];
         }
 
         // H8: Apply SFO correction if estimate exceeds threshold
@@ -456,7 +461,7 @@ OfdmDemodResult OfdmDemodulator::demodulate(
                 float phase_corr = -2.0f * (float)M_PI * (float)bin
                                    * sfo_frac * elapsed_samples / (float)nfft;
                 std::complex<float> rot(std::cos(phase_corr), std::sin(phase_corr));
-                used_carriers[i] *= rot;
+                used_carriers_buf[i] *= rot;
             }
         }
 
@@ -466,7 +471,7 @@ OfdmDemodResult OfdmDemodulator::demodulate(
             float cpe_den = 0.0f;   // weight sum
             for (int i = 0; i < n_used; i += config_.pilot_carrier_spacing) {
                 // Pilot position: every pilot_carrier_spacing-th used carrier
-                std::complex<float> Y_pilot = used_carriers[i];
+                std::complex<float> Y_pilot = used_carriers_buf[i];
                 std::complex<float> H = channel_est_.H[i];
                 float H_mag2 = std::norm(H);
                 if (H_mag2 < 1e-12f) continue;
@@ -481,7 +486,7 @@ OfdmDemodResult OfdmDemodulator::demodulate(
                 // Apply conjugate rotation to all used carriers
                 std::complex<float> cpe_rot(std::cos(-cpe), std::sin(-cpe));
                 for (int i = 0; i < n_used; i++) {
-                    used_carriers[i] *= cpe_rot;
+                    used_carriers_buf[i] *= cpe_rot;
                 }
                 if (data_sym_count % 20 == 0 || std::abs(cpe) > 0.1f) {
                     IRIS_LOG("[OFDM-RX] CPE sym %d: %.4f rad (%.2f deg)",
@@ -490,20 +495,20 @@ OfdmDemodResult OfdmDemodulator::demodulate(
             }
         }
 
-        // Extract data carriers (skip pilot positions)
-        std::vector<std::complex<float>> data_carriers =
-            extract_data_carriers(used_carriers.data(), n_used);
+        // Extract data carriers (skip pilot positions, reuse pre-allocated buffer)
+        int n_data_actual = extract_data_carriers(used_carriers_buf.data(), n_used,
+                                                  data_carriers_buf);
 
-        // MMSE equalize
-        std::vector<std::complex<float>> eq_carriers =
-            equalize_mmse(data_carriers, channel_est_);
+        // MMSE equalize (reuse pre-allocated buffer)
+        equalize_mmse(data_carriers_buf, n_data_actual, channel_est_, eq_carriers_buf);
 
         // Store equalized constellation for GUI scatter plot
         result.eq_constellation.insert(result.eq_constellation.end(),
-                                        eq_carriers.begin(), eq_carriers.end());
+                                        eq_carriers_buf.begin(),
+                                        eq_carriers_buf.begin() + n_data_actual);
 
         // Soft demap to LLRs
-        demap_to_llrs(eq_carriers, active_tone_map, channel_est_, all_llrs);
+        demap_to_llrs(eq_carriers_buf, n_data_actual, active_tone_map, channel_est_, all_llrs);
 
         pos += sym_len;
         data_sym_count++;

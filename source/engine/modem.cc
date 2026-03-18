@@ -1145,7 +1145,7 @@ void Modem::process_rx_native(const float* audio, int count) {
                 ofdm_rx_audio_buf_[i] *= native_rx_gain_;
         }
         // Trim to max buffer size
-        constexpr size_t OFDM_RX_BUF_MAX = 48000 * 10;  // 10 seconds
+        constexpr size_t OFDM_RX_BUF_MAX = 48000 * 2;  // 2 seconds — enough for preamble + frame + margin
         if (ofdm_rx_audio_buf_.size() > OFDM_RX_BUF_MAX) {
             size_t excess = ofdm_rx_audio_buf_.size() - OFDM_RX_BUF_MAX;
             ofdm_rx_audio_buf_.erase(ofdm_rx_audio_buf_.begin(),
@@ -1174,7 +1174,18 @@ void Modem::process_rx_native(const float* audio, int count) {
             sync = ofdm_pending_sync_;
         } else {
             sync = ofdm_detect_frame(ofdm_rx_iq_.data(), (int)n_samples, ofdm_config_);
-            if (!sync.detected) return;
+            if (!sync.detected) {
+                // If no detection and buffer is getting large, trim old searched samples.
+                // Keep last 4 symbols of margin in case a preamble straddles the trim boundary.
+                if (ofdm_rx_audio_buf_.size() > (size_t)(sym_len * 8)) {
+                    size_t keep = sym_len * 4;
+                    size_t trim = ofdm_rx_audio_buf_.size() - keep;
+                    ofdm_rx_audio_buf_.erase(ofdm_rx_audio_buf_.begin(),
+                                              ofdm_rx_audio_buf_.begin() + trim);
+                    ofdm_sync_cached_ = false;
+                }
+                return;
+            }
             ofdm_redetect_count_ = 0;
         }
 

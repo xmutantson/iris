@@ -65,16 +65,17 @@ private:
     OfdmChannelEst channel_est_;
 
     // Extract data carriers from one OFDM symbol (after FFT, skip pilots)
-    std::vector<std::complex<float>> extract_data_carriers(
-        const std::complex<float>* symbol_freq, int n_used);
+    // Writes into pre-allocated output buffer, returns count of data carriers written.
+    int extract_data_carriers(const std::complex<float>* symbol_freq, int n_used,
+                              std::vector<std::complex<float>>& out);
 
-    // MMSE equalize data carriers using channel estimate
-    std::vector<std::complex<float>> equalize_mmse(
-        const std::vector<std::complex<float>>& data_carriers,
-        const OfdmChannelEst& est);
+    // MMSE equalize data carriers using channel estimate (writes into out)
+    void equalize_mmse(const std::vector<std::complex<float>>& data_carriers, int n_data,
+                       const OfdmChannelEst& est,
+                       std::vector<std::complex<float>>& out);
 
     // Demap equalized symbols to soft LLRs per carrier (mixed modulation)
-    void demap_to_llrs(const std::vector<std::complex<float>>& eq_carriers,
+    void demap_to_llrs(const std::vector<std::complex<float>>& eq_carriers, int n_data,
                        const ToneMap& tone_map,
                        const OfdmChannelEst& est,
                        std::vector<float>& llrs);

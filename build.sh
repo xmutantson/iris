@@ -21,8 +21,8 @@ case "$MODE" in
     o0)           OPT_LEVEL="-O0"; MODE="release" ;;
     o1)           OPT_LEVEL="-O1"; MODE="release" ;;
     o2)           OPT_LEVEL="-O2"; MODE="release" ;;
-    o3)           OPT_LEVEL="-O3 -march=native"; MODE="release"; USE_IMGUI=1 ;;
-    gui)          OPT_LEVEL="-O3 -march=native"; MODE="release"; USE_IMGUI=1 ;;
+    o3)           OPT_LEVEL="-O3 -march=native -ffast-math"; MODE="release"; USE_IMGUI=1 ;;
+    gui)          OPT_LEVEL="-O3 -march=native -ffast-math"; MODE="release"; USE_IMGUI=1 ;;
     gui-debug)    MODE="debug";   USE_IMGUI=1 ;;
     gui-sdl)      MODE="release"; USE_IMGUI=1; USE_SDL2=1 ;;
     gui-sdl-debug) MODE="debug";  USE_IMGUI=1; USE_SDL2=1 ;;
