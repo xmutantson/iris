@@ -369,8 +369,12 @@ private:
     // each slottime period, generate random 0-255; if < persist then TX, else wait.
     int csma_slot_timer_ = 0;  // samples remaining in current slot
 
+    // Thread safety: single recursive mutex protecting all shared mutable state.
+    // Audio threads (capture delivery, playback producer) are FIFO-buffered from
+    // real-time WASAPI threads, so brief blocking (~1-5ms) is safe.
+    mutable std::recursive_mutex modem_mutex_;
+
     // TX queue
-    std::mutex tx_mutex_;
     std::queue<std::vector<uint8_t>> tx_queue_;
     std::queue<std::vector<uint8_t>> ax25_tx_queue_;  // forced AX.25 (XID replies)
     std::vector<float> probe_audio_pending_;          // probe tones waiting to TX
@@ -422,7 +426,7 @@ private:
     bool ofdm_kiss_probe_done_ = false; // Probe completed, PHY reconfigured
     bool probe_manual_ = false;         // Manual probe (button) vs in-session
     int  disconnect_timeout_ticks_ = 0; // 30s timeout: stop TX if stuck in AWAITING_RELEASE
-    bool probe_start_pending_ = false;  // Deferred PROBE:START (can't send from state callback — tx_mutex_)
+    bool probe_start_pending_ = false;  // Deferred PROBE:START (can't send from state callback)
     std::string probe_peer_call_;       // Peer callsign for standalone probe result addressing
     XidCapability local_cap_;
 
@@ -492,8 +496,7 @@ private:
     int pending_frame_timeout_ = 0;  // Samples remaining before abandoning pending frame
     bool relisten_pending_ = false;  // Deferred return to LISTENING after failed hail
 
-    // Waterfall spectrum
-    mutable std::mutex diag_mutex_;
+    // Waterfall spectrum (protected by modem_mutex_)
     std::vector<std::complex<float>> last_constellation_;
     KalmanTrace last_kalman_trace_;
     std::vector<float> last_spectrum_;

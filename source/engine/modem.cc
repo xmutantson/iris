@@ -157,11 +157,11 @@ bool Modem::init(const IrisConfig& config) {
     probe_.on_send_audio = [this](const float* audio, int count) {
         // Queue probe audio — appended to tx_buffer_ in process_tx
         // after any pending AFSK messages (RESULT before tones, same PTT cycle)
-        std::lock_guard<std::mutex> lock(tx_mutex_);
+        std::lock_guard<std::recursive_mutex> lock(modem_mutex_);
         probe_audio_pending_.insert(probe_audio_pending_.end(), audio, audio + count);
     };
     probe_.on_send_msg = [this](const uint8_t* data, size_t len) {
-        std::lock_guard<std::mutex> lock(tx_mutex_);
+        std::lock_guard<std::recursive_mutex> lock(modem_mutex_);
         // Wrap probe result in AX.25 UI frame, send via AFSK.
         // Use session peer if available, else probe_peer_call_, else broadcast.
         std::string dest = ax25_session_.remote_callsign();
@@ -251,7 +251,7 @@ bool Modem::init(const IrisConfig& config) {
     ArqCallbacks arq_cb;
     arq_cb.send_frame = [this](const uint8_t* data, size_t len) {
         // ARQ frames go directly to TX queue (not back through ARQ)
-        std::lock_guard<std::mutex> lock(tx_mutex_);
+        std::lock_guard<std::recursive_mutex> lock(modem_mutex_);
         constexpr size_t TX_QUEUE_MAX = 32;
         if (tx_queue_.size() >= TX_QUEUE_MAX) {
             IRIS_LOG("[TX] queue full (%zu frames), dropping oldest", tx_queue_.size());
@@ -428,7 +428,7 @@ bool Modem::init(const IrisConfig& config) {
         // Responder keeps ofdm_kiss_tx_=false until hearing first native frame,
         // so its session frames (RR etc) still go via AFSK during transition.
         // This is safe: the window is short (~1s) and AX.25 retry handles drops.
-        std::lock_guard<std::mutex> lock(tx_mutex_);
+        std::lock_guard<std::recursive_mutex> lock(modem_mutex_);
         if (ofdm_kiss_tx_) {
             std::vector<uint8_t> frame(data, data + len);
             // Peer SNR feedback: append our RX SNR to S-frames (RR/REJ/RNR)
@@ -482,9 +482,8 @@ bool Modem::init(const IrisConfig& config) {
             ax25_session_.we_initiated() &&
             !config_.ax25_only && !ofdm_kiss_probing_ &&
             ofdm_kiss_probe_cd_ == 0 && !ofdm_kiss_probe_done_) {
-            // Defer PROBE:START — this callback may fire from queue_tx_frame()
-            // which holds tx_mutex_. send_probe_start_ui() also needs tx_mutex_.
-            // Set flag and let tick() send it (outside the mutex).
+            // Defer PROBE:START — this callback may fire from queue_tx_frame().
+            // Set flag and let tick() send it.
             xid_peer_call_ = remote;
             probe_start_pending_ = true;
             ofdm_kiss_probe_cd_ = 60;  // 3s countdown before tones (3 PROBE:START sends)
@@ -607,6 +606,7 @@ bool Modem::init(const IrisConfig& config) {
 }
 
 void Modem::shutdown() {
+    std::lock_guard<std::recursive_mutex> lock(modem_mutex_);
     arq_.reset();
     ptt_off();
     state_ = ModemState::IDLE;
@@ -656,6 +656,7 @@ void Modem::ptt_off() {
 }
 
 void Modem::process_rx(const float* rx_audio, int frame_count) {
+    std::lock_guard<std::recursive_mutex> lock(modem_mutex_);
     // Deferred relisten: return to LISTENING after failed hail
     // (can't call from inside state callback due to recursion)
     if (relisten_pending_) {
@@ -1347,7 +1348,6 @@ void Modem::process_rx_native(const float* audio, int count) {
 
             // Feed equalized constellation to GUI (scatter plot)
             if (!result.eq_constellation.empty()) {
-                std::lock_guard<std::mutex> lock(diag_mutex_);
                 last_constellation_ = std::move(result.eq_constellation);
             }
 
@@ -1550,10 +1550,7 @@ void Modem::process_rx_native(const float* audio, int count) {
         // Always capture Kalman trace (even on decode failure — essential for debugging)
         bool decode_ok = decode_native_frame(rx_overlap_buf_.data(), rx_overlap_buf_.size(),
                                               start, phy_config_, payload);
-        {
-            std::lock_guard<std::mutex> lock(diag_mutex_);
-            last_kalman_trace_ = decode_kalman_trace();
-        }
+        last_kalman_trace_ = decode_kalman_trace();
         kalman_log_trace(last_kalman_trace_, decode_ok,
                          decode_snr_db(), decode_channel_gain());
 
@@ -1638,11 +1635,8 @@ void Modem::process_rx_native(const float* audio, int count) {
                 arq_.set_local_snr(snr);
             }
 
-            {
-                std::lock_guard<std::mutex> lock(diag_mutex_);
-                if (native_demod_)
-                    last_constellation_ = native_demod_->symbols();
-            }
+            if (native_demod_)
+                last_constellation_ = native_demod_->symbols();
 
             // Deliver payload(s) — split multi-payload frames
             auto deliver = [&](const uint8_t* data, size_t len) {
@@ -1671,7 +1665,6 @@ void Modem::process_rx_native(const float* audio, int count) {
                         }
                         // Migrate accumulated I-frames from AFSK to native queue
                         {
-                            std::lock_guard<std::mutex> lock(tx_mutex_);
                             int migrated = 0;
                             std::queue<std::vector<uint8_t>> keep;
                             while (!ax25_tx_queue_.empty()) {
@@ -1918,6 +1911,7 @@ void Modem::process_rx_native(const float* audio, int count) {
 }
 
 void Modem::process_tx(float* tx_audio, int frame_count) {
+    std::lock_guard<std::recursive_mutex> lock(modem_mutex_);
     // Draining: TX buffer exhausted, waiting for audio pipeline to flush
     if (tx_draining_) {
         std::memset(tx_audio, 0, frame_count * sizeof(float));
@@ -2095,15 +2089,6 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
     }
 
     {
-        // try_lock: avoid blocking the real-time audio callback.  If another
-        // thread is pushing a frame (brief), we output silence this round
-        // and encode on the next callback (~5-10ms later).
-        std::unique_lock<std::mutex> lock(tx_mutex_, std::try_to_lock);
-        if (!lock.owns_lock()) {
-            std::memset(tx_audio, 0, frame_count * sizeof(float));
-            return;
-        }
-
         // Drain forced-AX.25 queue first (probes, etc.),
         // then regular tx_queue_ (native or AX.25 depending on mode).
         bool have_frame = false;
@@ -2535,11 +2520,8 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
             frames_tx_++;
         }
     }
-    // *** tx_mutex_ released here ***
-
     // ptt_on() calls set_channel_busy() which acquires timer_mutex_.
-    // Must be called OUTSIDE tx_mutex_ to prevent ABBA deadlock with
-    // ax25_session_.tick() (holds timer_mutex_, then send_frame_ -> tx_mutex_).
+    // Lock order: modem_mutex_ → timer_mutex_ (consistent with ax25_session_.tick()).
     if (tx_pos_ == 0 && !tx_buffer_.empty()) {
         ptt_on();
 
@@ -2569,6 +2551,7 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
 }
 
 void Modem::queue_tx_frame(const uint8_t* frame, size_t len) {
+    std::lock_guard<std::recursive_mutex> lock(modem_mutex_);
     bytes_tx_ += len;
     if (native_mode_ && native_tx_ready_ && arq_.state() == ArqState::CONNECTED) {
         const uint8_t* cur = frame;
@@ -2625,11 +2608,10 @@ void Modem::queue_tx_frame(const uint8_t* frame, size_t len) {
         arq_.send_data(cur, cur_len);
         return;
     }
-    std::lock_guard<std::mutex> lock(tx_mutex_);
 
     // Notify AX.25 session of outgoing frame so it can track KISS-initiated
     // connections (SABM/DISC) without generating duplicate frames.
-    // Must be under tx_mutex_ to synchronize with connection header injection.
+    // Must be under modem_mutex_ to synchronize with connection header injection.
     ax25_session_.notify_outgoing(frame, len);
 
     // Buffer KISS client I-frame info fields during AFSK phase for B2F replay.
@@ -2787,6 +2769,7 @@ void Modem::queue_tx_frame(const uint8_t* frame, size_t len) {
 }
 
 void Modem::ax25_connect(const std::string& remote_callsign) {
+    std::lock_guard<std::recursive_mutex> lock(modem_mutex_);
     // Guard: reject if session already active (prevents SABM loop when AGW client
     // retries connect before processing the CONNECTED notification).
     if (ax25_session_.is_active()) {
@@ -2805,6 +2788,7 @@ void Modem::ax25_connect(const std::string& remote_callsign) {
 }
 
 void Modem::ax25_disconnect() {
+    std::lock_guard<std::recursive_mutex> lock(modem_mutex_);
     // Cancel probe if in progress
     if (ofdm_kiss_probing_ || ofdm_kiss_probe_cd_ > 0) {
         IRIS_LOG("AX25 disconnect: cancelling probe");
@@ -2819,6 +2803,7 @@ void Modem::ax25_disconnect() {
 }
 
 void Modem::send_connected_data(const uint8_t* data, size_t len) {
+    std::lock_guard<std::recursive_mutex> lock(modem_mutex_);
     // Route to AX.25 session if active, otherwise fall back to native ARQ path
     if (ax25_session_.state() == Ax25SessionState::CONNECTED ||
         ax25_session_.state() == Ax25SessionState::TIMER_RECOVERY) {
@@ -2829,6 +2814,7 @@ void Modem::send_connected_data(const uint8_t* data, size_t len) {
 }
 
 void Modem::arq_connect(const std::string& remote_callsign) {
+    std::lock_guard<std::recursive_mutex> lock(modem_mutex_);
     IRIS_LOG("ARQ connect to %s", remote_callsign.c_str());
     // Generate ephemeral X25519 keypair for DH key exchange
     generate_ephemeral_x25519();
@@ -2837,11 +2823,13 @@ void Modem::arq_connect(const std::string& remote_callsign) {
 }
 
 void Modem::arq_disconnect() {
+    std::lock_guard<std::recursive_mutex> lock(modem_mutex_);
     IRIS_LOG("ARQ disconnect");
     arq_.disconnect();
 }
 
 void Modem::arq_listen() {
+    std::lock_guard<std::recursive_mutex> lock(modem_mutex_);
     // Skip if already listening (prevents recursion from state callbacks)
     if (arq_.state() == ArqState::LISTENING)
         return;
@@ -2942,12 +2930,12 @@ void Modem::rekey_hybrid() {
 static constexpr int NATIVE_HAIL_ESCALATION_RETRIES = 3;
 
 void Modem::tick() {
+    std::lock_guard<std::recursive_mutex> lock(modem_mutex_);
     arq_.tick();
     ax25_session_.tick();
     probe_.tick();
 
-    // Deferred PROBE:START — queued from state callback (can't send there,
-    // callback fires inside tx_mutex_ via queue_tx_frame → notify_outgoing).
+    // Deferred PROBE:START — queued from state callback.
     if (probe_start_pending_) {
         probe_start_pending_ = false;
         send_probe_start_ui();
@@ -3412,7 +3400,6 @@ void Modem::tick() {
             // is active, move them so they go out as native frames — not as a
             // long AFSK burst that would bury the probe result UI frame.
             {
-                std::lock_guard<std::mutex> lock(tx_mutex_);
                 int migrated = 0;
                 std::queue<std::vector<uint8_t>> keep;
                 while (!ax25_tx_queue_.empty()) {
@@ -3492,6 +3479,7 @@ void Modem::tick() {
 }
 
 ModemDiag Modem::get_diagnostics() const {
+    std::lock_guard<std::recursive_mutex> lock(modem_mutex_);
     ModemDiag diag;
     diag.state = state_;
     diag.speed_level = gearshift_.current_level();
@@ -3526,12 +3514,9 @@ ModemDiag Modem::get_diagnostics() const {
     diag.rx_raw_rms = rx_raw_rms_;
     diag.dcd_tone_energy = afsk_demod_.tone_energy();
 
-    {
-        std::lock_guard<std::mutex> lock(diag_mutex_);
-        diag.constellation = last_constellation_;
-        diag.kalman_trace = last_kalman_trace_;
-        diag.spectrum = last_spectrum_;
-    }
+    diag.constellation = last_constellation_;
+    diag.kalman_trace = last_kalman_trace_;
+    diag.spectrum = last_spectrum_;
 
     // Probe results
     diag.probe_state = probe_.state();
@@ -3601,7 +3586,7 @@ void Modem::compute_spectrum(const float* audio, int count) {
         spec[k] = 10.0f * std::log10(std::max(pwr, 1e-12f));
     }
 
-    std::lock_guard<std::mutex> lock(diag_mutex_);
+    // Caller (process_rx) holds modem_mutex_
     last_spectrum_ = std::move(spec);
     spectrum_low_hz_ = 0;
     spectrum_high_hz_ = DS_RATE / 2.0f;
@@ -3620,13 +3605,13 @@ void Modem::compute_spectrum(const float* audio, int count) {
 // Each side adjusts TX: tx_level *= (1.0 / peer_measured_gain) to normalize to gain≈1.0.
 
 void Modem::send_tune_ui(const char* payload) {
+    // Caller holds modem_mutex_
     auto src = ax25_make_addr(config_.callsign);
     auto dst = ax25_make_addr("TUNE");
     auto frame = ax25_build_u(dst, src, AX25_CTRL_UI, false, true);
     frame.push_back(AX25_PID_NONE);
     size_t plen = strlen(payload);
     frame.insert(frame.end(), (const uint8_t*)payload, (const uint8_t*)payload + plen);
-    std::lock_guard<std::mutex> lock(tx_mutex_);
     constexpr size_t TX_QUEUE_MAX = 32;
     if (ax25_tx_queue_.size() >= TX_QUEUE_MAX) {
         IRIS_LOG("[TX] AX.25 queue full (%zu frames), dropping oldest", ax25_tx_queue_.size());
@@ -3639,9 +3624,9 @@ void Modem::tune_build_and_queue_test_frame() {
     // Build N test frames with known payload into tx_buffer_.
     // When OFDM is active, build OFDM frames (Schmidl-Cox preamble) so the
     // peer's OFDM RX can detect them. Otherwise, build native Mode A frames.
+    // Caller must hold modem_mutex_.
     const uint8_t test_payload[] = "TUNE_TEST_FRAME";
 
-    std::lock_guard<std::mutex> lock(tx_mutex_);
     tx_buffer_.clear();
 
     for (int i = 0; i < tune_test_frames_target_; i++) {
@@ -3928,6 +3913,7 @@ void Modem::kalman_log_trace(const KalmanTrace& trace, bool decode_ok,
 }
 
 void Modem::start_autotune(const std::string& remote_callsign) {
+    std::lock_guard<std::recursive_mutex> lock(modem_mutex_);
     if (tune_state_ != TuneState::IDLE && tune_state_ != TuneState::DONE) {
         IRIS_LOG("[TUNE] Already in progress, ignoring");
         return;
@@ -3962,6 +3948,7 @@ void Modem::start_autotune(const std::string& remote_callsign) {
 
 // Build and queue a UI frame with cal payload (e.g., "CAL:START" or "CAL:RMS=0.1234")
 void Modem::send_cal_ui(const char* payload) {
+    // Caller holds modem_mutex_
     auto src = ax25_make_addr(config_.callsign);
     auto dst = ax25_make_addr("CAL");
     // UI frame: dst(7) + src(7) + ctrl(1) + PID(1) + info
@@ -3969,7 +3956,6 @@ void Modem::send_cal_ui(const char* payload) {
     frame.push_back(AX25_PID_NONE);
     size_t plen = strlen(payload);
     frame.insert(frame.end(), (const uint8_t*)payload, (const uint8_t*)payload + plen);
-    std::lock_guard<std::mutex> lock(tx_mutex_);
     constexpr size_t TX_QUEUE_MAX = 32;
     if (ax25_tx_queue_.size() >= TX_QUEUE_MAX) {
         IRIS_LOG("[TX] AX.25 queue full (%zu frames), dropping oldest", ax25_tx_queue_.size());
@@ -4019,6 +4005,7 @@ void Modem::handle_cal_frame(const uint8_t* info, size_t len) {
 }
 
 void Modem::start_probe() {
+    std::lock_guard<std::recursive_mutex> lock(modem_mutex_);
     if (ofdm_kiss_probing_ || ofdm_kiss_probe_cd_ > 0) {
         IRIS_LOG("[PROBE] Already probing, ignoring request");
         return;
@@ -4042,7 +4029,7 @@ void Modem::send_probe_start_ui() {
     frame.push_back(AX25_PID_NONE);
     const char* payload = "PROBE:START";
     frame.insert(frame.end(), (const uint8_t*)payload, (const uint8_t*)payload + 11);
-    std::lock_guard<std::mutex> lock(tx_mutex_);
+    // Caller holds modem_mutex_
     constexpr size_t TX_QUEUE_MAX = 32;
     if (ax25_tx_queue_.size() >= TX_QUEUE_MAX) {
         IRIS_LOG("[TX] AX.25 queue full (%zu frames), dropping oldest", ax25_tx_queue_.size());
@@ -4052,6 +4039,7 @@ void Modem::send_probe_start_ui() {
 }
 
 void Modem::start_calibration() {
+    std::lock_guard<std::recursive_mutex> lock(modem_mutex_);
     IRIS_LOG("[CAL] Starting calibration");
     if (gui_log_) gui_log_("[CAL] Sending tone to remote...");
     state_ = ModemState::CALIBRATING;
