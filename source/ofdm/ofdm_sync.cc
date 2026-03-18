@@ -64,12 +64,15 @@ OfdmSyncResult ofdm_detect_frame(const std::complex<float>* iq, int n_samples,
     float detect_metric = 0.0f;
     std::complex<float> detect_P(0.0f, 0.0f);
     float detect_R = 0.0f;
+    float peak_metric = 0.0f;  // Track max M for diagnostics
+    int peak_d = 0;
 
     // Evaluate at d=0
     {
         float P_mag2 = std::norm(P);
         float denom = E * R;
         float M = (denom > 1e-20f) ? (P_mag2 / denom) : 0.0f;
+        if (M > peak_metric) { peak_metric = M; peak_d = 0; }
         if (M >= DETECTION_THRESHOLD) {
             detect_d = 0;
             detect_metric = M;
@@ -91,6 +94,7 @@ OfdmSyncResult ofdm_detect_frame(const std::complex<float>* iq, int n_samples,
             float P_mag2 = std::norm(P);
             float denom = E * R;
             float M = (denom > 1e-20f) ? (P_mag2 / denom) : 0.0f;
+            if (M > peak_metric) { peak_metric = M; peak_d = d; }
 
             if (M >= DETECTION_THRESHOLD) {
                 detect_d = d;
@@ -103,7 +107,14 @@ OfdmSyncResult ofdm_detect_frame(const std::complex<float>* iq, int n_samples,
     }
 
     if (detect_d < 0) {
-        IRIS_LOG("[OFDM-SYNC] Schmidl-Cox: no detection (threshold=%.2f)", DETECTION_THRESHOLD);
+        // Log peak metric and sample count for threshold tuning
+        static int no_detect_count = 0;
+        no_detect_count++;
+        // Log every 20th miss to avoid flooding, but always log if peak > 0.3
+        if (peak_metric > 0.30f || (no_detect_count % 20) == 1) {
+            IRIS_LOG("[OFDM-SYNC] no detection: peak_M=%.3f at d=%d/%d (threshold=%.2f, %d samples)",
+                     peak_metric, peak_d, search_len, DETECTION_THRESHOLD, n_samples);
+        }
         return result;
     }
 

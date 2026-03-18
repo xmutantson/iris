@@ -609,13 +609,28 @@ std::vector<std::complex<float>> OfdmModulator::build_ofdm_frame(
     // subcarrier orthogonality. Controlled soft clipping is much less harmful
     // than uncontrolled hard clipping.
     // Three iterations of clip-and-filter to better control spectral regrowth.
+    //
+    // CRITICAL: Only clip data/header/pilot symbols — NOT the training preamble.
+    // Clipping destroys the half-symbol repetition property that Schmidl-Cox
+    // relies on for frame detection. The preamble has √2 boost and relatively
+    // low PAPR (BPSK on even carriers), so it doesn't need clipping.
     int n_clipped = 0;
 
     constexpr float CLIP_RATIO = 2.5f;  // 8 dB PAPR — keeps signal within FM radio's linear deviation range
     constexpr int CLIP_ITERS = 3;
 
-    for (int iter = 0; iter < CLIP_ITERS; iter++) {
-        n_clipped += soft_clip(frame, CLIP_RATIO);
+    // Skip the 2 training symbols (train1 + train2)
+    int preamble_samples = 2 * sym_len;
+    if ((int)frame.size() > preamble_samples) {
+        // Create a view of the data portion only
+        std::vector<std::complex<float>> data_part(
+            frame.begin() + preamble_samples, frame.end());
+        for (int iter = 0; iter < CLIP_ITERS; iter++) {
+            n_clipped += soft_clip(data_part, CLIP_RATIO);
+        }
+        // Copy clipped data back
+        std::copy(data_part.begin(), data_part.end(),
+                  frame.begin() + preamble_samples);
     }
     if (n_clipped > 0)
         IRIS_LOG("[OFDM-TX] clip-filter: %d iters, ratio=%.1f, %d samples clipped",
