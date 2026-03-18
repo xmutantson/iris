@@ -52,13 +52,11 @@ OfdmSyncResult ofdm_detect_frame(const std::complex<float>* iq, int n_samples,
     // Detection strategy: find the FIRST position where M exceeds the threshold,
     // then take that as frame_start (left edge of CP plateau). This prevents
     // false detections from data symbols later in the buffer.
-    // Threshold 0.70: FM radio processing (pre-emphasis + deviation limiting +
-    // de-emphasis) degrades OFDM preamble to M ≈ 0.75-0.90 OTA.
-    // Self-hear showed M=0.86 at threshold 0.85 — barely above.
-    // False positives at 0.70 are filtered by header CRC check in demodulator.
-    // Preamble boost (√2) improves margin by ~3 dB.
-    // Noise/tones produce M ≈ 0.2-0.5 (probe remnants up to ~0.65).
-    constexpr float DETECTION_THRESHOLD = 0.70f;
+    // Threshold 0.55: OTA real preambles produce M=0.65-0.80 with pre-emphasis
+    // compensation + PREAMBLE_BOOST. Probe remnants/noise peak at ~0.53.
+    // 0.45 caused ~5/sec false positive flood (perceived GUI freeze).
+    // 0.55 gives margin above noise while catching real preambles.
+    constexpr float DETECTION_THRESHOLD = 0.55f;
 
     int detect_d = -1;
     float detect_metric = 0.0f;

@@ -1158,7 +1158,7 @@ void Modem::process_rx_native(const float* audio, int count) {
         // Need enough samples for a minimum OFDM frame:
         // 2 training + n_header + 1 data + 1 tail = (4 + n_header) symbols.
         size_t sym_len = (size_t)(ofdm_config_.cp_samples + ofdm_config_.nfft);
-        size_t min_samples = sym_len * (size_t)(6 + ofdm_config_.n_header_symbols);
+        size_t min_samples = sym_len * 4;  // 2 preamble + 1 data + 1 margin (no header)
         if (n_samples < min_samples) return;
 
         // Convert real audio to complex (real + j*0) for Schmidl-Cox
@@ -1197,7 +1197,7 @@ void Modem::process_rx_native(const float* audio, int count) {
         OfdmDemodResult result = ofdm_demod_->demodulate(
             ofdm_rx_iq_.data() + sync.frame_start,
             (int)(n_samples - sync.frame_start),
-            nullptr, &demod_sync);  // decode header to determine tone map
+            ofdm_tone_map_, &demod_sync);  // pre-negotiated tone map (no header)
 
         // ---- Incomplete frame: preamble detected but not enough samples ----
         // samples_consumed=0 means "wait for more data". Don't erase anything.
@@ -1220,13 +1220,13 @@ void Modem::process_rx_native(const float* audio, int count) {
         ofdm_sync_cached_ = false;
         ofdm_redetect_count_ = 0;
 
-        // ---- Secondary gate: header CRC check ----
-        // At threshold 0.70, false positives are possible (FM noise/tones).
-        // If header decode failed (payload_len==0, no LLRs), this is likely
-        // a false positive. Skip past detection point and keep scanning.
-        if (!result.success && result.payload_len == 0 && result.llrs.empty()) {
-            IRIS_LOG("[OFDM-RX] false positive (header CRC failed, M=%.3f) — skipping",
-                     sync.schmidl_metric);
+        // ---- Secondary gate: quality gate / false positive ----
+        // With headerless frames, the quality gate (mean|H| < 0.50) rejects
+        // garbage before LDPC decode.  If no LLRs were produced, this is a
+        // false positive or quality-gated frame — skip past and keep scanning.
+        if (!result.success && result.llrs.empty()) {
+            IRIS_LOG("[OFDM-RX] false positive / quality gate (mean_H=%.3f, M=%.3f) — skipping",
+                     result.mean_H_mag, sync.schmidl_metric);
             size_t skip = (size_t)(sync.frame_start + ofdm_config_.nfft);
             skip = std::min(skip, ofdm_rx_audio_buf_.size());
             ofdm_rx_audio_buf_.erase(ofdm_rx_audio_buf_.begin(),
@@ -1257,26 +1257,32 @@ void Modem::process_rx_native(const float* audio, int count) {
             auto decoded = LdpcCodec::decode_soft(result.llrs, result.fec_rate,
                                                    LdpcDecoder::MIN_SUM, 50);
             if (!decoded.empty()) {
-                // Convert bits to bytes and verify CRC
-                int total_bytes = (int)result.payload_len + 4;
-                int total_bits = total_bytes * 8;
-                if ((int)decoded.size() >= total_bits) {
-                    std::vector<uint8_t> bytes(total_bytes, 0);
-                    for (int i = 0; i < total_bits; i++) {
-                        bytes[i / 8] |= (decoded[i] << (i % 8));
-                    }
-                    uint32_t computed = crc32(bytes.data(), result.payload_len);
-                    uint32_t received = (uint32_t)bytes[result.payload_len]
-                        | ((uint32_t)bytes[result.payload_len + 1] << 8)
-                        | ((uint32_t)bytes[result.payload_len + 2] << 16)
-                        | ((uint32_t)bytes[result.payload_len + 3] << 24);
-                    if (computed == received) {
-                        result.success = true;
-                        result.payload.assign(bytes.data(), bytes.data() + result.payload_len);
-                        ofdm_chase_llrs_.clear();
-                        ofdm_chase_combines_ = 0;
-                        IRIS_LOG("[OFDM-RX] Chase combining SUCCEEDED after %d combines",
-                                 ofdm_chase_combines_ + 1);
+                // Convert bits to bytes (headerless format: [2B len][payload][4B CRC])
+                int n_decoded_bytes = (int)decoded.size() / 8;
+                std::vector<uint8_t> bytes(n_decoded_bytes, 0);
+                for (int i = 0; i < n_decoded_bytes * 8; i++) {
+                    bytes[i / 8] |= (decoded[i] << (i % 8));
+                }
+                // Extract 2-byte length prefix
+                if (n_decoded_bytes >= 6) {
+                    uint16_t extracted_len = (uint16_t)bytes[0] | ((uint16_t)bytes[1] << 8);
+                    int crc_data_len = 2 + (int)extracted_len;
+                    if (crc_data_len + 4 <= n_decoded_bytes && extracted_len > 0) {
+                        uint32_t computed = crc32(bytes.data(), crc_data_len);
+                        uint32_t received = (uint32_t)bytes[crc_data_len]
+                            | ((uint32_t)bytes[crc_data_len + 1] << 8)
+                            | ((uint32_t)bytes[crc_data_len + 2] << 16)
+                            | ((uint32_t)bytes[crc_data_len + 3] << 24);
+                        if (computed == received) {
+                            result.success = true;
+                            result.payload_len = extracted_len;
+                            result.payload.assign(bytes.data() + 2,
+                                                   bytes.data() + 2 + extracted_len);
+                            ofdm_chase_llrs_.clear();
+                            ofdm_chase_combines_ = 0;
+                            IRIS_LOG("[OFDM-RX] Chase combining SUCCEEDED after %d combines",
+                                     ofdm_chase_combines_ + 1);
+                        }
                     }
                 }
             }
@@ -2383,13 +2389,16 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                     // per-carrier equalization via training symbols internally.
 
                     // Normalize RMS AFTER EQ to control total power.
-                    // Target 0.35: with ±0.95 hard clip, gives 8.7 dB PAPR headroom.
-                    // Previous 0.50 target crushed PAPR to 5.6 dB, distorting data symbols.
+                    // Target 0.50: FM deviation limiter clips anyway, so maximize
+                    // average deviation for best received SNR. Peaks at ~2.5×RMS=1.25
+                    // get hard-clipped to 0.95 — acceptable on FM (radio clips similarly).
+                    // Previous 0.35 target was 5 dB below AFSK output, causing OTA
+                    // preamble detection failure (mean SNR 2 dB per carrier).
                     // OFDM bypasses tx_level (which was calibrated for native PHY).
                     float sum_sq = 0.0f;
                     for (auto& s : tx_buffer_) sum_sq += s * s;
                     float ofdm_rms = std::sqrt(sum_sq / (float)tx_buffer_.size());
-                    constexpr float OFDM_TARGET_RMS = 0.35f;
+                    constexpr float OFDM_TARGET_RMS = 0.50f;
                     float ofdm_scale = (ofdm_rms > 1e-6f) ? (OFDM_TARGET_RMS / ofdm_rms) : 0.1f;
                     for (auto& s : tx_buffer_) s *= ofdm_scale;
 
@@ -3282,6 +3291,7 @@ void Modem::tick() {
                     }
                 }
 
+                ofdm_config_.fm_preemph_corner_hz = config_.ofdm_preemph_corner_hz;
                 ofdm_mod_ = std::make_unique<OfdmModulator>(ofdm_config_);
                 ofdm_demod_ = std::make_unique<OfdmDemodulator>(ofdm_config_);
                 // Don't set ofdm_phy_active_ yet — wait for CAP_OFDM negotiation below
@@ -3289,12 +3299,13 @@ void Modem::tick() {
                 ofdm_rx_audio_buf_.clear();
                 ofdm_sync_cached_ = false;
 
-                // Initialize gearshift OFDM level at O2 (rate 3/4) — RX SNR will refine
+                // Initialize gearshift OFDM level at O0 (QPSK r1/2) — Mercury approach:
+                // start at lowest speed, gearshift will negotiate up from RX SNR.
                 gearshift_.set_max_ofdm_level(NUM_OFDM_SPEED_LEVELS - 1);
-                ofdm_speed_level_ = 2;
-                gearshift_.force_ofdm_level(2);
+                ofdm_speed_level_ = 0;
+                gearshift_.force_ofdm_level(0);
                 ofdm_tone_map_ = get_uniform_tone_map(
-                    6, ofdm_config_);  // preset 6 = 64QAM r3/4 (default start)
+                    2, ofdm_config_);  // preset 2 = QPSK r1/2 (start low, negotiate up)
                 ofdm_tone_map_.use_nuc = config_.ofdm_nuc;
 
                 IRIS_LOG("OFDM PHY: prepared, %d carriers (%d data, %d pilot), CP=%d, BW=%.0f Hz",
@@ -3643,18 +3654,18 @@ void Modem::tune_build_and_queue_test_frame() {
             std::vector<float> audio(ofdm_iq.size());
             for (size_t j = 0; j < ofdm_iq.size(); j++)
                 audio[j] = ofdm_iq[j].real();
-            // Normalize RMS after EQ
+            // Normalize RMS after EQ — match OFDM_TARGET_RMS in process_tx
             float ssq = 0.0f;
             for (auto& s : audio) ssq += s * s;
             float rms = std::sqrt(ssq / (float)audio.size());
-            float sc = (rms > 1e-6f) ? (0.35f / rms) : 0.1f;
+            float sc = (rms > 1e-6f) ? (0.50f / rms) : 0.1f;
             for (auto& s : audio) s *= sc;
             // Hard clip to soundcard range
             for (auto& s : audio) {
                 if (s > 0.95f) s = 0.95f;
                 else if (s < -0.95f) s = -0.95f;
             }
-            IRIS_LOG("[TUNE] OFDM: RMS=%.3f->0.350 scale=%.4f EQ=%s",
+            IRIS_LOG("[TUNE] OFDM: RMS=%.3f->0.500 scale=%.4f EQ=%s",
                      rms, sc, tx_channel_eq_.is_configured() ? "on" : "off");
             tx_buffer_.insert(tx_buffer_.end(), audio.begin(), audio.end());
             tune_test_frames_sent_++;

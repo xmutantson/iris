@@ -14,19 +14,17 @@ namespace iris {
 // Result of OFDM frame demodulation
 struct OfdmDemodResult {
     bool success = false;          // CRC passed
-    std::vector<uint8_t> payload;  // Decoded payload bytes (without CRC)
+    std::vector<uint8_t> payload;  // Decoded payload bytes (without CRC or length prefix)
 
-    // Header fields
-    uint8_t tone_map_id = 0;
+    // Frame parameters (from pre-negotiated tone_map, not a header)
     LdpcRate fec_rate = LdpcRate::RATE_1_2;
-    uint16_t payload_len = 0;
-    int nfft_mode = 0;
-    bool harq_flag = false;
+    uint16_t payload_len = 0;      // Extracted from 2-byte length prefix after LDPC decode
 
     // Diagnostics
     float snr_db = 0;             // From sync
     float cfo_hz = 0;             // Estimated CFO
     float mean_channel_snr_db = 0; // From channel estimation
+    float mean_H_mag = 0;         // Mean |H| (quality gate diagnostic)
     int n_data_symbols = 0;
     int n_ldpc_blocks = 0;
     int worst_ldpc_iters = 0;      // Worst-case LDPC iterations across all blocks
@@ -42,7 +40,6 @@ struct OfdmDemodResult {
     std::vector<float> llrs;
 
     // Per-coded-bit phase variance (for HARQ region selection)
-    // Maps per-carrier noise_var/|H|² to each coded bit position.
     std::vector<float> sym_phase_var;
 
     // Per-LDPC-block decode results (for HARQ selective retransmit)
@@ -54,13 +51,10 @@ public:
     explicit OfdmDemodulator(const OfdmConfig& config);
 
     // Main entry: demodulate one OFDM frame from baseband IQ.
-    // iq points to the start of the search window.
-    // n_samples is the number of available samples.
-    // tone_map: if non-null, use this tone map (from negotiation).
-    //           if null, decode header to determine tone map.
+    // tone_map: REQUIRED — pre-negotiated config (no per-frame header).
     // pre_sync: if non-null, skip internal Schmidl-Cox detection and use this.
     OfdmDemodResult demodulate(const std::complex<float>* iq, int n_samples,
-                                const ToneMap* tone_map = nullptr,
+                                const ToneMap& tone_map,
                                 const OfdmSyncResult* pre_sync = nullptr);
 
     // Get the last channel estimate (for waterfilling updates)
@@ -69,12 +63,6 @@ public:
 private:
     OfdmConfig config_;
     OfdmChannelEst channel_est_;
-
-    // Decode the 3-symbol BPSK header
-    bool decode_header(const std::complex<float>* header_freq_symbols,
-                       int n_header_symbols,
-                       uint8_t& tone_map_id, LdpcRate& fec_rate,
-                       uint16_t& payload_len, int& nfft_mode, bool& harq_flag);
 
     // Extract data carriers from one OFDM symbol (after FFT, skip pilots)
     std::vector<std::complex<float>> extract_data_carriers(

@@ -12,6 +12,18 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+namespace {
+// FM pre-emphasis compensation gain for a given frequency bin.
+// Returns 1.0 if pre-emphasis compensation is disabled (corner_hz <= 0).
+inline float preemph_gain(int bin, int nfft, int sample_rate,
+                          float corner_hz, float gain_cap) {
+    if (corner_hz <= 0.0f) return 1.0f;
+    float fhz = (float)bin * (float)sample_rate / (float)nfft;
+    float g = std::sqrt(1.0f + (fhz / corner_hz) * (fhz / corner_hz));
+    return std::min(g, gain_cap);
+}
+} // anon namespace
+
 namespace iris {
 
 // ============================================================================
@@ -182,13 +194,19 @@ std::vector<std::complex<float>> OfdmModulator::generate_training_symbol_1() {
 
     // PN sequence for even-indexed used subcarriers (BPSK: +1 or -1).
     // Simple LFSR-based: seed = 0xACE1.
+    // Pre-emphasis compensation: boost higher carriers to counteract FM
+    // de-emphasis (6 dB/octave). This reduces spectral tilt BEFORE the
+    // deviation limiter, lowering nonlinear clipping that degrades Schmidl-Cox.
+    // Even-bin-only property preserved → halves still identical.
     uint16_t pn = 0xACE1;
     for (int i = 0; i < (int)config_.used_carrier_bins.size(); i++) {
         int bin = config_.used_carrier_bins[i];
         if (bin % 2 == 0) {  // even FFT bins only → identical halves in time domain
-            // PN bit determines +1 or -1
             float val = (pn & 1) ? 1.0f : -1.0f;
-            freq[bin] = {val, 0.0f};
+            float g = preemph_gain(bin, nfft, config_.sample_rate,
+                                   config_.fm_preemph_corner_hz,
+                                   config_.fm_preemph_gain_cap);
+            freq[bin] = {val * g, 0.0f};
             // Advance PN: x^15+x^14+1
             int fb = ((pn >> 14) ^ (pn >> 13)) & 1;
             pn = (pn >> 1) | ((uint16_t)fb << 14);
@@ -206,8 +224,14 @@ std::vector<std::complex<float>> OfdmModulator::generate_training_symbol_2() {
     int nfft = config_.nfft;
     std::vector<std::complex<float>> freq(nfft, {0.0f, 0.0f});
 
+    // Pre-emphasis compensation: same curve as train1, data, header, and pilots.
+    // H[k] from channel estimator includes gain[k]. All other symbol types
+    // also carry gain[k], so it cancels during equalization.
     for (int bin : config_.used_carrier_bins) {
-        freq[bin] = {1.0f, 0.0f};
+        float g = preemph_gain(bin, config_.nfft, config_.sample_rate,
+                               config_.fm_preemph_corner_hz,
+                               config_.fm_preemph_gain_cap);
+        freq[bin] = {g, 0.0f};
     }
 
     return symbol_to_time(freq);
@@ -298,14 +322,28 @@ std::vector<uint8_t> OfdmModulator::encode_ofdm_header(
 std::vector<std::complex<float>> OfdmModulator::build_ofdm_frame(
     const uint8_t* payload, size_t len, const ToneMap& tone_map, LdpcRate fec)
 {
-    // ---- 1. Append CRC-32 to payload ----
-    std::vector<uint8_t> payload_with_crc(len + 4);
-    std::memcpy(payload_with_crc.data(), payload, len);
-    uint32_t crc = crc32(payload, len);
-    payload_with_crc[len + 0] = (crc >>  0) & 0xFF;
-    payload_with_crc[len + 1] = (crc >>  8) & 0xFF;
-    payload_with_crc[len + 2] = (crc >> 16) & 0xFF;
-    payload_with_crc[len + 3] = (crc >> 24) & 0xFF;
+    // ---- 1. Prepend 2-byte length prefix, then append CRC-32 ----
+    // Headerless frame (Mercury approach): payload length is embedded inside
+    // the LDPC-protected data.  Format: [len_lo][len_hi][payload...][CRC32].
+    // CRC-32 covers the length prefix + payload.
+    if (fec != LdpcRate::NONE) {
+        int k = LdpcCodec::block_size(fec);
+        int max_payload = k / 8 - 4 - 2;  // minus CRC-32 and length prefix
+        if ((int)len > max_payload) {
+            IRIS_LOG("[OFDM-TX] payload %zu bytes exceeds capacity %d — rejected", len, max_payload);
+            return {};
+        }
+    }
+    uint16_t payload_len_u16 = (uint16_t)len;
+    std::vector<uint8_t> payload_with_crc(2 + len + 4);
+    payload_with_crc[0] = payload_len_u16 & 0xFF;
+    payload_with_crc[1] = (payload_len_u16 >> 8) & 0xFF;
+    std::memcpy(payload_with_crc.data() + 2, payload, len);
+    uint32_t crc = crc32(payload_with_crc.data(), 2 + len);
+    payload_with_crc[2 + len + 0] = (crc >>  0) & 0xFF;
+    payload_with_crc[2 + len + 1] = (crc >>  8) & 0xFF;
+    payload_with_crc[2 + len + 2] = (crc >> 16) & 0xFF;
+    payload_with_crc[2 + len + 3] = (crc >> 24) & 0xFF;
 
     // ---- 2. Convert to bits ----
     std::vector<uint8_t> data_bits;
@@ -332,6 +370,13 @@ std::vector<std::complex<float>> OfdmModulator::build_ofdm_frame(
         }
     } else {
         coded_bits = std::move(data_bits);
+    }
+
+    // ---- 3b. Fixed frame: exactly 1 LDPC block ----
+    // Both TX and RX compute n_data_symbols from this, so frame size is deterministic.
+    if (fec != LdpcRate::NONE) {
+        int n_fec_expected = LdpcCodec::codeword_size(fec);
+        coded_bits.resize(n_fec_expected, 0);  // pad or truncate to exactly 1 block
     }
 
     // ---- 4. BICM interleave (column-row per OFDM symbol, QAM16+ uniform) ----
@@ -463,19 +508,13 @@ std::vector<std::complex<float>> OfdmModulator::build_ofdm_frame(
     // FM de-emphasis causes higher-frequency carriers to lose power at the
     // receiver (6 dB/octave rolloff). Pre-compensate by boosting higher carriers
     // so all carriers arrive at roughly equal power after de-emphasis.
-    // Applied to DATA symbols only — training symbols use known amplitudes for
-    // channel estimation and already have their own PREAMBLE_BOOST.
-    {
-        float sr = (float)config_.sample_rate;
-        int nfft = config_.nfft;
-        constexpr float F_CORNER = 2120.0f;  // 300 us time constant for FM
+    // Same gain curve as training symbols, header, and pilots — the gain
+    // cancels in H[k] during equalization.  Disabled when corner_hz <= 0
+    // (flat audio data port connection).
+    if (config_.fm_preemph_corner_hz > 0.0f) {
         for (int s = 0; s < n_data_symbols; s++) {
             for (int k = 0; k < tone_map.n_data_carriers; k++) {
                 if (tone_map.bits_per_carrier[k] == 0) continue;
-                // Map data carrier index to its FFT bin to get actual frequency
-                // Data carriers are a subset of used_carrier_bins (skipping pilots)
-                // We need the bin for this data carrier — compute from used_carrier_bins
-                // by walking past pilots
                 int used_idx = 0;
                 int data_count = 0;
                 for (int i = 0; i < (int)config_.used_carrier_bins.size(); i++) {
@@ -486,13 +525,9 @@ std::vector<std::complex<float>> OfdmModulator::build_ofdm_frame(
                     }
                 }
                 int bin = config_.used_carrier_bins[used_idx];
-                float freq_hz = (float)bin * sr / (float)nfft;
-                // 6 dB/octave de-emphasis: power drops as 1/(1 + (f/f_corner)^2)
-                // Pre-compensate by boosting: gain = sqrt(1 + (f/f_corner)^2)
-                // Cap at +6 dB (2x) to avoid excessive boosting at band edges
-                float gain = std::sqrt(1.0f + (freq_hz / F_CORNER) * (freq_hz / F_CORNER));
-                gain = std::min(gain, 2.0f);
-                data_sym_carriers[s][k] *= gain;
+                data_sym_carriers[s][k] *= preemph_gain(bin, config_.nfft,
+                    config_.sample_rate, config_.fm_preemph_corner_hz,
+                    config_.fm_preemph_gain_cap);
             }
         }
     }
@@ -517,7 +552,12 @@ std::vector<std::complex<float>> OfdmModulator::build_ofdm_frame(
         int data_idx = 0;
         for (int i = 0; i < n_used; i++) {
             if (is_pilot[i]) {
-                all_used[i] = {1.0f, 0.0f};  // known pilot
+                // Comb pilot: +1 × pre-emphasis gain (must match block pilots / train2)
+                int bin = config_.used_carrier_bins[i];
+                float g = preemph_gain(bin, config_.nfft, config_.sample_rate,
+                                       config_.fm_preemph_corner_hz,
+                                       config_.fm_preemph_gain_cap);
+                all_used[i] = {g, 0.0f};
             } else {
                 if (data_idx < (int)data_carriers.size())
                     all_used[i] = data_carriers[data_idx++];
@@ -539,30 +579,7 @@ std::vector<std::complex<float>> OfdmModulator::build_ofdm_frame(
     for (auto& s : train1) s *= PREAMBLE_BOOST;
     for (auto& s : train2) s *= PREAMBLE_BOOST;
 
-    // ---- 9. Generate header symbols (BPSK on data carriers) ----
-    auto header_bits = encode_ofdm_header(
-        tone_map.tone_map_id, fec, (uint16_t)len,
-        nfft_to_mode(config_.nfft), false);
-
-    const int n_hdr_sym = config_.n_header_symbols;
-    int header_capacity = n_hdr_sym * config_.n_data_carriers;
-    std::vector<uint8_t> header_padded(header_capacity, 0);
-    int header_copy = std::min((int)header_bits.size(), header_capacity);
-    std::copy(header_bits.begin(), header_bits.begin() + header_copy, header_padded.begin());
-
-    std::vector<std::vector<std::complex<float>>> header_time_symbols;
-    for (int h = 0; h < n_hdr_sym; h++) {
-        // Map header bits for this symbol to BPSK on data carriers
-        std::vector<std::complex<float>> hdr_data(config_.n_data_carriers);
-        for (int k = 0; k < config_.n_data_carriers; k++) {
-            int bidx = h * config_.n_data_carriers + k;
-            // BPSK: 0 → +1, 1 → -1
-            hdr_data[k] = header_padded[bidx] ? std::complex<float>{-1.0f, 0.0f}
-                                               : std::complex<float>{ 1.0f, 0.0f};
-        }
-        auto used = build_used_carrier_symbols(hdr_data);
-        header_time_symbols.push_back(generate_data_symbol(used));
-    }
+    // ---- 9. (Header removed — config pre-negotiated, Mercury approach) ----
 
     // ---- 10. Assemble data symbols with block pilots every 8th ----
     std::vector<std::vector<std::complex<float>>> all_data_time;
@@ -583,7 +600,8 @@ std::vector<std::complex<float>> OfdmModulator::build_ofdm_frame(
     auto tail = generate_pilot_symbol();
 
     // ---- 12. Concatenate all time-domain symbols ----
-    int total_ofdm_symbols = 2 + n_hdr_sym + (int)all_data_time.size() + 1;
+    // Frame: [train1][train2][data+block_pilots][tail] — no header symbols
+    int total_ofdm_symbols = 2 + (int)all_data_time.size() + 1;
     int sym_len = config_.symbol_samples();
     std::vector<std::complex<float>> frame;
     frame.reserve(total_ofdm_symbols * sym_len);
@@ -591,10 +609,6 @@ std::vector<std::complex<float>> OfdmModulator::build_ofdm_frame(
     // Training
     frame.insert(frame.end(), train1.begin(), train1.end());
     frame.insert(frame.end(), train2.begin(), train2.end());
-
-    // Header
-    for (auto& hs : header_time_symbols)
-        frame.insert(frame.end(), hs.begin(), hs.end());
 
     // Data + block pilots
     for (auto& ds : all_data_time)

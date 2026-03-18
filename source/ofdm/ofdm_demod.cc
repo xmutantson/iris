@@ -15,68 +15,7 @@
 
 namespace iris {
 
-// ============================================================================
-//  CRC-8 (must match TX in ofdm_mod.cc exactly)
-//  Polynomial: x^8+x^5+x^4+1 = 0x8C reflected
-// ============================================================================
-static uint8_t crc8(const uint8_t* data, size_t len) {
-    uint8_t crc = 0xFF;
-    for (size_t i = 0; i < len; i++) {
-        crc ^= data[i];
-        for (int j = 0; j < 8; j++) {
-            if (crc & 1)
-                crc = (crc >> 1) ^ 0x8C;
-            else
-                crc >>= 1;
-        }
-    }
-    return crc;
-}
-
-// ============================================================================
-//  LFSR descrambler (x^15 + x^14 + 1) — must match TX scramble_bits()
-//  XOR is self-inverse, so identical to scrambler. XOR before advancing.
-// ============================================================================
-static void descramble_bits(std::vector<uint8_t>& bits) {
-    uint16_t lfsr = 0x6959;  // fixed seed (same as TX)
-    for (size_t i = 0; i < bits.size(); i++) {
-        bits[i] ^= (lfsr & 1);
-        int fb = ((lfsr >> 14) ^ (lfsr >> 13)) & 1;
-        lfsr = (lfsr >> 1) | ((uint16_t)fb << 14);
-    }
-}
-
-// ============================================================================
-//  FEC field decode (4-bit header field -> LdpcRate, matches TX fec_to_field)
-// ============================================================================
-static LdpcRate field_to_fec_rate(uint8_t field) {
-    switch (field) {
-        case 0:  return LdpcRate::NONE;
-        case 1:  return LdpcRate::RATE_1_16;
-        case 2:  return LdpcRate::RATE_2_16;
-        case 3:  return LdpcRate::RATE_3_16;
-        case 4:  return LdpcRate::RATE_4_16;
-        case 5:  return LdpcRate::RATE_5_16;
-        case 6:  return LdpcRate::RATE_6_16;
-        case 7:  return LdpcRate::RATE_1_2;
-        case 8:  return LdpcRate::RATE_5_8;
-        case 9:  return LdpcRate::RATE_3_4;
-        case 10: return LdpcRate::RATE_7_8;
-        default: return LdpcRate::RATE_1_2;
-    }
-}
-
-// ============================================================================
-//  NFFT mode decode (matches TX nfft_to_mode)
-// ============================================================================
-static int mode_to_nfft(int mode) {
-    switch (mode) {
-        case 0: return 512;
-        case 1: return 256;
-        case 2: return 1024;
-        default: return 512;
-    }
-}
+// (Header decode removed — config pre-negotiated, Mercury approach)
 
 // ============================================================================
 //  Interleave stride constant (must match TX)
@@ -90,136 +29,6 @@ static constexpr int INTERLEAVE_STRIDE = 41;  // coprime to 1600
 OfdmDemodulator::OfdmDemodulator(const OfdmConfig& config)
     : config_(config)
 {
-}
-
-// ----------------------------------------------------------------------------
-//  decode_header: extract metadata from 3 BPSK header OFDM symbols
-//
-//  Input: header_freq_symbols points to 3 * n_used_carriers complex values.
-//  Each group of n_used_carriers is the frequency-domain used carrier values
-//  from one header OFDM symbol (already FFT'd and extracted).
-// ----------------------------------------------------------------------------
-bool OfdmDemodulator::decode_header(
-    const std::complex<float>* header_freq_symbols,
-    int n_header_symbols,
-    uint8_t& tone_map_id, LdpcRate& fec_rate,
-    uint16_t& payload_len, int& nfft_mode, bool& harq_flag)
-{
-    if (n_header_symbols < 1) return false;
-
-    const int n_used = config_.n_used_carriers;
-    const int n_data = config_.n_data_carriers;
-
-    // Build pilot mask: pilot at every pilot_carrier_spacing-th used carrier index
-    std::vector<bool> is_pilot(n_used, false);
-    for (int i = 0; i < n_used; i += config_.pilot_carrier_spacing) {
-        is_pilot[i] = true;
-    }
-
-    // Collect BPSK hard-decision bits from all header symbols using MMSE.
-    // Header bits are sequential across symbols (sym 0 carries bits 0..n_data-1,
-    // sym 1 carries bits n_data..2*n_data-1, etc.).
-    // MMSE: conj(H)*Y / (|H|² + σ²_n) — avoids noise amplification on faded
-    // carriers that naive ZF (Y/H) would cause on FM channels with roll-off.
-    std::vector<uint8_t> header_bits;
-    header_bits.reserve(n_header_symbols * n_data);
-
-    for (int h = 0; h < n_header_symbols; h++) {
-        const std::complex<float>* sym = header_freq_symbols + h * n_used;
-        for (int i = 0; i < n_used; i++) {
-            if (is_pilot[i]) continue;  // skip pilot positions
-
-            // MMSE equalize: conj(H)*Y / (|H|² + σ²_n)
-            std::complex<float> H = channel_est_.H[i];
-            float H_mag2 = std::norm(H);
-            float nv = (i < (int)channel_est_.noise_var.size())
-                        ? channel_est_.noise_var[i] : 1e-6f;
-
-            float denom = H_mag2 + nv;
-            std::complex<float> eq;
-            if (H_mag2 < 1e-4f * nv) {
-                // Deep fade: zero this carrier (numerical safety only)
-                eq = {0.0f, 0.0f};
-            } else if (denom > 1e-12f) {
-                eq = std::conj(H) * sym[i] / denom;
-            } else {
-                eq = {0.0f, 0.0f};
-            }
-
-            // BPSK hard-decision: real > 0 -> bit 0 (+1), else bit 1 (-1)
-            header_bits.push_back(eq.real() > 0.0f ? 0 : 1);
-        }
-    }
-
-    // We need at least 36 bits: [4 tone_map_id][4 fec_rate][12 payload_len]
-    //                            [4 nfft_mode][1 harq][3 reserved][8 CRC-8]
-    if ((int)header_bits.size() < 36) {
-        IRIS_LOG("[OFDM-RX] header too short: %d bits < 36", (int)header_bits.size());
-        return false;
-    }
-
-    // Parse fields (MSB first, matching TX encode_ofdm_header)
-    int pos = 0;
-
-    // tone_map_id: 4 bits
-    tone_map_id = 0;
-    for (int i = 3; i >= 0; i--)
-        tone_map_id |= (header_bits[pos++] << i);
-
-    // fec_rate: 4 bits
-    uint8_t fec_field = 0;
-    for (int i = 3; i >= 0; i--)
-        fec_field |= (header_bits[pos++] << i);
-    fec_rate = field_to_fec_rate(fec_field);
-
-    // payload_len: 15 bits (max 32767 bytes)
-    payload_len = 0;
-    for (int i = 14; i >= 0; i--)
-        payload_len |= ((uint16_t)header_bits[pos++] << i);
-
-    // nfft_mode: 4 bits
-    nfft_mode = 0;
-    for (int i = 3; i >= 0; i--)
-        nfft_mode |= (header_bits[pos++] << i);
-
-    // harq_flag: 1 bit
-    harq_flag = header_bits[pos++] != 0;
-
-    // CRC-8: 8 bits
-    uint8_t received_crc = 0;
-    for (int i = 7; i >= 0; i--)
-        received_crc |= (header_bits[pos++] << i);
-
-    // Compute CRC-8 over first 28 bits (packed into 4 bytes, same as TX)
-    uint8_t header_bytes[4] = {};
-    for (int i = 0; i < 28; i++) {
-        header_bytes[i / 8] |= header_bits[i] << (7 - (i % 8));
-    }
-    uint8_t computed_crc = crc8(header_bytes, 4);
-
-    if (received_crc != computed_crc) {
-        // Dump channel diagnostics to help debug OTA header failures
-        float h_min = 1e9f, h_max = 0.0f, h_sum = 0.0f;
-        for (int i = 0; i < (int)channel_est_.H.size(); i++) {
-            float mag = std::abs(channel_est_.H[i]);
-            h_min = std::min(h_min, mag);
-            h_max = std::max(h_max, mag);
-            h_sum += mag;
-        }
-        float h_mean = channel_est_.H.empty() ? 0.0f : h_sum / channel_est_.H.size();
-        // Show first 8 header bits for debugging
-        uint8_t hdr_preview = 0;
-        for (int i = 0; i < 8 && i < (int)header_bits.size(); i++)
-            hdr_preview |= (header_bits[i] << (7 - i));
-        IRIS_LOG("[OFDM-RX] header CRC-8 fail: rx=0x%02X computed=0x%02X  "
-                 "|H| min=%.3f mean=%.3f max=%.3f  first8=0x%02X",
-                 received_crc, computed_crc, h_min, h_mean, h_max, hdr_preview);
-        return false;
-    }
-
-    IRIS_LOG("[OFDM-RX] header OK: tone_map=%d fec=%d payload=%d nfft_mode=%d harq=%d",
-             tone_map_id, fec_field, payload_len, nfft_mode, harq_flag ? 1 : 0);
-    return true;
 }
 
 // ----------------------------------------------------------------------------
@@ -359,7 +168,7 @@ void OfdmDemodulator::demap_to_llrs(
 // ============================================================================
 OfdmDemodResult OfdmDemodulator::demodulate(
     const std::complex<float>* iq, int n_samples,
-    const ToneMap* tone_map, const OfdmSyncResult* pre_sync)
+    const ToneMap& tone_map, const OfdmSyncResult* pre_sync)
 {
     OfdmDemodResult result;
     const int nfft = config_.nfft;
@@ -387,12 +196,12 @@ OfdmDemodResult OfdmDemodulator::demodulate(
     int frame_start = sync.frame_start;  // Start of CP of training symbol 1
 
     // ---- 1b. Minimum frame guard ----
-    // Need at least: 2 training + n_header + 1 data + 1 tail = (4 + n_header) symbols
-    int min_frame_samples = (4 + config_.n_header_symbols) * sym_len;
+    // Need at least: 2 training + 1 data + 1 tail = 4 symbols (no header)
+    int min_frame_samples = 4 * sym_len;
     int remaining = n_samples - frame_start;
     if (remaining < min_frame_samples) {
-        IRIS_LOG("[OFDM-RX] insufficient samples after detection: %d < %d (need %d syms)",
-                 remaining, min_frame_samples, 4 + config_.n_header_symbols);
+        IRIS_LOG("[OFDM-RX] insufficient samples after detection: %d < %d (need 4 syms)",
+                 remaining, min_frame_samples);
         // Don't consume samples — leave preamble in buffer for retry with more data.
         // samples_consumed = 0 signals "frame detected but incomplete, wait for more".
         result.samples_consumed = 0;
@@ -495,79 +304,24 @@ OfdmDemodResult OfdmDemodulator::demodulate(
 
     result.mean_channel_snr_db = channel_est_.mean_snr_db;
 
-    // ---- 5. Decode BPSK header symbols ----
-    const int n_hdr_sym = config_.n_header_symbols;
-    if (pos + n_hdr_sym * sym_len > remaining) {
-        IRIS_LOG("[OFDM-RX] insufficient samples for header symbols");
-        return result;
-    }
-
-    // Store header used-carrier values: n_hdr_sym * n_used complex values
-    std::vector<std::complex<float>> header_used(n_hdr_sym * n_used);
-
-    for (int h = 0; h < n_hdr_sym; h++) {
-        // Skip CP, FFT the symbol body
-        const std::complex<float>* sym_body = iq_corrected.data() + pos + cp;
-        std::vector<std::complex<float>> fft_buf(nfft);
-        std::copy(sym_body, sym_body + nfft, fft_buf.data());
-        fft_complex(fft_buf.data(), nfft);
-
-        // Extract values at used carrier bins
-        for (int i = 0; i < n_used; i++) {
-            int bin = config_.used_carrier_bins[i];
-            header_used[h * n_used + i] = fft_buf[bin];
+    // ---- 5. Mean |H| quality gate (Mercury approach) ----
+    // Skip decode if channel estimate is too weak — avoids wasting LDPC cycles.
+    {
+        float h_sum = 0.0f;
+        for (auto& h : channel_est_.H)
+            h_sum += std::abs(h);
+        float mean_H = channel_est_.H.empty() ? 0.0f : h_sum / channel_est_.H.size();
+        result.mean_H_mag = mean_H;
+        if (mean_H < 0.50f) {
+            IRIS_LOG("[OFDM-RX] quality gate: mean|H|=%.3f < 0.50, skipping decode", mean_H);
+            result.samples_consumed = frame_start + 2 * sym_len;  // skip past preamble
+            return result;
         }
-
-        pos += sym_len;
     }
 
-    // Decode header
-    uint8_t hdr_tone_map_id = 0;
-    LdpcRate hdr_fec_rate = LdpcRate::RATE_1_2;
-    uint16_t hdr_payload_len = 0;
-    int hdr_nfft_mode = 0;
-    bool hdr_harq_flag = false;
-
-    if (!decode_header(header_used.data(), n_hdr_sym,
-                       hdr_tone_map_id, hdr_fec_rate, hdr_payload_len,
-                       hdr_nfft_mode, hdr_harq_flag)) {
-        IRIS_LOG("[OFDM-RX] header decode failed");
-        // Consume past the preamble + header so we don't re-detect the same frame.
-        // Skip 2 training + n_header symbols worth of samples.
-        result.samples_consumed = frame_start + (2 + config_.n_header_symbols) * sym_len;
-        return result;
-    }
-
-    result.tone_map_id = hdr_tone_map_id;
-    result.fec_rate = hdr_fec_rate;
-    result.payload_len = hdr_payload_len;
-    result.nfft_mode = hdr_nfft_mode;
-    result.harq_flag = hdr_harq_flag;
-
-    // Verify NFFT mode matches
-    int expected_nfft = mode_to_nfft(hdr_nfft_mode);
-    if (expected_nfft != nfft) {
-        IRIS_LOG("[OFDM-RX] NFFT mismatch: header says %d, config has %d",
-                 expected_nfft, nfft);
-        return result;
-    }
-
-    // ---- 6. Determine tone map ----
-    ToneMap active_tone_map;
-    if (hdr_tone_map_id > 0) {
-        // Uniform preset from header
-        active_tone_map = get_uniform_tone_map(hdr_tone_map_id, config_);
-    } else if (tone_map != nullptr) {
-        // Waterfill tone map from negotiation
-        active_tone_map = *tone_map;
-    } else {
-        // Fallback: QPSK r1/2
-        IRIS_LOG("[OFDM-RX] tone_map_id=0 but no waterfill map provided, fallback QPSK r1/2");
-        active_tone_map = get_uniform_tone_map(2, config_);
-    }
-
-    // Override FEC rate from header (header is authoritative)
-    active_tone_map.fec_rate = hdr_fec_rate;
+    // ---- 6. Use pre-negotiated tone map (no header — Mercury approach) ----
+    const ToneMap& active_tone_map = tone_map;
+    result.fec_rate = active_tone_map.fec_rate;
 
     int bps_total = active_tone_map.total_bits_per_symbol;
     if (bps_total <= 0) {
@@ -575,34 +329,22 @@ OfdmDemodResult OfdmDemodulator::demodulate(
         return result;
     }
 
-    // ---- 7. Calculate number of data symbols needed ----
-    // payload_len bytes + 4 CRC bytes -> bits -> LDPC encode -> coded bits
-    int payload_with_crc_bits = ((int)hdr_payload_len + 4) * 8;
+    // ---- 7. Calculate number of data symbols (fixed: 1 LDPC block) ----
     int coded_bits_total;
-
-    if (hdr_fec_rate != LdpcRate::NONE) {
-        int k = LdpcCodec::block_size(hdr_fec_rate);     // data bits per LDPC block
-        int n_fec = LdpcCodec::codeword_size(hdr_fec_rate); // codeword bits (1600)
-
-        if (k <= 0) {
-            IRIS_LOG("[OFDM-RX] invalid LDPC block size for FEC rate");
-            return result;
-        }
-
-        int n_ldpc_blocks = (payload_with_crc_bits + k - 1) / k;
-        coded_bits_total = n_ldpc_blocks * n_fec;
-        result.n_ldpc_blocks = n_ldpc_blocks;
+    if (active_tone_map.fec_rate != LdpcRate::NONE) {
+        coded_bits_total = LdpcCodec::codeword_size(active_tone_map.fec_rate);
+        result.n_ldpc_blocks = 1;
     } else {
-        coded_bits_total = payload_with_crc_bits;
+        int k = LdpcCodec::block_size(active_tone_map.fec_rate);
+        coded_bits_total = (k > 0) ? k : bps_total;
         result.n_ldpc_blocks = 0;
     }
 
-    // Pad to full OFDM symbols
     int n_data_symbols = (coded_bits_total + bps_total - 1) / bps_total;
     result.n_data_symbols = n_data_symbols;
 
-    IRIS_LOG("[OFDM-RX] expecting %d data symbols (%d coded bits, %d bits/sym, %d LDPC blocks)",
-             n_data_symbols, coded_bits_total, bps_total, result.n_ldpc_blocks);
+    IRIS_LOG("[OFDM-RX] expecting %d data symbols (%d coded bits, %d bits/sym, 1 LDPC block)",
+             n_data_symbols, coded_bits_total, bps_total);
 
     // ---- 8. Receive data symbols (with block pilots) ----
     std::vector<float> all_llrs;
@@ -653,7 +395,7 @@ OfdmDemodResult OfdmDemodulator::demodulate(
                 if (weight_sum > 0.0f) {
                     float mean_phase = phase_sum / weight_sum;
                     // Symbol index relative to training symbol 2
-                    int sym_idx = n_hdr_sym + data_sym_count + sfo_block_pilot_count + 1;
+                    int sym_idx = data_sym_count + sfo_block_pilot_count + 1;
                     sfo_block_pilot_count++;
                     sfo_cumulative_phase += mean_phase * sym_idx;
                     sfo_cumulative_weight += (float)(sym_idx * sym_idx);
@@ -706,7 +448,7 @@ OfdmDemodResult OfdmDemodulator::demodulate(
 
         // H8: Apply SFO correction if estimate exceeds threshold
         if (std::abs(sfo_ppm_estimate) > 5.0f) {
-            int sym_idx = n_hdr_sym + total_symbols_elapsed + 1;
+            int sym_idx = total_symbols_elapsed + 1;
             float elapsed_samples = (float)(sym_idx * sym_len);
             float sfo_frac = sfo_ppm_estimate * 1e-6f;  // fractional SFO
             for (int i = 0; i < n_used; i++) {
@@ -875,8 +617,8 @@ OfdmDemodResult OfdmDemodulator::demodulate(
     }
 
     // ---- 11. De-interleave LDPC blocks (reverse stride-41) ----
-    if (hdr_fec_rate != LdpcRate::NONE) {
-        int n_fec = LdpcCodec::codeword_size(hdr_fec_rate);
+    if (active_tone_map.fec_rate != LdpcRate::NONE) {
+        int n_fec = LdpcCodec::codeword_size(active_tone_map.fec_rate);
 
         for (int blk_start = 0; blk_start + n_fec <= (int)all_llrs.size();
              blk_start += n_fec)
@@ -892,33 +634,18 @@ OfdmDemodResult OfdmDemodulator::demodulate(
         }
     }
 
-    // ---- 11b. Tail bit hardening ----
-    // The TX encoder pads the last LDPC block with zero bits. Bias those
-    // tail LLR positions toward +20 (strong "0" prior) to help the decoder
-    // converge on the correct codeword for short payloads.
-    if (hdr_fec_rate != LdpcRate::NONE) {
-        int k = LdpcCodec::block_size(hdr_fec_rate);
-        if (k > 0 && result.n_ldpc_blocks > 0) {
-            int total_data_bits = result.n_ldpc_blocks * k;
-            int payload_bits = payload_with_crc_bits;
-            if (total_data_bits > payload_bits) {
-                // Tail bits are in the last LDPC block, positions payload_bits..total_data_bits-1
-                // Map data bit index -> codeword LLR index (systematic code: first k bits)
-                int last_blk_start_data = (result.n_ldpc_blocks - 1) * k;
-                int n_fec = LdpcCodec::codeword_size(hdr_fec_rate);
-                int last_blk_start_llr = (result.n_ldpc_blocks - 1) * n_fec;
-                int tail_start_in_blk = payload_bits - last_blk_start_data;
-                if (tail_start_in_blk < 0) tail_start_in_blk = 0;
-                int n_tail = 0;
-                for (int i = tail_start_in_blk; i < k; i++) {
-                    int llr_idx = last_blk_start_llr + i;
-                    if (llr_idx < (int)all_llrs.size()) {
-                        all_llrs[llr_idx] = 20.0f;  // strong "0" prior
-                        n_tail++;
-                    }
+    // ---- 11b. Tail bit hardening (deferred) ----
+    // Payload length is unknown until after LDPC decode (embedded in data).
+    // Light tail hardening: bias last 16 systematic bits toward 0 as likely padding.
+    if (active_tone_map.fec_rate != LdpcRate::NONE) {
+        int k = LdpcCodec::block_size(active_tone_map.fec_rate);
+        if (k > 16) {
+            int n_tail = 0;
+            for (int i = k - 16; i < k; i++) {
+                if (i < (int)all_llrs.size()) {
+                    all_llrs[i] = std::max(all_llrs[i], 5.0f);  // weak "0" prior
+                    n_tail++;
                 }
-                IRIS_LOG("[OFDM-RX] tail hardening: %d bits biased to +20 in last LDPC block",
-                         n_tail);
             }
         }
     }
@@ -958,10 +685,10 @@ OfdmDemodResult OfdmDemodulator::demodulate(
     // ---- 12. LDPC decode (per-block for HARQ) ----
     std::vector<uint8_t> decoded_bits;
 
-    if (hdr_fec_rate != LdpcRate::NONE) {
+    if (active_tone_map.fec_rate != LdpcRate::NONE) {
         // Use per-block decode: continues all blocks even if some fail (for HARQ)
         auto block_results = LdpcCodec::decode_soft_per_block(
-            all_llrs, hdr_fec_rate, LdpcDecoder::MIN_SUM, 50);
+            all_llrs, active_tone_map.fec_rate, LdpcDecoder::MIN_SUM, 50);
 
         result.block_results = block_results;
 
@@ -998,44 +725,62 @@ OfdmDemodResult OfdmDemodulator::demodulate(
         }
     }
 
-    // ---- 13. Convert bits to bytes ----
-    int total_bytes_with_crc = (int)hdr_payload_len + 4;
-    int total_bits_needed = total_bytes_with_crc * 8;
+    // ---- 13. Extract 2-byte length prefix from decoded bits ----
+    // Headerless frame format: [len_lo][len_hi][payload...][CRC32]
+    // All inside the LDPC codeword.
+    if ((int)decoded_bits.size() < 16) {
+        IRIS_LOG("[OFDM-RX] decoded bits too short for length prefix: %d", (int)decoded_bits.size());
+        return result;
+    }
+
+    uint16_t extracted_len = 0;
+    for (int i = 0; i < 16; i++)
+        extracted_len |= ((uint16_t)(decoded_bits[i] & 1)) << i;
+
+    int k = LdpcCodec::block_size(active_tone_map.fec_rate);
+    int max_payload = k / 8 - 4 - 2;
+    if ((int)extracted_len > max_payload || extracted_len == 0) {
+        IRIS_LOG("[OFDM-RX] extracted payload_len=%d out of range [1,%d]",
+                 (int)extracted_len, max_payload);
+        return result;
+    }
+
+    result.payload_len = extracted_len;
+
+    // ---- 14. Convert bits to bytes and verify CRC-32 ----
+    int total_bytes = 2 + (int)extracted_len + 4;  // len_prefix + payload + CRC
+    int total_bits_needed = total_bytes * 8;
 
     if ((int)decoded_bits.size() < total_bits_needed) {
-        IRIS_LOG("[OFDM-RX] decoded bits too short: %d < %d",
+        IRIS_LOG("[OFDM-RX] decoded bits insufficient: %d < %d",
                  (int)decoded_bits.size(), total_bits_needed);
         return result;
     }
 
-    std::vector<uint8_t> decoded_bytes(total_bytes_with_crc, 0);
-    for (int i = 0; i < total_bits_needed; i++) {
-        // LSB-first packing (matching TX: bit j of byte i = (byte >> j) & 1)
+    std::vector<uint8_t> decoded_bytes(total_bytes, 0);
+    for (int i = 0; i < total_bits_needed; i++)
         decoded_bytes[i / 8] |= (decoded_bits[i] << (i % 8));
-    }
 
-    // ---- 14. Verify CRC-32 ----
-    const uint8_t* payload_data = decoded_bytes.data();
-    int payload_bytes = (int)hdr_payload_len;
-
-    uint32_t computed_crc = crc32(payload_data, payload_bytes);
-    uint32_t received_crc = (uint32_t)decoded_bytes[payload_bytes + 0]
-                          | ((uint32_t)decoded_bytes[payload_bytes + 1] << 8)
-                          | ((uint32_t)decoded_bytes[payload_bytes + 2] << 16)
-                          | ((uint32_t)decoded_bytes[payload_bytes + 3] << 24);
+    // CRC-32 covers [len_lo][len_hi][payload...] = first (2 + extracted_len) bytes
+    int crc_data_len = 2 + (int)extracted_len;
+    uint32_t computed_crc = crc32(decoded_bytes.data(), crc_data_len);
+    uint32_t received_crc = (uint32_t)decoded_bytes[crc_data_len + 0]
+                          | ((uint32_t)decoded_bytes[crc_data_len + 1] << 8)
+                          | ((uint32_t)decoded_bytes[crc_data_len + 2] << 16)
+                          | ((uint32_t)decoded_bytes[crc_data_len + 3] << 24);
 
     if (computed_crc != received_crc) {
-        IRIS_LOG("[OFDM-RX] CRC-32 fail: computed=0x%08X received=0x%08X",
-                 computed_crc, received_crc);
+        IRIS_LOG("[OFDM-RX] CRC-32 fail: computed=0x%08X received=0x%08X (payload_len=%d)",
+                 computed_crc, received_crc, extracted_len);
         return result;
     }
 
-    // ---- 15. Success ----
+    // ---- 15. Success — payload starts at byte 2 (after length prefix) ----
     result.success = true;
-    result.payload.assign(payload_data, payload_data + payload_bytes);
+    result.payload.assign(decoded_bytes.data() + 2, decoded_bytes.data() + 2 + extracted_len);
 
-    IRIS_LOG("[OFDM-RX] frame decoded OK: %d payload bytes, SNR=%.1f dB, channel SNR=%.1f dB",
-             payload_bytes, result.snr_db, result.mean_channel_snr_db);
+    IRIS_LOG("[OFDM-RX] frame decoded OK: %d payload bytes, SNR=%.1f dB, mean|H|=%.2f",
+             (int)extracted_len, result.snr_db, result.mean_H_mag);
 
     return result;
 }

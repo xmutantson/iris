@@ -65,11 +65,7 @@ OfdmConfig ofdm_config_from_probe(const NegotiatedPassband& passband, int nfft, 
     cfg.n_pilot_carriers = (int)cfg.pilot_carrier_bins.size();
     cfg.n_data_carriers  = (int)cfg.data_carrier_bins.size();
 
-    // Header symbols: ceil(36 / n_data_carriers), minimum 1
-    constexpr int HEADER_BITS = 36;
-    cfg.n_header_symbols = (cfg.n_data_carriers > 0)
-        ? (HEADER_BITS + cfg.n_data_carriers - 1) / cfg.n_data_carriers
-        : 3;
+    cfg.n_header_symbols = 0;  // No header — config pre-negotiated (Mercury approach)
 
     // Log configuration
     IRIS_LOG("[OFDM-CFG] nfft=%d spacing=%.1f Hz BW=%.0f Hz center=%.0f Hz",

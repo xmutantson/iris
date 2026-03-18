@@ -46,6 +46,7 @@ void OfdmSession::init(const NegotiatedPassband& passband, const IrisConfig& con
 
     // Create OfdmConfig from negotiated passband
     ofdm_config_ = ofdm_config_from_probe(passband, config.ofdm_nfft, config.ofdm_cp_samples);
+    ofdm_config_.fm_preemph_corner_hz = config.ofdm_preemph_corner_hz;
 
     // Create modulator and demodulator
     modulator_ = std::make_unique<OfdmModulator>(ofdm_config_);
@@ -178,7 +179,7 @@ OfdmDemodResult OfdmSession::process_rx_frame(const std::complex<float>* iq, int
         return result;
     }
 
-    result = demodulator_->demodulate(iq, n_samples, &rx_tone_map_);
+    result = demodulator_->demodulate(iq, n_samples, rx_tone_map_);
 
     n_frames_rx_++;
     if (result.success) {

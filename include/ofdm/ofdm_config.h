@@ -34,8 +34,14 @@ struct OfdmConfig {
     int pilot_carrier_spacing = 4;     // Every Nth used carrier (4=HF, 8-16=FM)
     int pilot_symbol_spacing = 8;      // Every Mth OFDM symbol is all-pilot (8=HF, 16-32=FM)
 
+    // FM pre-emphasis compensation
+    // NBFM mic/speaker: 300 Hz (530us time constant, TIA/EIA-603)
+    // FM broadcast (75us): 2120 Hz. Set to 0 to disable (flat audio data port).
+    float fm_preemph_corner_hz = 300.0f;
+    float fm_preemph_gain_cap = 2.0f;  // Max boost (+6 dB)
+
     // Header
-    int n_header_symbols = 3;          // BPSK header symbols (computed from n_data_carriers)
+    int n_header_symbols = 0;          // No header — config pre-negotiated (Mercury approach)
 
     // Computed helpers
     int symbol_samples() const { return nfft + cp_samples; }

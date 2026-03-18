@@ -116,6 +116,7 @@ struct IrisConfig {
     bool ofdm_auto_spacing = false;   // Auto-train subcarrier spacing
     bool ofdm_waterfill = true;       // Per-subcarrier adaptive bit loading
     bool ofdm_nuc = true;             // Non-uniform constellations
+    float ofdm_preemph_corner_hz = 300.0f;  // FM pre-emphasis corner (0=flat/data port)
 
     // GUI
     bool show_constellation = true;
