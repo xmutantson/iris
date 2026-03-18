@@ -31,8 +31,8 @@ struct OfdmConfig {
     std::vector<int> data_carrier_bins;    // Data FFT bin indices
 
     // Pilot pattern
-    int pilot_carrier_spacing = 4;     // Every Nth used carrier (4=HF, 8-16=FM)
-    int pilot_symbol_spacing = 8;      // Every Mth OFDM symbol is all-pilot (8=HF, 16-32=FM)
+    int pilot_carrier_spacing = 4;     // Every Nth used carrier — comb pilots for CPE + interpolation
+    int pilot_symbol_spacing = 14;     // Every Mth OFDM symbol is all-pilot (FM: slow fading, 14*12ms=168ms)
 
     // FM pre-emphasis compensation
     // NBFM mic/speaker: 300 Hz (530us time constant, TIA/EIA-603)
@@ -52,7 +52,7 @@ struct OfdmConfig {
 
 // Create OfdmConfig from probe result
 OfdmConfig ofdm_config_from_probe(const NegotiatedPassband& passband, int nfft = 512, int cp_samples = 64,
-                                   int pilot_carrier_spacing = 4, int pilot_symbol_spacing = 8);
+                                   int pilot_carrier_spacing = 4, int pilot_symbol_spacing = 14);
 
 // Get the FFT bin index for a given frequency
 int freq_to_bin(float freq_hz, int nfft, int sample_rate);

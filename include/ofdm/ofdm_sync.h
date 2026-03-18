@@ -11,14 +11,32 @@ namespace iris {
 struct OfdmSyncResult {
     bool detected = false;
     int frame_start = -1;        // Sample offset of first training symbol (after CP)
-    float schmidl_metric = 0;    // Peak metric value [0,1]
+    float schmidl_metric = 0;    // Peak metric value [0,1] (ZC cross-correlation peak)
     float cfo_hz = 0;            // Estimated carrier frequency offset
     float snr_est = 0;           // SNR estimate from training symbols (dB)
 };
 
-// Detect OFDM frame using Schmidl-Cox on training symbol 1.
-// Searches through baseband IQ samples for the training pattern.
-// Training symbol 1 has identical first/second halves (each L = NFFT/2 samples).
+// ---------------------------------------------------------------------------
+// Zadoff-Chu preamble generation (shared by TX and RX)
+// ---------------------------------------------------------------------------
+
+// Generate a Zadoff-Chu sequence of the given length.
+// ZC: x[n] = exp(-j * pi * root * n * (n+1) / length), n = 0..length-1.
+// Root must be coprime to length. Default root=7 works well for length~50-100.
+std::vector<std::complex<float>> generate_zc_sequence(int root, int length);
+
+// Generate a time-domain ZC training symbol for the given OFDM config.
+// Steps:
+//   1. Generate ZC sequence of length n_used_carriers
+//   2. Place into correct FFT bins (config.used_carrier_bins)
+//   3. IFFT to get nfft time-domain samples
+//   4. Normalize to unit RMS
+// Returns nfft samples WITHOUT cyclic prefix (caller adds CP).
+std::vector<std::complex<float>> generate_zc_training_symbol(const OfdmConfig& config,
+                                                              int root = 7);
+
+// Detect OFDM frame using Zadoff-Chu cross-correlation on training symbol 1.
+// Searches through baseband IQ samples for the ZC training pattern.
 // Returns detection result with timing, CFO, and SNR estimates.
 OfdmSyncResult ofdm_detect_frame(const std::complex<float>* iq, int n_samples,
                                   const OfdmConfig& config);
@@ -36,9 +54,10 @@ struct OfdmChannelEst {
     float mean_snr_db = 0;                    // Average SNR across carriers
 };
 
-// Estimate channel from training symbol 2 (all used carriers known = +1).
-// iq_symbol points to the start of training symbol 2 (after CP removal).
-// Performs NFFT-point FFT, extracts used carrier bins, estimates H and noise.
+// Estimate channel from training symbol (ZC-based).
+// iq_symbol points to the start of the training symbol (after CP removal).
+// Performs NFFT-point FFT, divides by known ZC frequency-domain sequence,
+// estimates H and noise.
 OfdmChannelEst ofdm_estimate_channel(const std::complex<float>* iq_symbol,
                                       const OfdmConfig& config);
 
@@ -58,10 +77,10 @@ void ofdm_interpolate_pilots(OfdmChannelEst& est,
                               const OfdmConfig& config,
                               float alpha = 0.3f);
 
-// Fine CFO estimation from training symbol 2.
+// Fine CFO estimation from training symbol.
 // After coarse CFO correction, the channel estimate H[k] for each used
-// subcarrier should be purely real (since TX = +1). Any residual CFO
-// manifests as a linear phase slope across subcarriers.
+// subcarrier should align with the known ZC phase. Any residual CFO
+// manifests as a common phase rotation across subcarriers.
 // Returns residual CFO in Hz (add to coarse CFO for total correction).
 float ofdm_estimate_fine_cfo(const OfdmChannelEst& est, const OfdmConfig& config);
 

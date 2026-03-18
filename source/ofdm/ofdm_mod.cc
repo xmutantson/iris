@@ -1,4 +1,5 @@
 #include "ofdm/ofdm_mod.h"
+#include "ofdm/ofdm_sync.h"    // generate_zc_training_symbol()
 #include "common/fft.h"
 #include "common/logging.h"
 #include "native/frame.h"       // crc32()
@@ -568,13 +569,22 @@ std::vector<std::complex<float>> OfdmModulator::build_ofdm_frame(
         return all_used;
     };
 
-    // ---- 8. Generate training symbols ----
-    auto train1 = generate_training_symbol_1();
-    auto train2 = generate_training_symbol_2();
+    // ---- 8. Generate ZC training symbols ----
+    // Both training symbols are identical Zadoff-Chu sequences (root=7).
+    // RX estimates CFO from the phase rotation between them.
+    auto zc_sym = generate_zc_training_symbol(config_, /*root=*/7);  // nfft samples, no CP
+
+    // Add cyclic prefix: [last cp_samples of symbol][symbol]
+    int cp = config_.cp_samples;
+    std::vector<std::complex<float>> train1;
+    train1.reserve(cp + config_.nfft);
+    train1.insert(train1.end(), zc_sym.end() - cp, zc_sym.end());
+    train1.insert(train1.end(), zc_sym.begin(), zc_sym.end());
+    auto train2 = train1;  // identical copy for CFO estimation
 
     // Preamble boost: √2 (3 dB) extra amplitude for detection headroom.
     // FM radio pre-emphasis + deviation limiting degrades OFDM peaks;
-    // boosting the preamble ensures Schmidl-Cox metric stays above threshold.
+    // boosting the preamble ensures ZC cross-correlation stays above threshold.
     constexpr float PREAMBLE_BOOST = 1.4142f;  // sqrt(2)
     for (auto& s : train1) s *= PREAMBLE_BOOST;
     for (auto& s : train2) s *= PREAMBLE_BOOST;
@@ -649,6 +659,75 @@ std::vector<std::complex<float>> OfdmModulator::build_ofdm_frame(
     if (n_clipped > 0)
         IRIS_LOG("[OFDM-TX] clip-filter: %d iters, ratio=%.1f, %d samples clipped",
                  CLIP_ITERS, CLIP_RATIO, n_clipped);
+
+    // ---- 13b. TX bandpass filter (frequency-domain windowing) ----
+    // Suppress out-of-band spectral regrowth from clipping.
+    // FFT entire frame, zero bins outside passband with raised-cosine taper, IFFT back.
+    // FFT requires power-of-2 length, so pad frame and truncate after IFFT.
+    {
+        int frame_len = (int)frame.size();
+        if (frame_len > 0) {
+            // Round up to next power of 2
+            int N = 1;
+            while (N < frame_len) N <<= 1;
+
+            // Copy frame into zero-padded buffer
+            std::vector<std::complex<float>> spectrum(N, {0.0f, 0.0f});
+            std::copy(frame.begin(), frame.end(), spectrum.begin());
+
+            iris::fft_complex(spectrum.data(), N);
+
+            // Passband bin range (using padded FFT size N for bin resolution)
+            float lo_hz = config_.center_hz - config_.bandwidth_hz / 2.0f;
+            float hi_hz = config_.center_hz + config_.bandwidth_hz / 2.0f;
+            int bin_lo = freq_to_bin(lo_hz, N, config_.sample_rate);
+            int bin_hi = freq_to_bin(hi_hz, N, config_.sample_rate);
+            constexpr int TAPER_BINS = 4;  // raised-cosine transition width
+
+            static bool logged_once = false;
+            if (!logged_once) {
+                IRIS_LOG("[OFDM-TX] BPF: %.0f-%.0f Hz, bins %d-%d/%d, taper=%d bins",
+                         lo_hz, hi_hz, bin_lo, bin_hi, N, TAPER_BINS);
+                logged_once = true;
+            }
+
+            // Apply per-bin gain mask
+            for (int k = 0; k < N; k++) {
+                // For real-valued passband signal, energy lives at positive bins
+                // [bin_lo..bin_hi] and Hermitian mirror [N-bin_hi..N-bin_lo].
+                float gain = 0.0f;
+
+                // Positive frequency range
+                if (k >= bin_lo && k <= bin_hi) {
+                    gain = 1.0f;
+                    // Raised-cosine taper at lower edge
+                    if (k < bin_lo + TAPER_BINS)
+                        gain = 0.5f * (1.0f - (float)std::cos(M_PI * (k - bin_lo + 1) / (TAPER_BINS + 1)));
+                    // Raised-cosine taper at upper edge
+                    if (k > bin_hi - TAPER_BINS)
+                        gain = std::min(gain, 0.5f * (1.0f - (float)std::cos(M_PI * (bin_hi - k + 1) / (TAPER_BINS + 1))));
+                }
+                // Hermitian mirror range
+                else if (k >= (N - bin_hi) && k <= (N - bin_lo)) {
+                    int mirror = N - k;  // corresponding positive bin
+                    gain = 1.0f;
+                    if (mirror < bin_lo + TAPER_BINS)
+                        gain = 0.5f * (1.0f - (float)std::cos(M_PI * (mirror - bin_lo + 1) / (TAPER_BINS + 1)));
+                    if (mirror > bin_hi - TAPER_BINS)
+                        gain = std::min(gain, 0.5f * (1.0f - (float)std::cos(M_PI * (bin_hi - mirror + 1) / (TAPER_BINS + 1))));
+                }
+                spectrum[k] *= gain;
+            }
+
+            // IFFT back to time domain
+            iris::ifft_complex(spectrum.data(), N);
+
+            // ifft_complex divides by N internally; scale by N to recover original amplitude
+            float scale = (float)N;
+            for (int i = 0; i < frame_len; i++)
+                frame[i] = spectrum[i] * scale;
+        }
+    }
 
     // ---- 14. Compute PAPR for logging ----
     float max_power = 0.0f;

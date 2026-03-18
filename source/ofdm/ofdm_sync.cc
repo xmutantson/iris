@@ -12,147 +12,280 @@
 namespace iris {
 
 // ---------------------------------------------------------------------------
-// Schmidl-Cox frame detection
+// Zadoff-Chu sequence generation
 // ---------------------------------------------------------------------------
+std::vector<std::complex<float>> generate_zc_sequence(int root, int length)
+{
+    std::vector<std::complex<float>> seq(length);
+    for (int n = 0; n < length; ++n) {
+        // x[n] = exp(-j * pi * root * n * (n+1) / length)
+        float phase = -(float)M_PI * root * n * (n + 1) / (float)length;
+        seq[n] = std::complex<float>(std::cos(phase), std::sin(phase));
+    }
+    return seq;
+}
+
+// ---------------------------------------------------------------------------
+// Generate time-domain ZC training symbol (nfft samples, no CP)
+// ---------------------------------------------------------------------------
+std::vector<std::complex<float>> generate_zc_training_symbol(const OfdmConfig& config,
+                                                              int root)
+{
+    const int nfft = config.nfft;
+    const int n_used = config.n_used_carriers;
+
+    // Generate ZC sequence in frequency domain for used carriers
+    auto zc_freq = generate_zc_sequence(root, n_used);
+
+    // Place into FFT bins
+    std::vector<std::complex<float>> X(nfft, std::complex<float>(0.0f, 0.0f));
+    for (int i = 0; i < n_used; ++i) {
+        int bin = config.used_carrier_bins[i];
+        X[bin] = zc_freq[i];
+    }
+
+    // IFFT to time domain (ifft_complex divides by nfft internally)
+    ifft_complex(X.data(), nfft);
+
+    // Normalize to unit RMS
+    float energy = 0.0f;
+    for (int n = 0; n < nfft; ++n) {
+        energy += std::norm(X[n]);
+    }
+    float rms = std::sqrt(energy / nfft);
+    if (rms > 1e-10f) {
+        float scale = 1.0f / rms;
+        for (int n = 0; n < nfft; ++n) {
+            X[n] *= scale;
+        }
+    }
+
+    return X;
+}
+
+// ---------------------------------------------------------------------------
+// ZC cross-correlation frame detection
+// ---------------------------------------------------------------------------
+
+// Detection threshold for ZC cross-correlation peak.
+// ZC has near-zero autocorrelation sidelobes, so we can use a lower threshold
+// than Schmidl-Cox (which was 0.55). Start at 0.40.
+static constexpr float DETECTION_THRESHOLD = 0.40f;
+
 OfdmSyncResult ofdm_detect_frame(const std::complex<float>* iq, int n_samples,
                                   const OfdmConfig& config)
 {
     OfdmSyncResult result;
-    const int L = config.nfft / 2;  // Half-symbol length
+    const int nfft = config.nfft;
+    const int cp = config.cp_samples;
+    const int symbol_len = nfft + cp;
 
-    // Need at least one full training symbol + CP to search
-    const int min_samples = config.cp_samples + config.nfft + L;
+    // Need at least two training symbols (train1 + train2) for detection + CFO
+    const int min_samples = 2 * symbol_len;
     if (n_samples < min_samples) {
         IRIS_LOG("[OFDM-SYNC] insufficient samples for detection: %d < %d",
                  n_samples, min_samples);
         return result;
     }
 
-    // Sliding window computation of P(d) and R(d)
-    // P(d) = sum_{m=0}^{L-1} r(d+m) * conj(r(d+m+L))
-    // R(d) = sum_{m=0}^{L-1} |r(d+m+L)|^2
-    // M(d) = |P(d)|^2 / R(d)^2
+    // Generate known ZC training symbol (time-domain, nfft samples)
+    // Cache it: config doesn't change between calls within a session.
+    static std::vector<std::complex<float>> zc_td;
+    static float zc_energy = 0.0f;
+    static int cached_nfft = 0;
+    static int cached_n_used = 0;
 
-    const int search_len = n_samples - 2 * L;
+    if (cached_nfft != nfft || cached_n_used != config.n_used_carriers) {
+        zc_td = generate_zc_training_symbol(config);
+        zc_energy = 0.0f;
+        for (int n = 0; n < nfft; ++n) {
+            zc_energy += std::norm(zc_td[n]);
+        }
+        cached_nfft = nfft;
+        cached_n_used = config.n_used_carriers;
+        IRIS_LOG("[OFDM-SYNC] ZC training symbol cached: nfft=%d, n_used=%d, energy=%.1f",
+                 nfft, config.n_used_carriers, zc_energy);
+    }
+
+    // Sliding normalized cross-correlation:
+    // metric[d] = |sum_n r[d+n] * conj(zc[n])| / sqrt(sum_n |r[d+n]|^2 * zc_energy)
+    //
+    // The correlation window is nfft samples. We search for the start of
+    // train1 (which includes CP before it, but we detect the symbol body).
+    // The frame_start we return is the position of the CP start, so the
+    // actual symbol body is at frame_start + cp.
+    //
+    // Search range: we look for the CP start, so the symbol body starts at d+cp.
+    // We need d+cp+nfft <= n_samples, i.e. d <= n_samples - cp - nfft.
+    const int search_len = n_samples - symbol_len - nfft; // leave room for train2
     if (search_len <= 0) {
         IRIS_LOG("[OFDM-SYNC] search range empty");
         return result;
     }
 
-    // Compute initial P, R (second-half energy), and E (first-half energy) for d=0
-    std::complex<float> P(0.0f, 0.0f);
-    float R = 0.0f;   // sum |r(d+m+L)|^2 for m=0..L-1
-    float E = 0.0f;   // sum |r(d+m)|^2   for m=0..L-1
-    for (int m = 0; m < L; ++m) {
-        P += iq[m] * std::conj(iq[m + L]);
-        R += std::norm(iq[m + L]);
-        E += std::norm(iq[m]);
+    // Compute initial signal energy for the first window at the symbol body position
+    // (d=0 means CP starts at 0, symbol body at cp)
+    float sig_energy = 0.0f;
+    for (int n = 0; n < nfft; ++n) {
+        sig_energy += std::norm(iq[cp + n]);
     }
 
-    // Detection strategy: find the FIRST position where M exceeds the threshold,
-    // then take that as frame_start (left edge of CP plateau). This prevents
-    // false detections from data symbols later in the buffer.
-    // Threshold 0.55: OTA real preambles produce M=0.65-0.80 with pre-emphasis
-    // compensation + PREAMBLE_BOOST. Probe remnants/noise peak at ~0.53.
-    // 0.45 caused ~5/sec false positive flood (perceived GUI freeze).
-    // 0.55 gives margin above noise while catching real preambles.
-    constexpr float DETECTION_THRESHOLD = 0.55f;
+    // Compute initial cross-correlation
+    std::complex<float> xcorr(0.0f, 0.0f);
+    for (int n = 0; n < nfft; ++n) {
+        xcorr += iq[cp + n] * std::conj(zc_td[n]);
+    }
 
-    int detect_d = -1;
-    float detect_metric = 0.0f;
-    std::complex<float> detect_P(0.0f, 0.0f);
-    float detect_R = 0.0f;
-    float peak_metric = 0.0f;  // Track max M for diagnostics
-    int peak_d = 0;
+    float peak_metric = 0.0f;
+    int peak_d = -1;
+    std::complex<float> peak_xcorr(0.0f, 0.0f);
 
-    // Evaluate at d=0
+    // Evaluate d=0
     {
-        float P_mag2 = std::norm(P);
-        float denom = E * R;
-        float M = (denom > 1e-20f) ? (P_mag2 / denom) : 0.0f;
-        if (M > peak_metric) { peak_metric = M; peak_d = 0; }
-        if (M >= DETECTION_THRESHOLD) {
-            detect_d = 0;
-            detect_metric = M;
-            detect_P = P;
-            detect_R = R;
+        float denom = sig_energy * zc_energy;
+        float metric = (denom > 1e-20f) ? (std::norm(xcorr) / denom) : 0.0f;
+        // metric is |xcorr|^2 / (sig_energy * zc_energy), so it's the squared
+        // normalized correlation. Take sqrt for the actual correlation coefficient.
+        metric = std::sqrt(metric);
+        if (metric > peak_metric) {
+            peak_metric = metric;
+            peak_d = 0;
+            peak_xcorr = xcorr;
         }
     }
 
-    if (detect_d < 0) {
-        // Slide until we find the first threshold crossing
-        for (int d = 1; d < search_len; ++d) {
-            P -= iq[d - 1] * std::conj(iq[d - 1 + L]);
-            P += iq[d + L - 1] * std::conj(iq[d + L - 1 + L]);
-            R -= std::norm(iq[d - 1 + L]);
-            R += std::norm(iq[d + L - 1 + L]);
-            E -= std::norm(iq[d - 1]);
-            E += std::norm(iq[d + L - 1]);
+    // Slide the window
+    for (int d = 1; d < search_len; ++d) {
+        // Update signal energy: remove sample leaving, add sample entering
+        int body_start = d + cp;
+        sig_energy -= std::norm(iq[body_start - 1]);
+        sig_energy += std::norm(iq[body_start + nfft - 1]);
 
-            float P_mag2 = std::norm(P);
-            float denom = E * R;
-            float M = (denom > 1e-20f) ? (P_mag2 / denom) : 0.0f;
-            if (M > peak_metric) { peak_metric = M; peak_d = d; }
+        // Update cross-correlation: remove old first sample, add new last sample
+        xcorr -= iq[body_start - 1] * std::conj(zc_td[0]);
 
-            if (M >= DETECTION_THRESHOLD) {
-                detect_d = d;
-                detect_metric = M;
-                detect_P = P;
-                detect_R = R;
-                break;
+        // Recompute cross-correlation (sliding update for cross-correlation with
+        // a non-trivial reference is not straightforward due to the conjugate
+        // reference shift). Instead, we use a two-pass approach: first find a
+        // coarse peak using a decimated search, then refine.
+        // Actually, for correctness, just recompute at each position.
+        // This is O(search_len * nfft) but nfft=512 and search_len is typically
+        // a few thousand, so ~1-2M multiplies -- fine at audio rates.
+        break; // Exit sliding approach, use direct computation below
+    }
+
+    // Direct computation approach (more correct than broken sliding update)
+    peak_metric = 0.0f;
+    peak_d = -1;
+
+    // Decimate search: step by cp/4 for coarse, then refine around peak
+    const int coarse_step = std::max(1, cp / 4);
+    float coarse_peak = 0.0f;
+    int coarse_peak_d = -1;
+
+    for (int d = 0; d < search_len; d += coarse_step) {
+        int body = d + cp;
+        std::complex<float> xc(0.0f, 0.0f);
+        float se = 0.0f;
+        for (int n = 0; n < nfft; ++n) {
+            xc += iq[body + n] * std::conj(zc_td[n]);
+            se += std::norm(iq[body + n]);
+        }
+        float denom = se * zc_energy;
+        float m = (denom > 1e-20f) ? std::sqrt(std::norm(xc) / denom) : 0.0f;
+        if (m > coarse_peak) {
+            coarse_peak = m;
+            coarse_peak_d = d;
+        }
+    }
+
+    // Refine: search sample-by-sample around coarse peak
+    if (coarse_peak_d >= 0 && coarse_peak > DETECTION_THRESHOLD * 0.7f) {
+        int refine_lo = std::max(0, coarse_peak_d - coarse_step);
+        int refine_hi = std::min(search_len - 1, coarse_peak_d + coarse_step);
+
+        for (int d = refine_lo; d <= refine_hi; ++d) {
+            int body = d + cp;
+            std::complex<float> xc(0.0f, 0.0f);
+            float se = 0.0f;
+            for (int n = 0; n < nfft; ++n) {
+                xc += iq[body + n] * std::conj(zc_td[n]);
+                se += std::norm(iq[body + n]);
+            }
+            float denom = se * zc_energy;
+            float m = (denom > 1e-20f) ? std::sqrt(std::norm(xc) / denom) : 0.0f;
+            if (m > peak_metric) {
+                peak_metric = m;
+                peak_d = d;
+                peak_xcorr = xc;
             }
         }
     }
 
-    if (detect_d < 0) {
-        // Log peak metric and sample count for threshold tuning
+    if (peak_d < 0 || peak_metric < DETECTION_THRESHOLD) {
         static int no_detect_count = 0;
         no_detect_count++;
-        // Log every 20th miss to avoid flooding, but always log if peak > 0.3
-        if (peak_metric > 0.30f || (no_detect_count % 20) == 1) {
-            IRIS_LOG("[OFDM-SYNC] no detection: peak_M=%.3f at d=%d/%d (threshold=%.2f, %d samples)",
+        if (peak_metric > 0.20f || (no_detect_count % 20) == 1) {
+            IRIS_LOG("[OFDM-SYNC] no detection: peak_metric=%.3f at d=%d/%d (threshold=%.2f, %d samples)",
                      peak_metric, peak_d, search_len, DETECTION_THRESHOLD, n_samples);
         }
         return result;
     }
 
-    result.schmidl_metric = detect_metric;
     result.detected = true;
-    result.frame_start = detect_d;
+    result.frame_start = peak_d;
+    result.schmidl_metric = peak_metric;
 
-    std::complex<float> best_P = detect_P;
-    float best_R = detect_R;
+    // -----------------------------------------------------------------------
+    // CFO estimation from phase difference between train1 and train2
+    // train1 body starts at peak_d + cp
+    // train2 body starts at peak_d + symbol_len + cp
+    // cfo_phase = angle(sum_n r[train2+n] * conj(r[train1+n])) for n=0..nfft-1
+    // cfo_hz = cfo_phase / (2*pi) * (sample_rate / nfft)
+    // -----------------------------------------------------------------------
+    {
+        int train1_body = peak_d + cp;
+        int train2_body = peak_d + symbol_len + cp;
 
-    // CFO estimation: cfo_hz = angle(P(d_peak)) * sample_rate / (2 * pi * L)
-    float phase = std::arg(best_P);
-    result.cfo_hz = phase * config.sample_rate / (2.0f * (float)M_PI * L);
-
-    // SNR estimate from Schmidl-Cox: SNR ~ |P|^2 / (R - |P|)^2
-    // More stable form: SNR ~ |P| / (R - |P|)
-    float P_mag = std::abs(best_P);
-    float denom = best_R - P_mag;
-    if (denom > 1e-10f) {
-        float snr_linear = P_mag / denom;
-        result.snr_est = 10.0f * std::log10(std::max(snr_linear, 1e-10f));
-    } else {
-        result.snr_est = 40.0f;  // Very high SNR
+        // Bounds check: need train2_body + nfft <= n_samples
+        if (train2_body + nfft <= n_samples) {
+            std::complex<float> cfo_corr(0.0f, 0.0f);
+            for (int n = 0; n < nfft; ++n) {
+                cfo_corr += iq[train2_body + n] * std::conj(iq[train1_body + n]);
+            }
+            float cfo_phase = std::arg(cfo_corr);
+            result.cfo_hz = cfo_phase / (2.0f * (float)M_PI) * ((float)config.sample_rate / nfft);
+        } else {
+            IRIS_LOG("[OFDM-SYNC] cannot estimate CFO: train2 out of bounds");
+            result.cfo_hz = 0.0f;
+        }
     }
 
-    IRIS_LOG("[OFDM-SYNC] Schmidl-Cox: M=%.4f at sample %d, CFO=%.1f Hz, SNR~%.1f dB",
-             detect_metric, detect_d, result.cfo_hz, result.snr_est);
+    // -----------------------------------------------------------------------
+    // SNR estimate: signal power from correlation peak, noise from residual
+    // SNR ~ peak_metric^2 / (1 - peak_metric^2)
+    // -----------------------------------------------------------------------
+    {
+        float m2 = peak_metric * peak_metric;
+        float snr_linear = (m2 < 0.999f) ? (m2 / (1.0f - m2)) : 1000.0f;
+        result.snr_est = 10.0f * std::log10(std::max(snr_linear, 1e-10f));
+    }
 
-    // M10: Track detection metric statistics for threshold tuning
+    IRIS_LOG("[OFDM-SYNC] ZC detect: metric=%.4f at sample %d, CFO=%.1f Hz, SNR~%.1f dB",
+             peak_metric, peak_d, result.cfo_hz, result.snr_est);
+
+    // Track detection statistics
     {
         static int detect_count = 0;
         static float metric_sum = 0.0f;
         static float metric_min = 1.0f;
         static float metric_max = 0.0f;
         detect_count++;
-        metric_sum += detect_metric;
-        metric_min = std::min(metric_min, detect_metric);
-        metric_max = std::max(metric_max, detect_metric);
+        metric_sum += peak_metric;
+        metric_min = std::min(metric_min, peak_metric);
+        metric_max = std::max(metric_max, peak_metric);
         if (detect_count % 50 == 0) {
-            IRIS_LOG("[OFDM-SYNC] detection stats: %d frames, M avg=%.3f min=%.3f max=%.3f",
+            IRIS_LOG("[OFDM-SYNC] detection stats: %d frames, metric avg=%.3f min=%.3f max=%.3f",
                      detect_count, metric_sum / detect_count, metric_min, metric_max);
         }
     }
@@ -181,7 +314,7 @@ void ofdm_correct_cfo(std::complex<float>* iq, int n_samples,
 }
 
 // ---------------------------------------------------------------------------
-// Channel estimation from training symbol 2
+// Channel estimation from training symbol (ZC-based)
 // ---------------------------------------------------------------------------
 OfdmChannelEst ofdm_estimate_channel(const std::complex<float>* iq_symbol,
                                       const OfdmConfig& config)
@@ -195,16 +328,22 @@ OfdmChannelEst ofdm_estimate_channel(const std::complex<float>* iq_symbol,
         return est;
     }
 
-    // FFT the received training symbol 2
+    // Generate ZC frequency-domain reference for used carriers
+    auto zc_freq = generate_zc_sequence(7, n_used);
+
+    // FFT the received training symbol
     std::vector<std::complex<float>> Y(N);
     std::copy(iq_symbol, iq_symbol + N, Y.begin());
     fft_complex(Y.data(), N);
 
-    // Extract H at used carrier bins: H[k] = Y[k] / X[k] = Y[k] (since X=+1)
+    // Extract H at used carrier bins: H[k] = Y[k] / X[k]
+    // where X[k] is the known ZC frequency-domain value
     est.H.resize(n_used);
     for (int i = 0; i < n_used; ++i) {
         int bin = config.used_carrier_bins[i];
-        est.H[i] = Y[bin];
+        // Division by ZC value: since |ZC[i]| = 1 (unit magnitude),
+        // H[i] = Y[bin] * conj(ZC[i]) / |ZC[i]|^2 = Y[bin] * conj(ZC[i])
+        est.H[i] = Y[bin] * std::conj(zc_freq[i]);
     }
 
     // Noise estimation: fit a local quadratic (7-tap window) to H across
@@ -214,8 +353,8 @@ OfdmChannelEst ofdm_estimate_channel(const std::complex<float>* iq_symbol,
     // gradient to noise, inflating noise_var at band edges by 6-10 dB.
     std::vector<std::complex<float>> H_smooth(n_used);
     {
-        // Local quadratic regression over a window of ±W carriers.
-        // For each carrier i, fit H(x) = a + b*x + c*x² to neighbors,
+        // Local quadratic regression over a window of +/-W carriers.
+        // For each carrier i, fit H(x) = a + b*x + c*x^2 to neighbors,
         // evaluate at x=0 to get H_smooth[i]. x is centered at i.
         // Using W=3 (7-tap window) balances noise averaging with slope tracking.
         constexpr int W = 3;
@@ -225,17 +364,16 @@ OfdmChannelEst ofdm_estimate_channel(const std::complex<float>* iq_symbol,
             int count = hi - lo + 1;
 
             if (count < 3) {
-                // Not enough points for quadratic — fall back to local mean
+                // Not enough points for quadratic -- fall back to local mean
                 std::complex<float> sum(0.0f, 0.0f);
                 for (int j = lo; j <= hi; ++j) sum += est.H[j];
                 H_smooth[i] = sum / (float)count;
             } else {
                 // Solve normal equations for quadratic fit (real and imag independently)
-                // Basis: 1, x, x² where x = j - i
-                // Sums: S0=n, S1=Σx, S2=Σx², S3=Σx³, S4=Σx⁴
+                // Basis: 1, x, x^2 where x = j - i
                 float S0 = 0, S1 = 0, S2 = 0, S3 = 0, S4 = 0;
-                float Yr0 = 0, Yr1 = 0, Yr2 = 0;  // real projections
-                float Yi0 = 0, Yi1 = 0, Yi2 = 0;  // imag projections
+                float Yr0 = 0, Yr1 = 0, Yr2 = 0;
+                float Yi0 = 0, Yi1 = 0, Yi2 = 0;
                 for (int j = lo; j <= hi; ++j) {
                     float x = (float)(j - i);
                     float x2 = x * x;
@@ -251,16 +389,12 @@ OfdmChannelEst ofdm_estimate_channel(const std::complex<float>* iq_symbol,
                     Yi1 += est.H[j].imag() * x;
                     Yi2 += est.H[j].imag() * x2;
                 }
-                // Normal equations: [S0 S1 S2; S1 S2 S3; S2 S3 S4] * [a;b;c] = [Y0;Y1;Y2]
-                // We only need a (the constant term = value at x=0).
-                // Cramer's rule for a:
                 float D = S0*(S2*S4 - S3*S3) - S1*(S1*S4 - S3*S2) + S2*(S1*S3 - S2*S2);
                 if (std::abs(D) > 1e-12f) {
                     float Dr_a = Yr0*(S2*S4-S3*S3) - S1*(Yr1*S4-Yr2*S3) + S2*(Yr1*S3-Yr2*S2);
                     float Di_a = Yi0*(S2*S4-S3*S3) - S1*(Yi1*S4-Yi2*S3) + S2*(Yi1*S3-Yi2*S2);
                     H_smooth[i] = std::complex<float>(Dr_a / D, Di_a / D);
                 } else {
-                    // Degenerate — fall back to center value
                     H_smooth[i] = est.H[i];
                 }
             }
@@ -280,8 +414,7 @@ OfdmChannelEst ofdm_estimate_channel(const std::complex<float>* iq_symbol,
         std::complex<float> residual = est.H[i] - H_smooth[i];
         est.noise_var[i] = std::norm(residual);
 
-        // Floor noise variance: 1e-6 caps per-carrier SNR at ~60 dB,
-        // preventing MMSE equalizer from amplifying faded carriers
+        // Floor noise variance: 1e-6 caps per-carrier SNR at ~60 dB
         if (est.noise_var[i] < 1e-6f)
             est.noise_var[i] = 1e-6f;
 
@@ -326,7 +459,7 @@ void ofdm_update_channel(OfdmChannelEst& est,
     }
 
     // Compute noise variance BEFORE IIR update (residual = H_new - H_old).
-    // Computing after IIR would underestimate by factor (1-alpha)² ≈ 0.49.
+    // Computing after IIR would underestimate by factor (1-alpha)^2.
     float snr_sum_db = 0.0f;
     for (int i = 0; i < n_used; ++i) {
         std::complex<float> residual = H_new[i] - est.H[i];
@@ -417,16 +550,11 @@ void ofdm_interpolate_pilots(OfdmChannelEst& est,
     }
 
     // Compute pilot noise_var BEFORE IIR update (residual vs current estimate).
-    // After IIR, residual would be attenuated by (1-alpha), underestimating noise.
-    //
     // M9: Separate noise from channel variation (Doppler).
-    // Compute mean phase rotation across all pilots weighted by |H_old|²,
-    // then remove it before computing residuals. This prevents common Doppler
-    // shift from inflating the noise variance estimate.
     std::complex<float> phase_acc(0.0f, 0.0f);
     for (int j = 0; j < (int)pilots.size(); ++j) {
         int idx = pilots[j].used_idx;
-        float w = std::norm(est.H[idx]);  // |H_old|² weight
+        float w = std::norm(est.H[idx]);
         phase_acc += w * (pilots[j].H * std::conj(est.H[idx]));
     }
     float mean_phase_rot = std::arg(phase_acc);
@@ -436,16 +564,13 @@ void ofdm_interpolate_pilots(OfdmChannelEst& est,
     std::vector<float> pilot_nv(pilots.size());
     for (int j = 0; j < (int)pilots.size(); ++j) {
         int idx = pilots[j].used_idx;
-        // Remove common phase rotation before computing residual
         std::complex<float> residual = pilots[j].H * phase_correction - est.H[idx];
         pilot_nv[j] = std::norm(residual);
         if (pilot_nv[j] < 1e-6f)
             pilot_nv[j] = std::max(1e-6f, est.noise_var[idx]);
     }
 
-    // IIR blend pilot-interpolated H with existing estimate.
-    // alpha=0.3 default: slowly track time-varying channels without
-    // destroying the training-based estimate from noisy comb pilots.
+    // IIR blend
     for (int i = 0; i < n_used; ++i) {
         est.H[i] = alpha * H_new[i] + (1.0f - alpha) * est.H[i];
     }
@@ -484,12 +609,7 @@ void ofdm_interpolate_pilots(OfdmChannelEst& est,
 }
 
 // ---------------------------------------------------------------------------
-// Fine CFO estimation from training symbol 2 pilot phases
-//
-// After coarse CFO correction, H[k] = Y[k]/X[k] = Y[k] (X=+1) should have
-// zero phase if CFO=0. Any residual CFO causes a linear phase slope across
-// frequency: phase(H[k]) ≈ 2π * Δf * (bin[k] / sample_rate).
-// We estimate Δf via weighted linear regression of unwrapped phases.
+// Fine CFO estimation from training symbol
 // ---------------------------------------------------------------------------
 float ofdm_estimate_fine_cfo(const OfdmChannelEst& est, const OfdmConfig& config)
 {
@@ -497,12 +617,12 @@ float ofdm_estimate_fine_cfo(const OfdmChannelEst& est, const OfdmConfig& config
     if (n_used < 4 || (int)est.H.size() != n_used) return 0.0f;
 
     // CFO manifests as a common phase rotation on all subcarriers:
-    // phase(H[k]) = 2π * Δf * nfft / Fs
+    // phase(H[k]) = 2*pi * delta_f * nfft / Fs
     // Weighted mean phase (by |H|^2) gives robust estimate.
     float sum_wp = 0.0f;
     float sum_w2 = 0.0f;
     for (int i = 0; i < n_used; i++) {
-        float w = std::norm(est.H[i]);  // |H|^2
+        float w = std::norm(est.H[i]);
         if (w < 1e-12f) continue;
         sum_wp += w * std::arg(est.H[i]);
         sum_w2 += w;
