@@ -61,7 +61,7 @@ public:
 private:
     int current_level_;
     int max_level_;
-    int ofdm_level_;             // Current OFDM O-level (O0-O3)
+    int ofdm_level_;             // Current OFDM O-level (O0-O7)
     int max_ofdm_level_;
     bool locked_ = false;
     bool initialized_ = false;
@@ -70,9 +70,9 @@ private:
     int fail_count_;       // Consecutive CRC failures
     float ldpc_boost_;     // SNR bonus from easy LDPC convergence
     int cooldown_;         // Frames to suppress upshift after failure-driven downshift
-    static constexpr int HOLD_FRAMES = 4;    // Hold this many frames before upshift
+    static constexpr int HOLD_FRAMES = 6;    // Hold this many frames before upshift (conservative for FM)
     static constexpr int FAIL_THRESHOLD = 2;  // Downshift after this many failures
-    static constexpr int COOLDOWN_FRAMES = 3; // Suppress upshift after failure downshift (was 8)
+    static constexpr int COOLDOWN_FRAMES = 8; // Suppress upshift after failure downshift
     static constexpr float SNR_ALPHA = 0.3f;  // Smoothing factor
 
     std::string cache_dir_;

@@ -49,6 +49,12 @@ public:
     // Local capability flags to embed in probe result
     void set_local_caps(uint16_t caps) { local_caps_ = caps; }
 
+    // OFDM PHY config to embed in probe result for parameter negotiation
+    void set_local_ofdm_config(uint8_t cp, uint8_t pilot_carrier, uint8_t pilot_symbol, uint8_t nfft_code) {
+        ofdm_cp_ = cp; ofdm_pilot_carrier_ = pilot_carrier;
+        ofdm_pilot_symbol_ = pilot_symbol; ofdm_nfft_code_ = nfft_code;
+    }
+
 private:
     void generate_and_send_probe();
     void analyze_captured();
@@ -81,6 +87,12 @@ private:
     bool has_results_ = false;
 
     uint16_t local_caps_ = 0;  // Embedded in probe result for peer capability exchange
+
+    // OFDM PHY config (embedded in probe result for parameter negotiation)
+    uint8_t ofdm_cp_ = 64;
+    uint8_t ofdm_pilot_carrier_ = 4;
+    uint8_t ofdm_pilot_symbol_ = 14;
+    uint8_t ofdm_nfft_code_ = 0;  // 0=512
 };
 
 } // namespace iris

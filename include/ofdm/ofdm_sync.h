@@ -35,8 +35,9 @@ std::vector<std::complex<float>> generate_zc_sequence(int root, int length);
 std::vector<std::complex<float>> generate_zc_training_symbol(const OfdmConfig& config,
                                                               int root = 7);
 
-// Detect OFDM frame using Zadoff-Chu cross-correlation on training symbol 1.
-// Searches through baseband IQ samples for the ZC training pattern.
+// Detect OFDM frame using hybrid Schmidl-Cox + ZC detection.
+// Schmidl-Cox autocorrelation (train1 vs train2) for channel-invariant detection,
+// then ZC cross-correlation for precise timing refinement.
 // Returns detection result with timing, CFO, and SNR estimates.
 OfdmSyncResult ofdm_detect_frame(const std::complex<float>* iq, int n_samples,
                                   const OfdmConfig& config);

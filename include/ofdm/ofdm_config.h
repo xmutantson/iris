@@ -10,7 +10,7 @@ namespace iris {
 struct OfdmConfig {
     // Core parameters
     int nfft = 512;                    // FFT size (256/512/1024)
-    int cp_samples = 64;               // Cyclic prefix length in samples
+    int cp_samples = 64;               // Cyclic prefix length in samples (1.33ms, safe for all radios)
     int sample_rate = 48000;           // Fixed
 
     // Derived from probe
@@ -32,14 +32,14 @@ struct OfdmConfig {
 
     // Pilot pattern
     int pilot_carrier_spacing = 4;     // Every Nth used carrier — comb pilots for CPE + interpolation
-    int pilot_symbol_spacing = 14;     // Every Mth OFDM symbol is all-pilot (FM: slow fading, 14*12ms=168ms)
+    int pilot_symbol_spacing = 14;     // Every Mth OFDM symbol is all-pilot (block pilots for channel tracking)
 
     // FM TX de-emphasis: attenuate higher carriers on TX so that after the
     // radio's own pre-emphasis the signal is flat entering the deviation limiter.
     // NBFM mic/speaker: 300 Hz (530us time constant, TIA/EIA-603)
     // FM broadcast (75us): 2120 Hz. Set to 0 to disable (flat audio data port).
     float fm_preemph_corner_hz = 300.0f;
-    float fm_preemph_gain_cap = 3.0f;  // Max de-emphasis ratio (3 = −9.5 dB floor)
+    float fm_preemph_gain_cap = 10.0f; // Max de-emphasis ratio (10 = −20 dB floor, handles 6 kHz BW)
 
     // Header
     int n_header_symbols = 0;          // No header — config pre-negotiated (Mercury approach)

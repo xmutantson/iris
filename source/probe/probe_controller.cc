@@ -303,6 +303,10 @@ void ProbeController::generate_and_send_probe() {
 void ProbeController::send_result(const ProbeResult& r) {
     ProbeResult r_with_caps = r;
     r_with_caps.capabilities = local_caps_;
+    r_with_caps.ofdm_cp_samples = ofdm_cp_;
+    r_with_caps.ofdm_pilot_carrier_spacing = ofdm_pilot_carrier_;
+    r_with_caps.ofdm_pilot_symbol_spacing = ofdm_pilot_symbol_;
+    r_with_caps.ofdm_nfft_code = ofdm_nfft_code_;
     auto encoded = probe_result_encode(r_with_caps);
     std::vector<uint8_t> msg;
     msg.reserve(1 + encoded.size());

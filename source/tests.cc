@@ -26,6 +26,7 @@
 #include "ofdm/ofdm_demod.h"
 #include "ofdm/ofdm_sync.h"
 #include "ofdm/ofdm_frame.h"
+#include "ofdm/ofdm_papr.h"
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -553,6 +554,11 @@ static void test_ofdm_phy_roundtrip() {
     printf("  Frame: %zu complex samples (%.1f ms)\n",
            iq.size(), 1000.0f * iq.size() / 48000.0f);
 
+    // --- Verify PAPR after Hilbert clipper ---
+    float papr = compute_papr_db(iq);
+    printf("  PAPR = %.1f dB (target <= 8.0 dB)\n", papr);
+    check("PAPR reduced to <= 8.0 dB", papr <= 8.0f);
+
     // --- Verify Hermitian symmetry: imaginary parts should be near zero ---
     float max_imag = 0;
     for (auto& s : iq) {
@@ -948,8 +954,8 @@ int run_tests() {
         for (int i = 0; i < 20; i++) gs.update(35.0f);
         check("High SNR -> level > 0", gs.current_level() > 0);
 
-        // Feed low SNR — should drop
-        for (int i = 0; i < 5; i++) gs.update(2.0f);
+        // Feed low SNR — should drop (needs enough frames to drain smoothed SNR)
+        for (int i = 0; i < 30; i++) gs.update(2.0f);
         check("Low SNR -> level 0", gs.current_level() == 0);
     }
 
@@ -1964,15 +1970,19 @@ int run_tests() {
         check("Probe high_hz near 4500", result.high_hz >= 4400.0f && result.high_hz <= 4600.0f);
     }
 
-    // Probe result encode/decode (v3 wire format with tone powers)
+    // Probe result encode/decode (v4 wire format with tone powers + OFDM config)
     {
-        printf("\n=== Probe Wire Format v3 ===\n");
+        printf("\n=== Probe Wire Format v4 ===\n");
         ProbeResult tx_result;
         tx_result.low_hz = 350.0f;
         tx_result.high_hz = 3050.0f;
         tx_result.tones_detected = 42;
         tx_result.valid = true;
         tx_result.capabilities = 0x001F;  // all caps
+        tx_result.ofdm_cp_samples = 64;
+        tx_result.ofdm_pilot_carrier_spacing = 4;
+        tx_result.ofdm_pilot_symbol_spacing = 14;
+        tx_result.ofdm_nfft_code = 0;  // 512
 
         // Set up realistic tone data
         for (int k = 0; k < PassbandProbeConfig::N_TONES; k++) {
@@ -1987,16 +1997,20 @@ int run_tests() {
         }
 
         auto encoded = probe_result_encode(tx_result);
-        // v3 = 19 base + 2 caps + 64 tone powers = 85 bytes
-        check("Probe v3 encode size = 85", (int)encoded.size() == 85);
+        // v4 = 19 base + 2 caps + 64 tone powers + 4 ofdm config = 89 bytes
+        check("Probe v4 encode size = 89", (int)encoded.size() == 89);
 
         ProbeResult decoded;
         bool ok = probe_result_decode(encoded.data(), encoded.size(), decoded);
-        check("Probe v3 decode succeeds", ok);
-        check("Probe v3 low_hz matches", std::abs(decoded.low_hz - tx_result.low_hz) < 0.01f);
-        check("Probe v3 high_hz matches", std::abs(decoded.high_hz - tx_result.high_hz) < 0.01f);
-        check("Probe v3 tones_detected matches", decoded.tones_detected == tx_result.tones_detected);
-        check("Probe v3 capabilities matches", decoded.capabilities == tx_result.capabilities);
+        check("Probe v4 decode succeeds", ok);
+        check("Probe v4 low_hz matches", std::abs(decoded.low_hz - tx_result.low_hz) < 0.01f);
+        check("Probe v4 high_hz matches", std::abs(decoded.high_hz - tx_result.high_hz) < 0.01f);
+        check("Probe v4 tones_detected matches", decoded.tones_detected == tx_result.tones_detected);
+        check("Probe v4 capabilities matches", decoded.capabilities == tx_result.capabilities);
+        check("Probe v4 ofdm_cp", decoded.ofdm_cp_samples == 64);
+        check("Probe v4 ofdm_pilot_carrier", decoded.ofdm_pilot_carrier_spacing == 4);
+        check("Probe v4 ofdm_pilot_symbol", decoded.ofdm_pilot_symbol_spacing == 14);
+        check("Probe v4 ofdm_nfft_code", decoded.ofdm_nfft_code == 0);
 
         // Check tone powers survived quantization (0.5 dB resolution)
         float max_power_err = 0;
@@ -2004,7 +2018,7 @@ int run_tests() {
             float err = std::abs(decoded.tone_power_db[k] - tx_result.tone_power_db[k]);
             if (err > max_power_err) max_power_err = err;
         }
-        check("Probe v3 tone powers within 0.5 dB", max_power_err <= 0.5f);
+        check("Probe v4 tone powers within 0.5 dB", max_power_err <= 0.5f);
 
         // Bitmap round-trip
         bool bitmap_match = true;
@@ -2013,10 +2027,10 @@ int run_tests() {
                 bitmap_match = false; break;
             }
         }
-        check("Probe v3 bitmap round-trip", bitmap_match);
+        check("Probe v4 bitmap round-trip", bitmap_match);
     }
 
-    // Backward compatibility: decode old v2 packet (no tone powers)
+    // Backward compatibility: decode old v2 packet (no tone powers, no OFDM config)
     {
         printf("\n=== Probe Wire Format Backward Compat ===\n");
         ProbeResult tx_result;
@@ -2046,6 +2060,39 @@ int run_tests() {
             if (decoded.tone_power_db[k] != 0.0f) { powers_zero = false; break; }
         }
         check("Old v2 tone powers = 0 (no EQ)", powers_zero);
+
+        // OFDM config should be 0 (old peer, use defaults)
+        check("Old v2 ofdm_cp = 0", decoded.ofdm_cp_samples == 0);
+        check("Old v2 ofdm_pilot_carrier = 0", decoded.ofdm_pilot_carrier_spacing == 0);
+        check("Old v2 ofdm_pilot_symbol = 0", decoded.ofdm_pilot_symbol_spacing == 0);
+        check("Old v2 ofdm_nfft_code = 0", decoded.ofdm_nfft_code == 0);
+    }
+
+    // Backward compatibility: decode old v3 packet (tone powers but no OFDM config)
+    {
+        printf("\n=== Probe Wire Format v3 Backward Compat ===\n");
+        ProbeResult tx_result;
+        tx_result.low_hz = 400.0f;
+        tx_result.high_hz = 2800.0f;
+        tx_result.tones_detected = 35;
+        tx_result.valid = true;
+        tx_result.capabilities = 0x0203;  // CAP_OFDM + others
+        tx_result.ofdm_cp_samples = 32;   // will be in full encode but truncated
+        for (int k = 0; k < PassbandProbeConfig::N_TONES; k++) {
+            tx_result.tone_detected[k] = (k >= 2 && k <= 40);
+            tx_result.tone_power_db[k] = -15.0f;
+        }
+
+        auto full = probe_result_encode(tx_result);
+        // Simulate v3 peer: truncate to 85 bytes (no OFDM config)
+        std::vector<uint8_t> v3_wire(full.begin(), full.begin() + 85);
+
+        ProbeResult decoded;
+        bool ok = probe_result_decode(v3_wire.data(), v3_wire.size(), decoded);
+        check("Old v3 decode succeeds", ok);
+        check("Old v3 capabilities", decoded.capabilities == 0x0203);
+        check("Old v3 ofdm_cp = 0 (not present)", decoded.ofdm_cp_samples == 0);
+        check("Old v3 ofdm_pilot_carrier = 0", decoded.ofdm_pilot_carrier_spacing == 0);
     }
 
     // Channel Equalizer: flatten synthetic FM de-emphasis

@@ -19,8 +19,9 @@ struct SpeedLevel {
 constexpr int NUM_SPEED_LEVELS = 8;
 extern const SpeedLevel SPEED_LEVELS[NUM_SPEED_LEVELS];
 
-// OFDM O-level speed levels (FEC-rate-only, modulation set by waterfilling)
-constexpr int NUM_OFDM_SPEED_LEVELS = 4;
+// OFDM O-level speed levels (uniform preset modulation + FEC rate).
+// Maps 1:1 to kUniformPresets[] in ofdm_frame.cc (preset_id = level + 1).
+constexpr int NUM_OFDM_SPEED_LEVELS = 8;
 extern const SpeedLevel OFDM_SPEED_LEVELS[NUM_OFDM_SPEED_LEVELS];
 
 // Get the speed level index appropriate for a given SNR

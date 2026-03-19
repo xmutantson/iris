@@ -1,4 +1,5 @@
 #include "ofdm/ofdm_mod.h"
+#include "ofdm/ofdm_papr.h"    // ofdm_papr_clip()
 #include "ofdm/ofdm_sync.h"    // generate_zc_training_symbol()
 #include "common/fft.h"
 #include "common/logging.h"
@@ -629,17 +630,18 @@ std::vector<std::complex<float>> OfdmModulator::build_ofdm_frame(
     // Tail
     frame.insert(frame.end(), tail.begin(), tail.end());
 
-    // ---- 13. PAPR management ----
-    // Soft clipping is DISABLED: it corrupts pilot symbols (both comb pilots
-    // in data symbols and block pilot symbols), destroying channel estimation.
-    // The receiver's CPE tracker sees 80°+ phase errors after the first block
-    // pilot update because the clipped pilot values don't match the reference.
+    // ---- 13. PAPR reduction (Hilbert clipper) ----
+    // Clip time-domain amplitude to 7 dB PAPR, then per-symbol bandpass
+    // filter to remove OOB regrowth, iterate 4×. This reduces peaks from
+    // ~16-19 dB PAPR to ~7 dB so the signal survives the FM radio's
+    // deviation limiter without hard clipping.
     //
-    // The FM radio's deviation limiter handles amplitude control. The TX should
-    // send the linear OFDM signal and let the radio clip naturally — the
-    // receiver is designed to handle the resulting distortion via its channel
-    // estimation and LDPC FEC.
-    int n_clipped = 0;
+    // Unlike the old soft clipper (which corrupted pilots because it didn't
+    // filter OOB regrowth), the Hilbert clipper preserves in-band signal
+    // structure: pilots and data carriers remain valid at the cost of ~1 dB
+    // EVM penalty (acceptable tradeoff vs 15+ dB loss from deviation clipping).
+    auto papr_result = ofdm_papr_clip(frame, config_, 7.0f, 4);
+    int n_clipped = papr_result.n_clipped_samples;
 
     // ---- 13b. TX bandpass filter ----
     // DISABLED: frame-level FFT windowing creates spectral leakage between OFDM
@@ -713,21 +715,11 @@ std::vector<std::complex<float>> OfdmModulator::build_ofdm_frame(
         }
     }
 
-    // ---- 14. Compute PAPR for logging ----
-    float max_power = 0.0f;
-    float mean_power = 0.0f;
-    for (auto& s : frame) {
-        float p = std::norm(s);  // |s|^2
-        if (p > max_power) max_power = p;
-        mean_power += p;
-    }
-    mean_power /= (float)frame.size();
-    float papr_db = (mean_power > 0.0f)
-        ? 10.0f * std::log10(max_power / mean_power) : 0.0f;
-
-    IRIS_LOG("[OFDM-TX] frame: %d OFDM syms, %d bytes, PAPR=%.1f dB, %d clipped, NUC=%s",
-             total_ofdm_symbols, (int)len, papr_db, n_clipped,
-             tone_map.use_nuc ? "ON" : "off");
+    // ---- 14. Log frame stats ----
+    IRIS_LOG("[OFDM-TX] frame: %d OFDM syms, %d bytes, PAPR=%.1f->%.1f dB, %d clipped, NUC=%s",
+             total_ofdm_symbols, (int)len,
+             papr_result.papr_before_db, papr_result.papr_after_db,
+             n_clipped, tone_map.use_nuc ? "ON" : "off");
 
     return frame;
 }

@@ -82,13 +82,21 @@ std::vector<std::complex<float>> generate_zc_training_symbol(const OfdmConfig& c
 }
 
 // ---------------------------------------------------------------------------
-// ZC cross-correlation frame detection
+// Hybrid Schmidl-Cox + ZC frame detection
+// ---------------------------------------------------------------------------
+// Schmidl-Cox autocorrelation for DETECTION (channel-invariant):
+//   Correlates train1 body with train2 body (identical ZC sequences).
+//   Both pass through the same channel, so distortion cancels out.
+//   Works regardless of radio frequency response differences.
+// ZC cross-correlation for TIMING REFINEMENT (sharp peak):
+//   After SC detection, ZC xcorr pinpoints exact frame start within ±cp.
 // ---------------------------------------------------------------------------
 
-// Detection threshold for ZC cross-correlation peak.
-// ZC has near-zero autocorrelation sidelobes, so we can use a lower threshold
-// than Schmidl-Cox (which was 0.55). Start at 0.40.
-static constexpr float DETECTION_THRESHOLD = 0.40f;
+// SC detection threshold.  SC metric for identical training symbols:
+//   M ≈ (SNR/(SNR+1))² → ~0.82 at 10 dB, ~0.64 at 5 dB, ~0.25 at 0 dB.
+// Noise-only: M ≈ 1/nfft ≈ 0.002.  Data symbols: ~0.01-0.05 (no repetition).
+// Threshold 0.40 detects signals down to ~3 dB with wide margin above noise.
+static constexpr float SC_DETECTION_THRESHOLD = 0.40f;
 
 // Helper: next power of 2 >= n
 static int next_pow2(int n) {
@@ -105,7 +113,7 @@ OfdmSyncResult ofdm_detect_frame(const std::complex<float>* iq, int n_samples,
     const int cp = config.cp_samples;
     const int symbol_len = nfft + cp;
 
-    // Need at least two training symbols (train1 + train2) for detection + CFO
+    // Need at least two training symbols for SC detection + CFO
     const int min_samples = 2 * symbol_len;
     if (n_samples < min_samples) {
         IRIS_LOG("[OFDM-SYNC] insufficient samples for detection: %d < %d",
@@ -114,14 +122,12 @@ OfdmSyncResult ofdm_detect_frame(const std::complex<float>* iq, int n_samples,
     }
 
     // -----------------------------------------------------------------------
-    // Cache ZC training symbol AND its conjugate FFT (padded to seg_size)
+    // Cache ZC training symbol for timing refinement
     // -----------------------------------------------------------------------
     static std::vector<std::complex<float>> zc_td;
     static float zc_energy = 0.0f;
     static int cached_nfft = 0;
     static int cached_n_used = 0;
-    static int seg_size = 0;   // FFT segment size (power of 2 >= 2*nfft)
-    static std::vector<std::complex<float>> zc_conj_fft; // conj(FFT(zc_td, seg_size))
 
     if (cached_nfft != nfft || cached_n_used != config.n_used_carriers) {
         zc_td = generate_zc_training_symbol(config);
@@ -129,114 +135,119 @@ OfdmSyncResult ofdm_detect_frame(const std::complex<float>* iq, int n_samples,
         for (int n = 0; n < nfft; ++n) {
             zc_energy += std::norm(zc_td[n]);
         }
-
-        // Compute FFT segment size: power of 2 >= 2*nfft (for linear correlation)
-        seg_size = next_pow2(2 * nfft);
-        if (seg_size < 4096) seg_size = 4096; // minimum for efficiency
-
-        // Pad ZC to seg_size, compute FFT, then conjugate
-        zc_conj_fft.assign(seg_size, std::complex<float>(0.0f, 0.0f));
-        for (int n = 0; n < nfft; ++n) {
-            zc_conj_fft[n] = zc_td[n];
-        }
-        fft_complex(zc_conj_fft.data(), seg_size);
-        for (int n = 0; n < seg_size; ++n) {
-            zc_conj_fft[n] = std::conj(zc_conj_fft[n]);
-        }
-
         cached_nfft = nfft;
         cached_n_used = config.n_used_carriers;
-        IRIS_LOG("[OFDM-SYNC] ZC training symbol cached: nfft=%d, n_used=%d, energy=%.1f, seg_size=%d",
-                 nfft, config.n_used_carriers, zc_energy, seg_size);
+        IRIS_LOG("[OFDM-SYNC] ZC training symbol cached: nfft=%d, n_used=%d, energy=%.1f",
+                 nfft, config.n_used_carriers, zc_energy);
     }
 
-    // Search range: d is CP start, body at d+cp, need d+cp+nfft <= n_samples
-    // Also leave room for train2: need d + 2*symbol_len <= n_samples
-    const int search_len = n_samples - symbol_len - nfft; // leave room for train2
+    // Search range: d is CP start of train1, need d + 2*symbol_len <= n_samples
+    const int search_len = n_samples - 2 * symbol_len;
     if (search_len <= 0) {
         IRIS_LOG("[OFDM-SYNC] search range empty");
         return result;
     }
 
-    // The correlation maps body position (d+cp) to lag.
-    const int body_offset = cp; // body = d + cp
-
     // -----------------------------------------------------------------------
-    // FFT-based cross-correlation in overlapping segments
+    // Phase 1: Schmidl-Cox autocorrelation — coarse search at stride cp
     // -----------------------------------------------------------------------
-    // Each segment of seg_size input samples yields (seg_size - nfft + 1) valid
-    // correlation lags. Overlap by nfft-1 to cover all lags.
-    const int valid_per_seg = seg_size - nfft + 1;
+    // Correlate train1 body [d+cp, d+cp+nfft) with train2 body [d+cp+sym_len, ...)
+    // M(d) = |P(d)|² / (A(d) · R(d))   [Cauchy-Schwarz normalized, 0..1]
+    // Energy weighting: W(d) = M(d) · (A(d) + R(d))  [rejects silence]
 
-    float peak_metric = 0.0f;
-    int peak_d = -1;
-    std::complex<float> peak_xcorr(0.0f, 0.0f);
+    float sc_best_metric = 0.0f;
+    float sc_best_weighted = 0.0f;
+    int sc_best_d = -1;
 
-    // We also need running signal energy for normalization.
-    // Compute it per-candidate in the refine pass only (cheap after FFT narrows candidates).
+    const int coarse_stride = std::max(1, cp);  // stride = CP width (32 samples typical)
 
-    // Scratch buffer (static to avoid reallocation)
-    static std::vector<std::complex<float>> seg_buf;
+    for (int d = 0; d < search_len; d += coarse_stride) {
+        const int body1 = d + cp;
+        const int body2 = d + symbol_len + cp;
 
-    if ((int)seg_buf.size() != seg_size) {
-        seg_buf.resize(seg_size);
+        std::complex<float> P(0.0f, 0.0f);
+        float A = 0.0f;
+        float R = 0.0f;
+
+        for (int n = 0; n < nfft; ++n) {
+            P += std::conj(iq[body1 + n]) * iq[body2 + n];
+            A += std::norm(iq[body1 + n]);
+            R += std::norm(iq[body2 + n]);
+        }
+
+        float denom = A * R;
+        float M = (denom > 1e-20f) ? (std::norm(P) / denom) : 0.0f;
+        float W = M * (A + R);  // energy-weighted metric (rejects silence)
+
+        if (W > sc_best_weighted) {
+            sc_best_weighted = W;
+            sc_best_metric = M;
+            sc_best_d = d;
+        }
     }
 
-    // Coarse pass: find the best correlation magnitude across all segments.
-    // We process overlapping segments of the input starting from body positions.
-    // body_pos = search_start + body_offset is where the first segment starts in iq[].
-    // Each valid lag l in [0, valid_per_seg) corresponds to d = seg_d_start + l
-    // where body = d + cp = seg_input_start + l.
+    // -----------------------------------------------------------------------
+    // Phase 2: Schmidl-Cox fine search at stride 1 around coarse peak
+    // -----------------------------------------------------------------------
+    if (sc_best_d >= 0 && sc_best_metric >= SC_DETECTION_THRESHOLD * 0.5f) {
+        int fine_lo = std::max(0, sc_best_d - coarse_stride);
+        int fine_hi = std::min(search_len - 1, sc_best_d + coarse_stride);
 
-    float coarse_best_mag2 = 0.0f;
-    int coarse_best_d = -1;
+        for (int d = fine_lo; d <= fine_hi; ++d) {
+            const int body1 = d + cp;
+            const int body2 = d + symbol_len + cp;
 
-    for (int seg_d = 0; seg_d < search_len; seg_d += valid_per_seg) {
-        int seg_body_start = seg_d + body_offset; // where this segment reads from iq[]
-        int seg_input_len = std::min(seg_size, n_samples - seg_body_start);
-        if (seg_input_len < nfft) break; // not enough samples for even one correlation
+            std::complex<float> P(0.0f, 0.0f);
+            float A = 0.0f;
+            float R = 0.0f;
 
-        // Copy input segment, zero-pad remainder
-        for (int i = 0; i < seg_input_len; ++i) {
-            seg_buf[i] = iq[seg_body_start + i];
-        }
-        for (int i = seg_input_len; i < seg_size; ++i) {
-            seg_buf[i] = std::complex<float>(0.0f, 0.0f);
-        }
+            for (int n = 0; n < nfft; ++n) {
+                P += std::conj(iq[body1 + n]) * iq[body2 + n];
+                A += std::norm(iq[body1 + n]);
+                R += std::norm(iq[body2 + n]);
+            }
 
-        // FFT of input segment
-        fft_complex(seg_buf.data(), seg_size);
+            float denom = A * R;
+            float M = (denom > 1e-20f) ? (std::norm(P) / denom) : 0.0f;
+            float W = M * (A + R);
 
-        // Multiply by conjugate FFT of ZC reference (= correlation in freq domain)
-        for (int i = 0; i < seg_size; ++i) {
-            seg_buf[i] *= zc_conj_fft[i];
-        }
-
-        // IFFT to get correlation lags
-        ifft_complex(seg_buf.data(), seg_size);
-
-        // Scan valid lags for peaks (only lags where full nfft overlap exists)
-        int n_valid = std::min(valid_per_seg, seg_input_len - nfft + 1);
-        // Also constrain to search_len
-        n_valid = std::min(n_valid, search_len - seg_d);
-
-        for (int l = 0; l < n_valid; ++l) {
-            float mag2 = std::norm(seg_buf[l]);
-            if (mag2 > coarse_best_mag2) {
-                coarse_best_mag2 = mag2;
-                coarse_best_d = seg_d + l;
+            if (W > sc_best_weighted) {
+                sc_best_weighted = W;
+                sc_best_metric = M;
+                sc_best_d = d;
             }
         }
     }
 
     // -----------------------------------------------------------------------
-    // Refine: sample-by-sample normalized correlation around the coarse peak
+    // Threshold check
     // -----------------------------------------------------------------------
-    if (coarse_best_d >= 0) {
-        // Compute normalized metric at coarse peak and neighbors (+/- 2 samples)
-        // to find the precise peak with proper normalization.
-        int refine_lo = std::max(0, coarse_best_d - 2);
-        int refine_hi = std::min(search_len - 1, coarse_best_d + 2);
+    float peak_metric = std::sqrt(sc_best_metric);  // sqrt for [0,1] range comparable to old ZC metric
+    int peak_d = sc_best_d;
+
+    if (peak_d < 0 || sc_best_metric < SC_DETECTION_THRESHOLD) {
+        static int no_detect_count = 0;
+        no_detect_count++;
+        if ((no_detect_count % 200) == 1) {
+            IRIS_LOG("[OFDM-SYNC] no detection: peak_sc=%.3f (sqrt=%.3f) at d=%d/%d (threshold=%.2f, %d samples)",
+                     sc_best_metric, peak_metric, peak_d, search_len,
+                     SC_DETECTION_THRESHOLD, n_samples);
+        }
+        return result;
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3: ZC cross-correlation for precise timing within ±cp of SC peak
+    // -----------------------------------------------------------------------
+    // SC has a plateau of width cp (due to cyclic prefix periodicity).
+    // ZC xcorr has a sharp peak at the exact body start.
+    // We use ZC to refine timing but NOT for detection thresholding.
+    {
+        float best_zc_metric = 0.0f;
+        int best_zc_d = peak_d;
+
+        int refine_lo = std::max(0, peak_d - cp);
+        int refine_hi = std::min(search_len - 1, peak_d + cp);
 
         for (int d = refine_lo; d <= refine_hi; ++d) {
             int body = d + cp;
@@ -248,55 +259,36 @@ OfdmSyncResult ofdm_detect_frame(const std::complex<float>* iq, int n_samples,
             }
             float denom = se * zc_energy;
             float m = (denom > 1e-20f) ? std::sqrt(std::norm(xc) / denom) : 0.0f;
-            if (m > peak_metric) {
-                peak_metric = m;
-                peak_d = d;
-                peak_xcorr = xc;
+            if (m > best_zc_metric) {
+                best_zc_metric = m;
+                best_zc_d = d;
             }
         }
-    }
 
-    if (peak_d < 0 || peak_metric < DETECTION_THRESHOLD) {
-        static int no_detect_count = 0;
-        no_detect_count++;
-        if ((no_detect_count % 200) == 1) {  // log every 200th miss (~5 seconds)
-            IRIS_LOG("[OFDM-SYNC] no detection: peak_metric=%.3f at d=%d/%d (threshold=%.2f, %d samples)",
-                     peak_metric, peak_d, search_len, DETECTION_THRESHOLD, n_samples);
+        // Use ZC-refined timing if it found a reasonable peak
+        if (best_zc_metric > 0.1f) {
+            peak_d = best_zc_d;
+            IRIS_LOG("[OFDM-SYNC] ZC timing refine: d=%d (ZC=%.3f, SC=%.3f)",
+                     peak_d, best_zc_metric, peak_metric);
         }
-        return result;
-    }
 
-    // -----------------------------------------------------------------------
-    // Train1/Train2 disambiguation: since both training symbols are identical
-    // ZC sequences, the correlator may lock onto train2 instead of train1.
-    // Check if there's a second strong peak one symbol_len earlier; if so, use it.
-    // -----------------------------------------------------------------------
-    {
-        int earlier_d = peak_d - symbol_len;
-        if (earlier_d >= 0) {
-            int body = earlier_d + cp;
-            if (body + nfft <= n_samples) {
-                std::complex<float> xc(0.0f, 0.0f);
-                float se = 0.0f;
-                for (int n = 0; n < nfft; ++n) {
-                    xc += iq[body + n] * std::conj(zc_td[n]);
-                    se += std::norm(iq[body + n]);
-                }
-                float denom = se * zc_energy;
-                float m = (denom > 1e-20f) ? std::sqrt(std::norm(xc) / denom) : 0.0f;
-                // If the earlier position also has a strong correlation (>80% of peak),
-                // it's train1 and the detected position was train2. Use train1.
-                if (m > 0.8f * peak_metric) {
-                    IRIS_LOG("[OFDM-SYNC] train1/train2 disambiguation: using earlier peak at %d (M=%.3f vs %.3f)",
-                             earlier_d, m, peak_metric);
-                    peak_d = earlier_d;
-                    peak_metric = m;
-                }
-            }
+        // ZC quality gate: SC can false-trigger on repetitive non-OFDM structure.
+        // ZC metric degrades with carrier count (channel distortion across wider BW):
+        //   15 carriers (1.4 kHz): ZC ≥ 0.98    → threshold 0.55
+        //   30 carriers (2.8 kHz): ZC ≥ 0.47    → threshold 0.475
+        //   64 carriers (6.0 kHz): ZC ≈ 0.35-40 → threshold 0.305
+        // False positives: ZC ≤ 0.42 across all tested configs.
+        // Formula: max(0.25, 0.55 - 0.005 * max(0, n_used - 15))
+        const int n_used = config.n_used_carriers;
+        const float zc_threshold = std::max(0.25f, 0.55f - 0.005f * std::max(0, n_used - 15));
+        if (best_zc_metric < zc_threshold) {
+            IRIS_LOG("[OFDM-SYNC] SC passed (%.3f) but ZC too low (%.3f < %.2f, n_used=%d) — false positive rejected",
+                     peak_metric, best_zc_metric, zc_threshold, n_used);
+            return result;
         }
     }
 
-    result.detected = true;
+    // Tentatively detected — compute CFO before final validation
     result.frame_start = peak_d;
     result.schmidl_metric = peak_metric;
 
@@ -343,17 +335,32 @@ OfdmSyncResult ofdm_detect_frame(const std::complex<float>* iq, int n_samples,
     }
 
     // -----------------------------------------------------------------------
-    // SNR estimate: signal power from correlation peak, noise from residual
-    // SNR ~ peak_metric^2 / (1 - peak_metric^2)
+    // SNR estimate from SC metric.
+    // SC metric M_sq = |P|²/(A·R) = (SNR/(SNR+1))².
+    // peak_metric = sqrt(M_sq) = SNR/(SNR+1).
+    // Inversion: SNR = peak_metric / (1 - peak_metric).
     // -----------------------------------------------------------------------
     {
-        float m2 = peak_metric * peak_metric;
-        float snr_linear = (m2 < 0.999f) ? (m2 / (1.0f - m2)) : 1000.0f;
+        float snr_linear = (peak_metric < 0.999f) ? (peak_metric / (1.0f - peak_metric)) : 1000.0f;
         result.snr_est = 10.0f * std::log10(std::max(snr_linear, 1e-10f));
     }
 
     IRIS_LOG("[OFDM-SYNC] ZC detect: metric=%.4f at sample %d, CFO=%.1f Hz, SNR~%.1f dB",
              peak_metric, peak_d, result.cfo_hz, result.snr_est);
+
+    // CFO sanity check: real FM signals have < 2 Hz CFO (crystal offsets are small).
+    // False ZC triggers produce wildly wrong CFO (10-50 Hz) because the
+    // "training symbols" are noise — their cross-correlation phase is random.
+    // Reject these to avoid wasting demod time and corrupting Chase combining.
+    constexpr float CFO_MAX_HZ = 10.0f;
+    if (std::abs(result.cfo_hz) > CFO_MAX_HZ) {
+        IRIS_LOG("[OFDM-SYNC] CFO sanity check FAILED: |%.1f Hz| > %.0f Hz — false trigger rejected",
+                 result.cfo_hz, CFO_MAX_HZ);
+        result.detected = false;
+        return result;
+    }
+
+    result.detected = true;
 
     // Track detection statistics
     {

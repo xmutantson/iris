@@ -249,6 +249,17 @@ bool Modem::init(const IrisConfig& config) {
     arq_.set_callsign(config_.callsign);
     arq_.set_local_capabilities(local_cap_.capabilities);
     probe_.set_local_caps(local_cap_.capabilities);
+    // Advertise our preferred OFDM PHY parameters in probe result
+    {
+        uint8_t nfft_code = 0;  // 0=512
+        if (config_.ofdm_nfft == 256) nfft_code = 1;
+        else if (config_.ofdm_nfft == 1024) nfft_code = 2;
+        probe_.set_local_ofdm_config(
+            (uint8_t)config_.ofdm_cp_samples,  // e.g. 64
+            4,   // pilot_carrier_spacing (default)
+            14,  // pilot_symbol_spacing (default)
+            nfft_code);
+    }
     ArqCallbacks arq_cb;
     arq_cb.send_frame = [this](const uint8_t* data, size_t len) {
         // ARQ frames go directly to TX queue (not back through ARQ)
@@ -1133,6 +1144,12 @@ void Modem::process_rx_native(const float* audio, int count) {
     // OFDM uses real passband audio directly (Hermitian-symmetric IFFT),
     // bypassing the downconverter. Buffer raw audio separately.
     if (ofdm_phy_active_ && ofdm_demod_) {
+        // Skip OFDM RX during TX — our own signal bleeds back and creates
+        // false SC/ZC triggers that waste CPU and corrupt Chase combining.
+        if (ptt_active_ || rx_muted_) {
+            return;
+        }
+
         // OFDM bypasses the probe-based channel EQ entirely. The 127-tap FIR
         // has a 63-sample impulse response that exceeds the OFDM CP (16 samples),
         // causing catastrophic ISI. OFDM handles per-carrier equalization
@@ -1202,39 +1219,57 @@ void Modem::process_rx_native(const float* audio, int count) {
             return;
         }
 
-        // Demodulate OFDM frame — pass pre-computed sync to skip redundant detection.
-        // Adjust frame_start to 0 since we're already offset into the buffer.
+        // ---- Frame-length gate: wait until full frame is buffered ----
+        // Prevents O(N²) redundant re-demodulation. Previously, demodulate()
+        // was called every 10ms callback and re-ran training FFTs, channel est,
+        // CFO correction, and all data symbols from scratch each time. For a
+        // 34-symbol frame this meant symbol 0 demodulated 34 times, etc.
+        // Now we compute the expected frame length and only call demodulate()
+        // once when all samples are available.
+        {
+            int bps = ofdm_tone_map_.total_bits_per_symbol;
+            int coded_bits = (ofdm_tone_map_.fec_rate != LdpcRate::NONE)
+                ? LdpcCodec::codeword_size(ofdm_tone_map_.fec_rate)
+                : bps;
+            int n_data_syms = (bps > 0) ? (coded_bits + bps - 1) / bps : 1;
+            // Block pilots: one every pilot_symbol_spacing data symbols
+            int n_block_pilots = (ofdm_config_.pilot_symbol_spacing > 0)
+                ? n_data_syms / ofdm_config_.pilot_symbol_spacing : 0;
+            // Total: 2 training + data + block pilots + 1 tail
+            int total_syms = 2 + n_data_syms + n_block_pilots + 1;
+            size_t frame_samples = (size_t)(total_syms * sym_len);
+            size_t available = n_samples - (size_t)sync.frame_start;
+
+            if (available < frame_samples) {
+                // Not enough samples yet — cache sync and wait
+                if (!ofdm_sync_cached_) {
+                    IRIS_LOG("[OFDM-RX] frame incomplete: %zu/%zu samples (M=%.3f) — waiting",
+                             available, frame_samples, sync.schmidl_metric);
+                    ofdm_pending_sync_ = sync;
+                    ofdm_sync_cached_ = true;
+                }
+                ofdm_redetect_count_++;
+                if (ofdm_redetect_count_ > 150) {
+                    IRIS_LOG("[OFDM-RX] redetect limit reached (%d) — abandoning cached sync", ofdm_redetect_count_);
+                    size_t skip = (size_t)(ofdm_pending_sync_.frame_start + ofdm_config_.nfft);
+                    skip = std::min(skip, ofdm_rx_audio_buf_.size());
+                    ofdm_rx_audio_buf_.erase(ofdm_rx_audio_buf_.begin(), ofdm_rx_audio_buf_.begin() + skip);
+                    ofdm_sync_cached_ = false;
+                    ofdm_redetect_count_ = 0;
+                }
+                return;
+            }
+        }
+
+        // Full frame buffered — demodulate once (no redundant re-demod).
         OfdmSyncResult demod_sync = sync;
         demod_sync.frame_start = 0;
         OfdmDemodResult result = ofdm_demod_->demodulate(
             ofdm_rx_iq_.data() + sync.frame_start,
             (int)(n_samples - sync.frame_start),
-            ofdm_tone_map_, &demod_sync);  // pre-negotiated tone map (no header)
+            ofdm_tone_map_, &demod_sync);
 
-        // ---- Incomplete frame: preamble detected but not enough samples ----
-        // samples_consumed=0 means "wait for more data". Don't erase anything.
-        // Cache the sync result to skip Schmidl-Cox on next call.
-        if (result.samples_consumed == 0 && !result.success) {
-            if (!ofdm_sync_cached_) {
-                IRIS_LOG("[OFDM-RX] frame incomplete (M=%.3f) — caching sync, waiting for data",
-                         sync.schmidl_metric);
-                ofdm_pending_sync_ = sync;
-                ofdm_sync_cached_ = true;
-            }
-            ofdm_redetect_count_++;
-            if (ofdm_redetect_count_ > 150) {
-                IRIS_LOG("[OFDM-RX] redetect limit reached (%d) — abandoning cached sync", ofdm_redetect_count_);
-                size_t skip = (size_t)(ofdm_pending_sync_.frame_start + ofdm_config_.nfft);
-                skip = std::min(skip, ofdm_rx_audio_buf_.size());
-                ofdm_rx_audio_buf_.erase(ofdm_rx_audio_buf_.begin(), ofdm_rx_audio_buf_.begin() + skip);
-                ofdm_sync_cached_ = false;
-                ofdm_redetect_count_ = 0;
-                return;
-            }
-            return;
-        }
-
-        // Frame resolved (success, failure, or false positive) — clear cache.
+        // Frame resolved — clear cache.
         if (ofdm_sync_cached_) {
             IRIS_LOG("[OFDM-RX] frame resolved after %d waits", ofdm_redetect_count_);
         }
@@ -1256,6 +1291,18 @@ void Modem::process_rx_native(const float* audio, int count) {
         }
 
         // ---- OFDM Chase combining ----
+        // Guard: flush stored LLRs if this frame looks like a false trigger.
+        // False ZC triggers have wildly wrong CFO or very low SNR — combining
+        // their garbage LLRs with real data destroys the buffer.
+        if (!result.success && result.snr_db < 5.0f) {
+            if (!ofdm_chase_llrs_.empty()) {
+                IRIS_LOG("[OFDM-RX] Chase guard: flushing LLRs (SNR=%.1f dB too low, likely noise)",
+                         result.snr_db);
+                ofdm_chase_llrs_.clear();
+                ofdm_chase_combines_ = 0;
+            }
+        }
+
         // If decode failed and we have stored LLRs from a previous attempt
         // at the same frame, element-wise add (MRC in LLR domain, +3 dB gain).
         if (!result.success && !result.llrs.empty() &&
@@ -1355,21 +1402,35 @@ void Modem::process_rx_native(const float* audio, int count) {
             }
 
             // Update OFDM gearshift via Gearshift class (smoothing, LDPC boost,
-            // failure downshift, cooldown — same adaptive logic as Mode A)
-            gearshift_.feed_ldpc_iters(result.worst_ldpc_iters, 50);
-            int old_level = ofdm_speed_level_;
-            ofdm_speed_level_ = gearshift_.ofdm_update(result.mean_channel_snr_db);
-            // Feed modem gearshift state to ARQ for conflict detection
-            arq_.set_modem_gearshift(ofdm_speed_level_, gearshift_.smoothed_snr(),
-                                     gearshift_.cooldown());
-            if (ofdm_speed_level_ != old_level) {
-                IRIS_LOG("[OFDM-RX] gearshift: O%d -> O%d (ch_SNR=%.1f dB, boost=%.1f, cd=%d)",
-                         old_level, ofdm_speed_level_, result.mean_channel_snr_db,
-                         gearshift_.boost(), gearshift_.cooldown());
-                // Speed level changed — stored Chase LLRs are for a different
-                // tone map / FEC rate and would corrupt combining
-                ofdm_chase_llrs_.clear();
-                ofdm_chase_combines_ = 0;
+            // failure downshift, cooldown — same adaptive logic as Mode A).
+            // Skip during TUNE: test frames have artificially high preamble SNR
+            // (full-power tones, no data) that would cause premature O0→O1 upshift.
+            // The peer then can't decode O1, stops sending data, session stalls.
+            bool in_tune = (tune_state_ != TuneState::IDLE &&
+                            tune_state_ != TuneState::DONE);
+            if (!in_tune) {
+                gearshift_.feed_ldpc_iters(result.worst_ldpc_iters, 50);
+                int old_level = ofdm_speed_level_;
+                // Use frame SNR (post-EQ), not channel SNR (preamble-based).
+                // On FM, deviation limiter clips high-PAPR data but not ZC preamble,
+                // so ch_SNR overestimates by 15-20 dB → premature upshift → stall.
+                ofdm_speed_level_ = gearshift_.ofdm_update(result.snr_db);
+                // Feed modem gearshift state to ARQ for conflict detection
+                arq_.set_modem_gearshift(ofdm_speed_level_, gearshift_.smoothed_snr(),
+                                         gearshift_.cooldown());
+                if (ofdm_speed_level_ != old_level) {
+                    IRIS_LOG("[OFDM-RX] gearshift: O%d -> O%d (frame_SNR=%.1f dB, ch_SNR=%.1f, boost=%.1f, cd=%d)",
+                             old_level, ofdm_speed_level_, result.snr_db,
+                             result.mean_channel_snr_db,
+                             gearshift_.boost(), gearshift_.cooldown());
+                    // Speed level changed — stored Chase LLRs are for a different
+                    // tone map / FEC rate and would corrupt combining
+                    ofdm_chase_llrs_.clear();
+                    ofdm_chase_combines_ = 0;
+                }
+            } else {
+                IRIS_LOG("[OFDM-RX] TUNE frame: skipping gearshift (ch_SNR=%.1f dB)",
+                         result.mean_channel_snr_db);
             }
             arq_.set_local_snr(result.snr_db);
 
@@ -1378,21 +1439,14 @@ void Modem::process_rx_native(const float* audio, int count) {
                 last_constellation_ = std::move(result.eq_constellation);
             }
 
-            // Waterfilling: recompute TX tone map from per-carrier SNR feedback.
-            // This adapts modulation per-subcarrier (more bits on strong carriers,
-            // fewer on weak ones) instead of uniform constellation everywhere.
-            if (config_.ofdm_waterfill && !result.snr_per_carrier.empty()) {
-                LdpcRate fec = ofdm_tone_map_.fec_rate;
-                ToneMap wf = compute_waterfill_tone_map(result.snr_per_carrier, fec, ofdm_config_);
-                if (wf.total_bits_per_symbol > 0 &&
-                    wf.total_bits_per_symbol != ofdm_tone_map_.total_bits_per_symbol) {
-                    float old_tput = tone_map_throughput(ofdm_tone_map_, ofdm_config_, 50);
-                    float new_tput = tone_map_throughput(wf, ofdm_config_, 50);
-                    ofdm_tone_map_ = wf;
-                    IRIS_LOG("[OFDM-WF] waterfill updated: %d bits/sym -> %.0f bps (was %.0f)",
-                             wf.total_bits_per_symbol, new_tput, old_tput);
-                }
-            }
+            // Waterfilling: DISABLED for FM mode.
+            // The channel estimate SNR (from preamble |H|) overestimates link quality
+            // because the FM deviation limiter clips high-PAPR data symbols but not
+            // the low-PAPR ZC preamble. After one successful QPSK frame, waterfill
+            // jumped to 256QAM (222 bits/sym) based on 33.7 dB channel SNR while
+            // actual frame SNR was -1.3 dB. All subsequent frames failed.
+            // Rate adaptation is handled by gearshift via uniform presets.
+            // if (config_.ofdm_waterfill && !result.snr_per_carrier.empty()) { ... }
 
             // Payload delivery — reuse existing deliver + decompression logic
             std::vector<uint8_t> payload = std::move(result.payload);
@@ -2184,9 +2238,23 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                     int level = gearshift_.current_level();
                     phy_bps = net_throughput(level, phy_config_.baud_rate);
                 }
-                // OFDM can carry up to 32KB per frame; legacy caps at 4000 bytes
-                size_t max_payload = (ofdm_phy_active_ && !native_hail_active)
-                    ? 32000 : (size_t)NATIVE_MAX_PAYLOAD;
+                // Cap payload at actual LDPC block capacity for current speed level.
+                // LDPC k bits = data bits per block.  Minus 6 bytes overhead (2 len + 4 CRC).
+                // Going over this causes build_ofdm_frame() to reject → 0-byte TX → session stall.
+                // TODO: when multi-codeword frames are implemented, multiply by n_blocks.
+                size_t max_payload;
+                if (ofdm_phy_active_ && !native_hail_active) {
+                    int sl = std::clamp(ofdm_speed_level_, 0, NUM_OFDM_SPEED_LEVELS - 1);
+                    static const LdpcRate ofdm_batch_fec[] = {
+                        LdpcRate::RATE_1_2, LdpcRate::RATE_1_2,
+                        LdpcRate::RATE_3_4, LdpcRate::RATE_1_2,
+                        LdpcRate::RATE_3_4, LdpcRate::RATE_3_4,
+                        LdpcRate::RATE_7_8, LdpcRate::RATE_7_8};
+                    int k_bytes = LdpcCodec::block_size(ofdm_batch_fec[sl]) / 8;
+                    max_payload = (size_t)std::max(20, k_bytes - 6);  // minus CRC32 + len prefix
+                } else {
+                    max_payload = (size_t)NATIVE_MAX_PAYLOAD;
+                }
                 size_t max_batch = std::min(max_payload,
                                              (size_t)(phy_bps * batch_airtime_s_ / 8));
                 if (max_batch < 200) max_batch = 200;  // at least one frame
@@ -2305,19 +2373,23 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                         }
                     }
 
-                    // Select tone map: waterfill (per-carrier adaptive) or uniform preset
-                    static const uint8_t ofdm_level_to_preset[] = { 2, 4, 6, 8 };
+                    // Select tone map: O-levels map 1:1 to uniform presets (preset = level + 1)
+                    // O0=BPSK r1/2, O1=QPSK r1/2, O2=QPSK r3/4, O3=16QAM r1/2,
+                    // O4=16QAM r3/4, O5=64QAM r3/4, O6=64QAM r7/8, O7=256QAM r7/8
                     static const LdpcRate ofdm_level_to_fec[] = {
-                        LdpcRate::RATE_1_2, LdpcRate::RATE_5_8,
-                        LdpcRate::RATE_3_4, LdpcRate::RATE_7_8 };
+                        LdpcRate::RATE_1_2, LdpcRate::RATE_1_2,  // O0 BPSK, O1 QPSK
+                        LdpcRate::RATE_3_4, LdpcRate::RATE_1_2,  // O2 QPSK, O3 16QAM
+                        LdpcRate::RATE_3_4, LdpcRate::RATE_3_4,  // O4 16QAM, O5 64QAM
+                        LdpcRate::RATE_7_8, LdpcRate::RATE_7_8}; // O6 64QAM, O7 256QAM
 
+                    int sl = std::clamp(ofdm_speed_level_, 0, NUM_OFDM_SPEED_LEVELS - 1);
                     if (config_.ofdm_waterfill && ofdm_tone_map_.tone_map_id == 0 &&
                         ofdm_tone_map_.total_bits_per_symbol > 0) {
                         // Waterfill: keep per-carrier bit loading, update FEC from gearshift
-                        ofdm_tone_map_.fec_rate = ofdm_level_to_fec[ofdm_speed_level_];
+                        ofdm_tone_map_.fec_rate = ofdm_level_to_fec[sl];
                     } else {
                         // Uniform: all carriers same modulation
-                        uint8_t preset = ofdm_level_to_preset[ofdm_speed_level_];
+                        uint8_t preset = static_cast<uint8_t>(sl + 1);
                         ofdm_tone_map_ = get_uniform_tone_map(preset, ofdm_config_);
                     }
                     ofdm_tone_map_.use_nuc = config_.ofdm_nuc;
@@ -3280,18 +3352,45 @@ void Modem::tick() {
                 ofdm_pb.bandwidth_hz = bandwidth;
                 ofdm_pb.valid = true;
 
-                // FM-optimized: short CP (16 samples = 0.33ms) by default
+                // Negotiate OFDM PHY parameters from probe exchange.
+                // Both sides advertise their config; we use conservative values
+                // (max CP, min pilot spacings) so both sides compute identical config.
+                // Old peers (v3 or earlier) have ofdm_* = 0, meaning "use defaults."
                 int cp = config_.ofdm_cp_samples;
-                if (cp <= 0 || cp == 64) cp = 32;  // 0.67ms — adequate for FM radio IF group delay
+                int carrier_pilot_spacing = 4;  // safe default
+                int block_pilot_spacing = 14;   // safe default
+                int nfft = config_.ofdm_nfft;
+                {
+                    const ProbeResult& peer = probe_.my_tx_result();  // peer's advertised config
+                    if (peer.ofdm_cp_samples > 0) {
+                        // Both sides advertised: use max CP (more conservative/robust)
+                        cp = std::max(cp, (int)peer.ofdm_cp_samples);
+                    }
+                    if (peer.ofdm_pilot_carrier_spacing > 0) {
+                        // Use min spacing (more pilots = more robust)
+                        carrier_pilot_spacing = std::min(carrier_pilot_spacing, (int)peer.ofdm_pilot_carrier_spacing);
+                    }
+                    if (peer.ofdm_pilot_symbol_spacing > 0) {
+                        block_pilot_spacing = std::min(block_pilot_spacing, (int)peer.ofdm_pilot_symbol_spacing);
+                    }
+                    if (peer.ofdm_nfft_code > 0) {
+                        // NFFT: both must match. Use minimum (most conservative).
+                        int peer_nfft = 512;
+                        if (peer.ofdm_nfft_code == 1) peer_nfft = 256;
+                        else if (peer.ofdm_nfft_code == 2) peer_nfft = 1024;
+                        nfft = std::min(nfft, peer_nfft);
+                    }
+                    IRIS_LOG("[OFDM-NEG] peer config: cp=%d pilot=%d block=%d nfft_code=%d",
+                             peer.ofdm_cp_samples, peer.ofdm_pilot_carrier_spacing,
+                             peer.ofdm_pilot_symbol_spacing, peer.ofdm_nfft_code);
+                    IRIS_LOG("[OFDM-NEG] negotiated: cp=%d pilot=%d block=%d nfft=%d",
+                             cp, carrier_pilot_spacing, block_pilot_spacing, nfft);
+                }
 
                 // Auto-train pilot spacing: measure channel flatness from probe tones.
-                // Flat channels (VB-Cable, clean FM) can use sparse pilots (1:12) for
-                // more data carriers. Frequency-selective channels need dense pilots (1:4).
-                int carrier_pilot_spacing = 6;   // 1:6 default — ensures >=4 pilots in narrow 2kHz BW
-                int block_pilot_spacing = 16;
+                // Only used when auto_spacing is enabled AND overrides the negotiated value.
                 if (config_.ofdm_auto_spacing) {
                     const ProbeResult& rx_probe = probe_.their_tx_result();
-                    // Compute power variance across detected tones
                     float sum = 0, sum2 = 0;
                     int n_det = 0;
                     for (int t = 0; t < 64; t++) {
@@ -3305,9 +3404,6 @@ void Modem::tick() {
                         float mean = sum / n_det;
                         float var = sum2 / n_det - mean * mean;
                         float std_db = std::sqrt(std::max(0.0f, var));
-                        // Flat channel: std < 3 dB → sparse pilots (1:12, 1:24)
-                        // Moderate: std 3-8 dB → medium pilots (1:8, 1:16)
-                        // Selective: std > 8 dB → dense pilots (1:4, 1:8)
                         if (std_db < 3.0f) {
                             carrier_pilot_spacing = 12;
                             block_pilot_spacing = 24;
@@ -3319,7 +3415,7 @@ void Modem::tick() {
                                  std_db, carrier_pilot_spacing, block_pilot_spacing);
                     }
                 }
-                ofdm_config_ = ofdm_config_from_probe(ofdm_pb, config_.ofdm_nfft, cp,
+                ofdm_config_ = ofdm_config_from_probe(ofdm_pb, nfft, cp,
                                                        carrier_pilot_spacing, block_pilot_spacing);
 
                 // Minimum pilot check: ensure at least 4 pilots for reliable channel estimation
@@ -3342,13 +3438,13 @@ void Modem::tick() {
                 ofdm_rx_audio_buf_.clear();
                 ofdm_sync_cached_ = false;
 
-                // Initialize gearshift OFDM level at O0 (QPSK r1/2) — Mercury approach:
-                // start at lowest speed, gearshift will negotiate up from RX SNR.
+                // Initialize gearshift OFDM level at O0 (BPSK r1/2) — most robust.
+                // Gearshift will negotiate up from RX SNR + LDPC convergence.
                 gearshift_.set_max_ofdm_level(NUM_OFDM_SPEED_LEVELS - 1);
                 ofdm_speed_level_ = 0;
                 gearshift_.force_ofdm_level(0);
                 ofdm_tone_map_ = get_uniform_tone_map(
-                    2, ofdm_config_);  // preset 2 = QPSK r1/2 (start low, negotiate up)
+                    1, ofdm_config_);  // preset 1 = BPSK r1/2 (O0, start at most robust)
                 ofdm_tone_map_.use_nuc = config_.ofdm_nuc;
 
                 IRIS_LOG("OFDM PHY: prepared, %d carriers (%d data, %d pilot), CP=%d, BW=%.0f Hz",
@@ -3861,34 +3957,46 @@ void Modem::tune_apply_corrections() {
 
     float old_level = config_.tx_level;
 
-    // TX: adjust toward peer_gain=1.0.
-    //   peer_gain > 1 → we're too loud → reduce TX (always safe).
-    //   peer_gain < 1 → we're too quiet → boost TX (capped at 1.0).
-    //   Both sides adjust independently — the peer also adjusts RX gain,
-    //   but we can't assume they will, so we do our part.
-    if (tune_peer_gain_ > 0.01f) {
-        config_.tx_level /= tune_peer_gain_;
-        config_.tx_level = std::clamp(config_.tx_level, 0.05f, 1.0f);
-        config_.calibrated_tx_level = config_.tx_level;
-        if (std::abs(config_.tx_level - old_level) > 0.001f) {
-            IRIS_LOG("[TUNE] TX: peer_gain=%.3f, level %.3f → %.3f",
-                     tune_peer_gain_, old_level, config_.tx_level);
-        } else {
-            IRIS_LOG("[TUNE] TX: peer_gain=%.3f, level %.3f (no change needed)",
-                     tune_peer_gain_, config_.tx_level);
+    // OFDM native mode: skip BOTH TX and RX adjustments.
+    // The OFDM channel estimate mean|H| includes the FFT N-factor (512), so
+    // mean|H| ≈ 3-8 for normal audio levels. TUNE interprets this as "3-8x
+    // too loud" and attenuates both TX (tx_level /= peer_gain → 0.11-0.14)
+    // and RX (rx_gain = 1/my_gain → 0.16). Combined: 14-37x attenuation per
+    // direction. OTA confirmed: 3/3 decoded before TUNE, 0/everything after.
+    // The MMSE equalizer handles arbitrary channel gain, and the FM radio's
+    // deviation limiter handles PAPR. Gain calibration adds nothing for OFDM.
+    // TX adjustment is especially dangerous: calibrated_tx_level persists
+    // across modes, so OFDM over-correction also kills FX.25 fallback.
+    if (native_mode_ || ofdm_kiss_) {
+        IRIS_LOG("[TUNE] OFDM mode: skipping TX/RX correction (mean|H| includes FFT N-factor,"
+                 " peer_gain=%.3f, my_gain=%.3f — normal for OFDM, native=%d kiss=%d)",
+                 tune_peer_gain_, tune_my_gain_, (int)native_mode_, (int)ofdm_kiss_);
+        native_rx_gain_ = 1.0f;
+    } else {
+        // Mode A (single-carrier): apply TX and RX corrections as before.
+        // TX: adjust toward peer_gain=1.0.
+        //   peer_gain > 1 → we're too loud → reduce TX (always safe).
+        //   peer_gain < 1 → we're too quiet → boost TX (capped at 1.0).
+        if (tune_peer_gain_ > 0.01f) {
+            config_.tx_level /= tune_peer_gain_;
+            config_.tx_level = std::clamp(config_.tx_level, 0.05f, 1.0f);
+            config_.calibrated_tx_level = config_.tx_level;
+            if (std::abs(config_.tx_level - old_level) > 0.001f) {
+                IRIS_LOG("[TUNE] TX: peer_gain=%.3f, level %.3f → %.3f",
+                         tune_peer_gain_, old_level, config_.tx_level);
+            } else {
+                IRIS_LOG("[TUNE] TX: peer_gain=%.3f, level %.3f (no change needed)",
+                         tune_peer_gain_, config_.tx_level);
+            }
         }
-    }
 
-    // RX: normalize so channel_gain ≈ 1.0.
-    //   my_gain < 1 → peer is quiet → boost RX.
-    //   my_gain > 1 → peer is loud → attenuate RX.
-    //   The peer also adjusts TX, but we compensate on our side too
-    //   to avoid the deadlock where both sides "defer to peer."
-    if (tune_my_gain_ > 0.01f) {
-        native_rx_gain_ = 1.0f / tune_my_gain_;
-        native_rx_gain_ = std::clamp(native_rx_gain_, 0.1f, 10.0f);
-        IRIS_LOG("[TUNE] RX: my_gain=%.3f, rx_gain=%.3f",
-                 tune_my_gain_, native_rx_gain_);
+        // RX: normalize so channel_gain ≈ 1.0 (Mode A slicer needs this).
+        if (tune_my_gain_ > 0.01f) {
+            native_rx_gain_ = 1.0f / tune_my_gain_;
+            native_rx_gain_ = std::clamp(native_rx_gain_, 0.1f, 10.0f);
+            IRIS_LOG("[TUNE] RX: my_gain=%.3f, rx_gain=%.3f",
+                     tune_my_gain_, native_rx_gain_);
+        }
     }
 
     if (gui_log_) {

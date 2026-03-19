@@ -52,6 +52,15 @@ OfdmConfig ofdm_config_from_probe(const NegotiatedPassband& passband, int nfft, 
     }
     cfg.n_used_carriers = (int)cfg.used_carrier_bins.size();
 
+    // Adaptive pilot spacing: ensure at least 3 pilots at narrow BW.
+    // At n_used=10 (1 kHz), spacing=6 gives only 2 pilots — too few for CPE.
+    // Floor: spacing = min(requested, max(3, n_used/4)) to guarantee ≥3 pilots.
+    if (cfg.n_used_carriers > 0) {
+        int max_spacing = std::max(3, cfg.n_used_carriers / 4);
+        if (cfg.pilot_carrier_spacing > max_spacing)
+            cfg.pilot_carrier_spacing = max_spacing;
+    }
+
     // Pilot carriers: every Nth entry from used_carrier_bins
     cfg.pilot_carrier_bins.clear();
     cfg.data_carrier_bins.clear();

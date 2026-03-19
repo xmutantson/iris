@@ -325,6 +325,14 @@ std::vector<uint8_t> probe_result_encode(const ProbeResult& r) {
         out.push_back((uint8_t)std::max(0.0f, std::min(255.0f, val)));
     }
 
+    // OFDM PHY config (4 bytes, v4 extension)
+    // Allows peers to negotiate CP, pilot spacing, etc.
+    // Old peers ignore these extra bytes; we detect old peers by len < v4 size.
+    out.push_back(r.ofdm_cp_samples);
+    out.push_back(r.ofdm_pilot_carrier_spacing);
+    out.push_back(r.ofdm_pilot_symbol_spacing);
+    out.push_back(r.ofdm_nfft_code);
+
     return out;
 }
 
@@ -364,6 +372,17 @@ bool probe_result_decode(const uint8_t* data, size_t len, ProbeResult& r) {
         }
     }
     // If old peer without tone powers, tone_power_db stays at 0 (no EQ applied)
+
+    // OFDM PHY config (optional, appended by v4+ peers)
+    // 4 bytes after tone powers: cp, pilot_carrier_spacing, pilot_symbol_spacing, nfft_code
+    constexpr int OFDM_CFG_OFFSET = TONE_POWER_OFFSET + PassbandProbeConfig::N_TONES;
+    if (len >= (size_t)(OFDM_CFG_OFFSET + 4)) {
+        r.ofdm_cp_samples = data[OFDM_CFG_OFFSET];
+        r.ofdm_pilot_carrier_spacing = data[OFDM_CFG_OFFSET + 1];
+        r.ofdm_pilot_symbol_spacing = data[OFDM_CFG_OFFSET + 2];
+        r.ofdm_nfft_code = data[OFDM_CFG_OFFSET + 3];
+    }
+    // If old peer: ofdm_* fields stay at 0 (use defaults)
 
     return true;
 }

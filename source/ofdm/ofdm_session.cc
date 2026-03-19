@@ -6,13 +6,19 @@
 
 namespace iris {
 
-// Map speed level to FEC rate
+// Map speed level to FEC rate (matches OFDM_SPEED_LEVELS[] table).
+// O0=BPSK r1/2, O1=QPSK r1/2, O2=QPSK r3/4, O3=16QAM r1/2,
+// O4=16QAM r3/4, O5=64QAM r3/4, O6=64QAM r7/8, O7=256QAM r7/8
 static LdpcRate speed_level_to_fec(int level) {
     switch (level) {
-        case 0:  return LdpcRate::RATE_1_2;
-        case 1:  return LdpcRate::RATE_5_8;
-        case 2:  return LdpcRate::RATE_3_4;
-        case 3:  return LdpcRate::RATE_7_8;
+        case 0:  return LdpcRate::RATE_1_2;   // BPSK r1/2
+        case 1:  return LdpcRate::RATE_1_2;   // QPSK r1/2
+        case 2:  return LdpcRate::RATE_3_4;   // QPSK r3/4
+        case 3:  return LdpcRate::RATE_1_2;   // 16QAM r1/2
+        case 4:  return LdpcRate::RATE_3_4;   // 16QAM r3/4
+        case 5:  return LdpcRate::RATE_3_4;   // 64QAM r3/4
+        case 6:  return LdpcRate::RATE_7_8;   // 64QAM r7/8
+        case 7:  return LdpcRate::RATE_7_8;   // 256QAM r7/8
         default: return LdpcRate::RATE_1_2;
     }
 }
@@ -126,10 +132,9 @@ void OfdmSession::on_probe_complete(const ProbeResult& local_rx, const ProbeResu
         IRIS_LOG("[OFDM-SESSION] waterfill tone map: %d data carriers, %d total bits/sym, fec=%s",
                  tx_tone_map_.n_data_carriers, tx_tone_map_.total_bits_per_symbol, fec_name(fec));
     } else {
-        // Uniform tone map based on current speed level
-        // Map O-levels to uniform presets: O0=2(QPSK r1/2), O1=3(QPSK r3/4),
-        // O2=4(16QAM r1/2), O3=5(16QAM r3/4)
-        uint8_t preset = static_cast<uint8_t>(speed_level_ + 2);
+        // Uniform tone map based on current speed level.
+        // O-levels map 1:1 to uniform presets: O0=1(BPSK r1/2) through O7=8(256QAM r7/8)
+        uint8_t preset = static_cast<uint8_t>(speed_level_ + 1);
         tx_tone_map_ = make_uniform_tone_map(preset, ofdm_config_.n_data_carriers, ofdm_config_.nfft);
         tx_tone_map_.fec_rate = fec;
         IRIS_LOG("[OFDM-SESSION] uniform tone map preset %d: %d bits/sym, fec=%s",
@@ -214,12 +219,14 @@ void OfdmSession::update_speed_level(float snr_db) {
         int old_level = speed_level_;
         speed_level_ = new_level;
 
-        // Update FEC rate in tone map
+        // Rebuild tone map for new speed level (modulation + FEC rate change together)
+        uint8_t preset = static_cast<uint8_t>(speed_level_ + 1);
         LdpcRate new_fec = speed_level_to_fec(speed_level_);
+        tx_tone_map_ = make_uniform_tone_map(preset, ofdm_config_.n_data_carriers, ofdm_config_.nfft);
         tx_tone_map_.fec_rate = new_fec;
 
-        IRIS_LOG("[OFDM-SESSION] speed level O%d -> O%d (snr=%.1f dB, fec=%s)",
-                 old_level, speed_level_, snr_db, fec_name(new_fec));
+        IRIS_LOG("[OFDM-SESSION] speed level O%d -> O%d (snr=%.1f dB, preset=%d, fec=%s)",
+                 old_level, speed_level_, snr_db, preset, fec_name(new_fec));
     }
 
     last_snr_db_ = snr_db;

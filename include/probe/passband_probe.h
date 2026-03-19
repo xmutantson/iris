@@ -40,6 +40,12 @@ struct ProbeResult {
     // Per-tone power (dB, N_TONES entries) — for GUI visualization
     float tone_power_db[PassbandProbeConfig::N_TONES] = {};
     bool tone_detected[PassbandProbeConfig::N_TONES] = {};
+
+    // OFDM PHY parameters (v4 extension, 0 = old peer / use defaults)
+    uint8_t ofdm_cp_samples = 0;           // CP length (actual value, e.g. 32 or 64)
+    uint8_t ofdm_pilot_carrier_spacing = 0; // Comb pilot spacing (e.g. 4 or 6)
+    uint8_t ofdm_pilot_symbol_spacing = 0;  // Block pilot spacing (e.g. 14 or 24)
+    uint8_t ofdm_nfft_code = 0;            // 0=512(default), 1=256, 2=1024
 };
 
 // Negotiated passband from both directions
@@ -74,8 +80,9 @@ NegotiatedPassband probe_negotiate(const ProbeResult& a_to_b,
 
 // Serialize/deserialize ProbeResult for AX.25 transport
 // Wire format: magic(1) + low_hz(4) + high_hz(4) + n_tones(2) + bitmap(8) = 19 bytes
-//            + caps(2) + tone_power_db(64) = 85 bytes total (v3)
-// Old peers (v2): 21 bytes (no tone powers). Backward compatible.
+//            + caps(2) + tone_power_db(64) = 85 bytes (v3)
+//            + ofdm_cfg(4) = 89 bytes total (v4: cp, pilot_carrier, pilot_symbol, nfft)
+// Old peers: v1=19 bytes, v2=21 bytes, v3=85 bytes. Backward compatible.
 std::vector<uint8_t> probe_result_encode(const ProbeResult& r);
 bool probe_result_decode(const uint8_t* data, size_t len, ProbeResult& r);
 

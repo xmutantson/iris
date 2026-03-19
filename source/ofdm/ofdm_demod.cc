@@ -4,6 +4,7 @@
 #include "common/fft.h"
 #include "common/logging.h"
 #include "native/constellation.h"  // demap_soft, bits_to_modulation (from ofdm_mod.h)
+#include "native/nuc_tables.h"     // NucTable, get_nuc_table (for DD CPE)
 #include "native/frame.h"      // crc32
 #include <cmath>
 #include <algorithm>
@@ -71,6 +72,12 @@ void OfdmDemodulator::equalize_mmse(
         std::complex<float> H = est.H[i];
         float H_mag2 = std::norm(H);
         float nv = (i < (int)est.noise_var.size()) ? est.noise_var[i] : 1e-6f;
+        // Apply same NV floor as demap_to_llrs: prevents ZF noise amplification
+        // on weak carriers when preamble gives nv≈0.
+        constexpr float NV_ABS_FLOOR = 0.01f;
+        constexpr float NV_REL_FLOOR = 0.03f;
+        float nv_floor = std::max(NV_ABS_FLOOR, NV_REL_FLOOR * H_mag2);
+        if (nv < nv_floor) nv = nv_floor;
 
         if (H_mag2 < 1e-4f * nv) {
             // Deep fade: zero this carrier (numerical safety only)
@@ -126,9 +133,16 @@ void OfdmDemodulator::demap_to_llrs(
 
         Modulation mod = bits_to_modulation(bpc);
 
-        // Get noise variance for this used carrier
-        float nv = (i < (int)est.noise_var.size()) ? est.noise_var[i] : 1e-6f;
+        // Noise variance floors prevent LLR explosion when preamble gives nv≈0.
+        // OTA test (2026-03-19): 0.001/0.01 floors too relaxed — LDPC 9 iters
+        // at 21.7 dB SNR (should be 1-2). FM channel EVM is higher than
+        // loopback, so cap effective per-carrier SNR at 15 dB (0.03 relative).
         float H_mag2 = std::norm(est.H[i]);
+        float nv = (i < (int)est.noise_var.size()) ? est.noise_var[i] : 0.01f;
+        constexpr float NV_ABS_FLOOR = 0.01f;     // -20 dB absolute
+        constexpr float NV_REL_FLOOR = 0.03f;     // -15 dB relative to |H|²
+        float nv_floor = std::max(NV_ABS_FLOOR, NV_REL_FLOOR * H_mag2);
+        if (nv < nv_floor) nv = nv_floor;
 
         // Effective noise variance after MMSE equalization
         float sigma_sq = (H_mag2 + nv > 1e-12f) ? (nv / (H_mag2 + nv)) : 1.0f;
@@ -361,6 +375,17 @@ OfdmDemodResult OfdmDemodulator::demodulate(
     float sfo_cumulative_weight = 0.0f;   // sum of symbol indices (for weighted slope)
     int total_symbols_elapsed = 0;        // total symbols since training (incl. header)
 
+    // CPE PLL: 2nd-order phase-locked loop for common phase error tracking.
+    // FM VCO drift causes ~1-4 Hz residual CFO that fine CFO (from training)
+    // can't catch. Raw comb-pilot CPE estimate has ~4-5° RMS noise (5 pilots).
+    // PLL filters this to ~1-2° by tracking both phase and drift rate.
+    // Critical for 16QAM (22.5° decision boundary).
+    // OTA testing shows ~2 deg/sym steady drift — PLL must track this aggressively.
+    float cpe_phase = 0.0f;   // filtered phase state (rad)
+    float cpe_freq = 0.0f;    // drift rate state (rad/symbol)
+    constexpr float CPE_ALPHA = 0.6f;   // phase update gain (raised from 0.4: OTA drift needs fast tracking)
+    constexpr float CPE_BETA  = 0.15f;  // frequency update gain (raised from 0.1: lock onto drift rate faster)
+
     // Pre-allocate reusable buffers for the hot loop (avoid per-symbol heap allocs)
     std::vector<std::complex<float>> fft_buf(nfft);          // Issue 2+3: shared FFT buffer
     std::vector<std::complex<float>> used_carriers_buf(n_used);
@@ -383,13 +408,12 @@ OfdmDemodResult OfdmDemodulator::demodulate(
             std::copy(pilot_body, pilot_body + nfft, fft_buf.data());
             fft_complex(fft_buf.data(), nfft);
 
-            // Block pilot channel update is DISABLED for FM mode.
-            // The FM radio's deviation limiter clips OFDM symbols (high PAPR),
-            // but the preamble (ZC, near-constant envelope) survives intact.
-            // Updating H[k] from a clipped block pilot corrupts the channel
-            // estimate, causing CPE to diverge from ~7° to ±110° at symbol 16.
-            // The preamble-based estimate + comb pilot CPE tracking is sufficient
-            // for FM channels that are static within a frame.
+            // Block pilot channel update: DISABLED.
+            // OTA test (2026-03-19): even with PAPR clipper (17→8 dB), FM
+            // deviation limiter + channel distortion still corrupts block pilots.
+            // SFO estimates: 100K-600K ppm (should be <100 ppm).
+            // ofdm_update_channel() modifies H with garbage → LDPC degrades.
+            // Preamble-only channel estimate is sufficient for static FM channel.
             // ofdm_update_channel(channel_est_, fft_buf.data(), config_);
 
             // H8: SFO estimation from block pilot phase drift
@@ -451,8 +475,11 @@ OfdmDemodResult OfdmDemodulator::demodulate(
         std::copy(sym_body, sym_body + nfft, fft_buf.data());
         fft_complex(fft_buf.data(), nfft);
 
-        // Update channel estimate from comb pilots in this data symbol
-        ofdm_interpolate_pilots(channel_est_, fft_buf.data(), config_);
+        // Comb pilot IIR channel update: DISABLED.
+        // OTA test (2026-03-19): comb pilots still corrupted by FM channel
+        // even with PAPR clipping. DD-CPE corrections 10-28° indicate IIR
+        // is blending garbage into H[k]. Preamble estimate is sufficient.
+        // ofdm_interpolate_pilots(channel_est_, fft_buf.data(), config_);
 
         // Extract values at used carrier bins (reuse pre-allocated buffer)
         for (int i = 0; i < n_used; i++) {
@@ -474,32 +501,67 @@ OfdmDemodResult OfdmDemodulator::demodulate(
             }
         }
 
-        // H2: Common Phase Error (CPE) correction from comb pilots
+        // H2: Common Phase Error (CPE) correction — PLL-filtered comb pilots
+        //
+        // Raw CPE from 5 comb pilots has ~4-5° RMS noise. A 2nd-order PLL
+        // tracks both phase and drift rate (from FM VCO drift / residual CFO),
+        // reducing noise to ~1-2° RMS. Critical for 16QAM.
+        //
+        // PLL update:
+        //   predict: cpe_phase += cpe_freq  (propagate drift)
+        //   error:   e = raw_cpe - cpe_phase
+        //   correct: cpe_phase += alpha * e, cpe_freq += beta * e
         {
-            float cpe_num = 0.0f;   // weighted phase sum
-            float cpe_den = 0.0f;   // weight sum
+            // Measure raw CPE from comb pilots
+            float cpe_num = 0.0f;
+            float cpe_den = 0.0f;
             for (int i = 0; i < n_used; i += config_.pilot_carrier_spacing) {
-                // Pilot position: every pilot_carrier_spacing-th used carrier
                 std::complex<float> Y_pilot = used_carriers_buf[i];
                 std::complex<float> H = channel_est_.H[i];
                 float H_mag2 = std::norm(H);
                 if (H_mag2 < 1e-12f) continue;
-
-                // Phase difference: arg(Y_pilot * conj(H))
                 float phase_diff = std::arg(Y_pilot * std::conj(H));
                 cpe_num += H_mag2 * phase_diff;
                 cpe_den += H_mag2;
             }
             if (cpe_den > 0.0f) {
-                float cpe = cpe_num / cpe_den;
-                // Apply conjugate rotation to all used carriers
-                std::complex<float> cpe_rot(std::cos(-cpe), std::sin(-cpe));
+                float raw_cpe = cpe_num / cpe_den;
+
+                // PLL predict step: advance phase by drift rate
+                cpe_phase += cpe_freq;
+
+                // Phase error (wrap to ±π for robustness)
+                float err = raw_cpe - cpe_phase;
+                while (err > (float)M_PI) err -= 2.0f * (float)M_PI;
+                while (err < -(float)M_PI) err += 2.0f * (float)M_PI;
+
+                // PLL correct step
+                cpe_phase += CPE_ALPHA * err;
+                cpe_freq  += CPE_BETA  * err;
+
+                // Clamp frequency to realistic FM VCO drift (±2 deg/sym ≈ ±0.5 Hz).
+                // Without this, noisy pilots at low SNR cause freq to diverge
+                // (observed 51 deg/sym = 12 Hz, which is physically impossible).
+                constexpr float MAX_FREQ = 2.0f * (float)M_PI / 180.0f;  // 2 deg/sym in rad
+                if (cpe_freq > MAX_FREQ) cpe_freq = MAX_FREQ;
+                if (cpe_freq < -MAX_FREQ) cpe_freq = -MAX_FREQ;
+
+                // Wrap phase to [-π, π] — phase is circular, unbounded accumulation
+                // to 800°+ makes the rotation meaningless.
+                while (cpe_phase > (float)M_PI) cpe_phase -= 2.0f * (float)M_PI;
+                while (cpe_phase < -(float)M_PI) cpe_phase += 2.0f * (float)M_PI;
+
+                // Apply filtered CPE correction to all used carriers
+                std::complex<float> cpe_rot(std::cos(-cpe_phase), std::sin(-cpe_phase));
                 for (int i = 0; i < n_used; i++) {
                     used_carriers_buf[i] *= cpe_rot;
                 }
-                if (data_sym_count % 20 == 0 || std::abs(cpe) > 0.1f) {
-                    IRIS_LOG("[OFDM-RX] CPE sym %d: %.4f rad (%.2f deg)",
-                             data_sym_count, cpe, cpe * 180.0f / (float)M_PI);
+                if (data_sym_count % 20 == 0 || std::abs(raw_cpe) > 0.1f) {
+                    IRIS_LOG("[OFDM-RX] CPE sym %d: %.4f rad (%.2f deg) [raw=%.2f pll=%.2f freq=%.3f deg/sym]",
+                             data_sym_count, cpe_phase, cpe_phase * 180.0f / (float)M_PI,
+                             raw_cpe * 180.0f / (float)M_PI,
+                             cpe_phase * 180.0f / (float)M_PI,
+                             cpe_freq * 180.0f / (float)M_PI);
                 }
             }
         }
@@ -510,6 +572,113 @@ OfdmDemodResult OfdmDemodulator::demodulate(
 
         // MMSE equalize (reuse pre-allocated buffer)
         equalize_mmse(data_carriers_buf, n_data_actual, channel_est_, eq_carriers_buf);
+
+        // Decision-directed CPE refinement: use ALL data carriers (not just
+        // 5 comb pilots) to refine the phase estimate. Hard-slice each
+        // equalized carrier, compute phase error vs nearest constellation
+        // point, weighted-average across all carriers, apply correction and
+        // feed back into PLL. Provides ~√(Ndata/Npilot) ≈ 2.2× additional
+        // noise reduction — critical for 64QAM/256QAM.
+        {
+            // FEC rate for NUC table lookup
+            auto fec_r16 = [&]() -> int {
+                switch (active_tone_map.fec_rate) {
+                    case LdpcRate::RATE_1_2: return 8;
+                    case LdpcRate::RATE_5_8: return 10;
+                    case LdpcRate::RATE_3_4: return 12;
+                    case LdpcRate::RATE_7_8: return 14;
+                    default: return 8;
+                }
+            }();
+
+            float dd_num = 0.0f;   // weighted phase error accumulator
+            float dd_den = 0.0f;   // weight accumulator
+            int dd_count = 0;
+            int data_idx = 0;
+            const int n_used = config_.n_used_carriers;
+
+            for (int i = 0; i < n_used && data_idx < n_data_actual; i++) {
+                if (i % config_.pilot_carrier_spacing == 0) continue;  // skip pilot
+
+                int bpc = (data_idx < active_tone_map.n_data_carriers)
+                          ? active_tone_map.bits_per_carrier[data_idx] : 0;
+                if (bpc == 0) { data_idx++; continue; }
+
+                std::complex<float> eq = eq_carriers_buf[data_idx];
+                Modulation mod = bits_to_modulation(bpc);
+                std::complex<float> ref;
+
+                // Hard-slice to nearest constellation point
+                const NucTable* nuc = nullptr;
+                if (active_tone_map.use_nuc && bpc >= 4)
+                    nuc = get_nuc_table(mod, fec_r16);
+
+                if (nuc) {
+                    // NUC nearest-point search
+                    float best_dist = 1e30f;
+                    int best_idx = 0;
+                    if (!nuc->separable) {
+                        // 2D-NUC (16/64): brute force
+                        for (int s = 0; s < nuc->n_points_2d; s++) {
+                            float d = std::norm(eq - nuc->points_2d[s]);
+                            if (d < best_dist) { best_dist = d; best_idx = s; }
+                        }
+                        ref = nuc->points_2d[best_idx];
+                    } else {
+                        // 1D-NUC (256QAM): search I and Q axes independently
+                        int side = nuc->n_axis_1d;
+                        float best_i_dist = 1e30f, best_q_dist = 1e30f;
+                        int best_i = 0, best_q = 0;
+                        for (int s = 0; s < side; s++) {
+                            float di = (eq.real() - nuc->axis_1d[s]);
+                            if (di * di < best_i_dist) { best_i_dist = di * di; best_i = s; }
+                            float dq = (eq.imag() - nuc->axis_1d[s]);
+                            if (dq * dq < best_q_dist) { best_q_dist = dq * dq; best_q = s; }
+                        }
+                        ref = std::complex<float>(nuc->axis_1d[best_i], nuc->axis_1d[best_q]);
+                    }
+                } else {
+                    // Standard uniform QAM: demap then remap
+                    uint8_t bits[8];
+                    demap_symbol(eq, bits, mod);
+                    ref = map_symbol(bits, mod);
+                }
+
+                // Phase error between equalized carrier and nearest point,
+                // weighted by |ref|² (outer constellation points more reliable)
+                float ref_mag2 = std::norm(ref);
+                if (ref_mag2 > 1e-12f) {
+                    float phase_err = std::arg(eq * std::conj(ref));
+                    dd_num += ref_mag2 * phase_err;
+                    dd_den += ref_mag2;
+                    dd_count++;
+                }
+                data_idx++;
+            }
+
+            if (dd_den > 0.0f && dd_count >= 5) {
+                float dd_correction = dd_num / dd_den;
+
+                // Clamp DD correction to ±30° — on FM channels, residual CFO
+                // causes 2+ deg/sym drift that the pilot-based PLL can't fully
+                // track between pilot symbols. 15° was too tight for OTA.
+                constexpr float DD_MAX_RAD = 30.0f * (float)M_PI / 180.0f;
+                dd_correction = std::clamp(dd_correction, -DD_MAX_RAD, DD_MAX_RAD);
+
+                // Apply DD phase correction to all equalized data carriers
+                std::complex<float> dd_rot(std::cos(-dd_correction), std::sin(-dd_correction));
+                for (int i = 0; i < n_data_actual; i++)
+                    eq_carriers_buf[i] *= dd_rot;
+
+                // Feed back into PLL state (half weight — DD is a refinement)
+                cpe_phase += 0.5f * dd_correction;
+
+                if (data_sym_count % 20 == 0 || std::abs(dd_correction) > 0.03f) {
+                    IRIS_LOG("[OFDM-RX] DD-CPE sym %d: %.2f deg (%d carriers)",
+                             data_sym_count, dd_correction * 180.0f / (float)M_PI, dd_count);
+                }
+            }
+        }
 
         // Store equalized constellation for GUI scatter plot
         result.eq_constellation.insert(result.eq_constellation.end(),
