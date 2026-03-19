@@ -34,11 +34,12 @@ struct OfdmConfig {
     int pilot_carrier_spacing = 4;     // Every Nth used carrier — comb pilots for CPE + interpolation
     int pilot_symbol_spacing = 14;     // Every Mth OFDM symbol is all-pilot (FM: slow fading, 14*12ms=168ms)
 
-    // FM pre-emphasis compensation
+    // FM TX de-emphasis: attenuate higher carriers on TX so that after the
+    // radio's own pre-emphasis the signal is flat entering the deviation limiter.
     // NBFM mic/speaker: 300 Hz (530us time constant, TIA/EIA-603)
     // FM broadcast (75us): 2120 Hz. Set to 0 to disable (flat audio data port).
     float fm_preemph_corner_hz = 300.0f;
-    float fm_preemph_gain_cap = 2.0f;  // Max boost (+6 dB)
+    float fm_preemph_gain_cap = 3.0f;  // Max de-emphasis ratio (3 = −9.5 dB floor)
 
     // Header
     int n_header_symbols = 0;          // No header — config pre-negotiated (Mercury approach)

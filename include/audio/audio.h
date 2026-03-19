@@ -73,6 +73,15 @@ std::unique_ptr<AudioPlayback> create_playback();
 // Internal loopback (TX output -> RX input, no audio hardware)
 void loopback_reset();
 void loopback_set_noise(float amplitude);  // AWGN noise amplitude (0 = off)
+
+// FM channel simulator for loopback testing.
+// preemph_us: pre-emphasis time constant (530 = NBFM standard, 0 = off)
+// bp_low/bp_high: audio bandpass Hz (300-3000 typical, 0 = off)
+// cfo_hz: frequency offset Hz (0 = none)
+// deviation_limit: hard-clip threshold (0.95 typical)
+void loopback_set_fm_channel(float preemph_us, float bp_low, float bp_high,
+                              float cfo_hz, float deviation_limit);
+
 std::unique_ptr<AudioCapture> create_loopback_capture();
 std::unique_ptr<AudioPlayback> create_loopback_playback();
 

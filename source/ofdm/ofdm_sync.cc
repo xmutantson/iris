@@ -27,6 +27,10 @@ std::vector<std::complex<float>> generate_zc_sequence(int root, int length)
 
 // ---------------------------------------------------------------------------
 // Generate time-domain ZC training symbol (nfft samples, no CP)
+// Applies Hermitian symmetry so the IFFT output is REAL-VALUED.
+// This is essential because OFDM audio is real — without Hermitian symmetry,
+// only the real part of a complex ZC symbol survives through audio, halving
+// the effective power at each used carrier and destroying detection/channel est.
 // ---------------------------------------------------------------------------
 std::vector<std::complex<float>> generate_zc_training_symbol(const OfdmConfig& config,
                                                               int root)
@@ -37,27 +41,41 @@ std::vector<std::complex<float>> generate_zc_training_symbol(const OfdmConfig& c
     // Generate ZC sequence in frequency domain for used carriers
     auto zc_freq = generate_zc_sequence(root, n_used);
 
-    // Place into FFT bins
+    // Place into FFT bins WITH Hermitian symmetry: X[N-k] = conj(X[k])
+    // Used carrier bins are all in the positive-frequency half (< nfft/2),
+    // so mirrors land in the upper half with no overlap.
+    // TX de-emphasis: attenuate higher carriers so radio pre-emphasis
+    // produces a flat signal entering the deviation limiter.  Same curve as
+    // data symbols and pilots — ensures channel estimate H[k] matches.
     std::vector<std::complex<float>> X(nfft, std::complex<float>(0.0f, 0.0f));
     for (int i = 0; i < n_used; ++i) {
         int bin = config.used_carrier_bins[i];
-        X[bin] = zc_freq[i];
+        // FM TX de-emphasis gain (real scalar, doesn't break Hermitian symmetry)
+        float g = 1.0f;
+        if (config.fm_preemph_corner_hz > 0.0f) {
+            float fhz = (float)bin * (float)config.sample_rate / (float)nfft;
+            g = 1.0f / std::sqrt(1.0f + (fhz / config.fm_preemph_corner_hz)
+                                       * (fhz / config.fm_preemph_corner_hz));
+            if (g < 1.0f / config.fm_preemph_gain_cap)
+                g = 1.0f / config.fm_preemph_gain_cap;
+        }
+        X[bin] = zc_freq[i] * g;
+        // Hermitian mirror for real-valued IFFT output
+        if (bin > 0 && bin < nfft / 2) {
+            X[nfft - bin] = std::conj(zc_freq[i]) * g;
+        }
     }
 
-    // IFFT to time domain (ifft_complex divides by nfft internally)
+    // IFFT to time domain — output is real-valued due to Hermitian symmetry
     ifft_complex(X.data(), nfft);
 
-    // Normalize to unit RMS
-    float energy = 0.0f;
+    // Scale by nfft to match data symbol amplitude from symbol_to_time().
+    // ifft_complex divides by N, so ×N recovers unit-power-per-carrier scaling.
+    // This keeps preamble and data at similar amplitudes (preamble also gets
+    // PREAMBLE_BOOST in build_ofdm_frame for detection headroom).
+    float scale = (float)nfft;
     for (int n = 0; n < nfft; ++n) {
-        energy += std::norm(X[n]);
-    }
-    float rms = std::sqrt(energy / nfft);
-    if (rms > 1e-10f) {
-        float scale = 1.0f / rms;
-        for (int n = 0; n < nfft; ++n) {
-            X[n] *= scale;
-        }
+        X[n] *= scale;
     }
 
     return X;
@@ -105,10 +123,6 @@ OfdmSyncResult ofdm_detect_frame(const std::complex<float>* iq, int n_samples,
     static int seg_size = 0;   // FFT segment size (power of 2 >= 2*nfft)
     static std::vector<std::complex<float>> zc_conj_fft; // conj(FFT(zc_td, seg_size))
 
-    // Incremental search state
-    static int last_searched_pos = 0;
-    static int last_n_samples = 0;
-
     if (cached_nfft != nfft || cached_n_used != config.n_used_carriers) {
         zc_td = generate_zc_training_symbol(config);
         zc_energy = 0.0f;
@@ -132,8 +146,6 @@ OfdmSyncResult ofdm_detect_frame(const std::complex<float>* iq, int n_samples,
 
         cached_nfft = nfft;
         cached_n_used = config.n_used_carriers;
-        last_searched_pos = 0;
-        last_n_samples = 0;
         IRIS_LOG("[OFDM-SYNC] ZC training symbol cached: nfft=%d, n_used=%d, energy=%.1f, seg_size=%d",
                  nfft, config.n_used_carriers, zc_energy, seg_size);
     }
@@ -146,16 +158,7 @@ OfdmSyncResult ofdm_detect_frame(const std::complex<float>* iq, int n_samples,
         return result;
     }
 
-    // Detect buffer shrink/reset: if n_samples decreased, reset incremental pos
-    if (n_samples < last_n_samples || last_searched_pos >= search_len) {
-        last_searched_pos = 0;
-    }
-    last_n_samples = n_samples;
-
     // The correlation maps body position (d+cp) to lag.
-    // We search body positions from last_searched_pos+cp to search_len-1+cp.
-    // Effective input range: [search_start_body .. search_len-1+cp+nfft-1]
-    const int search_start = last_searched_pos; // start d for incremental
     const int body_offset = cp; // body = d + cp
 
     // -----------------------------------------------------------------------
@@ -188,7 +191,7 @@ OfdmSyncResult ofdm_detect_frame(const std::complex<float>* iq, int n_samples,
     float coarse_best_mag2 = 0.0f;
     int coarse_best_d = -1;
 
-    for (int seg_d = search_start; seg_d < search_len; seg_d += valid_per_seg) {
+    for (int seg_d = 0; seg_d < search_len; seg_d += valid_per_seg) {
         int seg_body_start = seg_d + body_offset; // where this segment reads from iq[]
         int seg_input_len = std::min(seg_size, n_samples - seg_body_start);
         if (seg_input_len < nfft) break; // not enough samples for even one correlation
@@ -253,9 +256,6 @@ OfdmSyncResult ofdm_detect_frame(const std::complex<float>* iq, int n_samples,
         }
     }
 
-    // Update incremental search position (search from here next time)
-    last_searched_pos = std::max(0, search_len - nfft);
-
     if (peak_d < 0 || peak_metric < DETECTION_THRESHOLD) {
         static int no_detect_count = 0;
         no_detect_count++;
@@ -266,32 +266,76 @@ OfdmSyncResult ofdm_detect_frame(const std::complex<float>* iq, int n_samples,
         return result;
     }
 
-    // Reset incremental position on detection so next call searches fresh
-    last_searched_pos = 0;
+    // -----------------------------------------------------------------------
+    // Train1/Train2 disambiguation: since both training symbols are identical
+    // ZC sequences, the correlator may lock onto train2 instead of train1.
+    // Check if there's a second strong peak one symbol_len earlier; if so, use it.
+    // -----------------------------------------------------------------------
+    {
+        int earlier_d = peak_d - symbol_len;
+        if (earlier_d >= 0) {
+            int body = earlier_d + cp;
+            if (body + nfft <= n_samples) {
+                std::complex<float> xc(0.0f, 0.0f);
+                float se = 0.0f;
+                for (int n = 0; n < nfft; ++n) {
+                    xc += iq[body + n] * std::conj(zc_td[n]);
+                    se += std::norm(iq[body + n]);
+                }
+                float denom = se * zc_energy;
+                float m = (denom > 1e-20f) ? std::sqrt(std::norm(xc) / denom) : 0.0f;
+                // If the earlier position also has a strong correlation (>80% of peak),
+                // it's train1 and the detected position was train2. Use train1.
+                if (m > 0.8f * peak_metric) {
+                    IRIS_LOG("[OFDM-SYNC] train1/train2 disambiguation: using earlier peak at %d (M=%.3f vs %.3f)",
+                             earlier_d, m, peak_metric);
+                    peak_d = earlier_d;
+                    peak_metric = m;
+                }
+            }
+        }
+    }
 
     result.detected = true;
     result.frame_start = peak_d;
     result.schmidl_metric = peak_metric;
 
     // -----------------------------------------------------------------------
-    // CFO estimation from phase difference between train1 and train2
-    // train1 body starts at peak_d + cp
-    // train2 body starts at peak_d + symbol_len + cp
-    // cfo_phase = angle(sum_n r[train2+n] * conj(r[train1+n])) for n=0..nfft-1
-    // cfo_hz = cfo_phase / (2*pi) * (sample_rate / nfft)
+    // CFO estimation: frequency-domain correlation between train1 and train2.
+    // Time-domain correlation CANNOT estimate CFO for real-valued signals:
+    //   sum(real1[n] * real2[n]) is always real → arg() is always 0.
+    // Frequency-domain: Y2[k]*conj(Y1[k]) = |H[k]|²*|ZC[k]|² * exp(j*φ_cfo)
+    //   → arg gives the CFO phase rotation over one symbol period.
     // -----------------------------------------------------------------------
     {
         int train1_body = peak_d + cp;
         int train2_body = peak_d + symbol_len + cp;
 
-        // Bounds check: need train2_body + nfft <= n_samples
         if (train2_body + nfft <= n_samples) {
+            // FFT both training symbols
+            static std::vector<std::complex<float>> Y1_buf, Y2_buf;
+            if ((int)Y1_buf.size() != nfft) {
+                Y1_buf.resize(nfft);
+                Y2_buf.resize(nfft);
+            }
+            std::copy(iq + train1_body, iq + train1_body + nfft, Y1_buf.data());
+            std::copy(iq + train2_body, iq + train2_body + nfft, Y2_buf.data());
+            fft_complex(Y1_buf.data(), nfft);
+            fft_complex(Y2_buf.data(), nfft);
+
+            // Correlate at used carrier bins (where signal energy exists)
             std::complex<float> cfo_corr(0.0f, 0.0f);
-            for (int n = 0; n < nfft; ++n) {
-                cfo_corr += iq[train2_body + n] * std::conj(iq[train1_body + n]);
+            for (int i = 0; i < (int)config.used_carrier_bins.size(); ++i) {
+                int bin = config.used_carrier_bins[i];
+                cfo_corr += Y2_buf[bin] * std::conj(Y1_buf[bin]);
             }
             float cfo_phase = std::arg(cfo_corr);
-            result.cfo_hz = cfo_phase / (2.0f * (float)M_PI) * ((float)config.sample_rate / nfft);
+            // Phase accumulates over one symbol period (nfft + cp samples)
+            result.cfo_hz = cfo_phase / (2.0f * (float)M_PI)
+                          * ((float)config.sample_rate / symbol_len);
+
+            IRIS_LOG("[OFDM-SYNC] freq-domain CFO: phase=%.4f rad -> %.2f Hz (|corr|=%.1f)",
+                     cfo_phase, result.cfo_hz, std::abs(cfo_corr));
         } else {
             IRIS_LOG("[OFDM-SYNC] cannot estimate CFO: train2 out of bounds");
             result.cfo_hz = 0.0f;

@@ -21,6 +21,11 @@
 #include "crypto/crypto.h"
 #include "probe/passband_probe.h"
 #include "native/channel_eq.h"
+#include "ofdm/ofdm_config.h"
+#include "ofdm/ofdm_mod.h"
+#include "ofdm/ofdm_demod.h"
+#include "ofdm/ofdm_sync.h"
+#include "ofdm/ofdm_frame.h"
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -511,6 +516,239 @@ static void test_ax25_to_native_upgrade() {
     }
 }
 
+// =======================================================================
+//  OFDM PHY Roundtrip: modulator → audio → (optional FM channel) → demod
+// =======================================================================
+static void test_ofdm_phy_roundtrip() {
+    printf("\n=== OFDM PHY Roundtrip (Hermitian baseband) ===\n");
+
+    // --- Build OfdmConfig for a typical FM passband (300-3000 Hz) ---
+    NegotiatedPassband pb;
+    pb.low_hz = 300.0f;
+    pb.high_hz = 3000.0f;
+    pb.center_hz = 1650.0f;
+    pb.bandwidth_hz = 2700.0f;
+    pb.valid = true;
+    OfdmConfig cfg = ofdm_config_from_probe(pb, 512, 32, 4, 14);
+
+    printf("  Config: nfft=%d cp=%d, %d used, %d data, %d pilot carriers\n",
+           cfg.nfft, cfg.cp_samples, cfg.n_used_carriers,
+           cfg.n_data_carriers, cfg.n_pilot_carriers);
+
+    check("Has data carriers", cfg.n_data_carriers > 0);
+    if (cfg.n_data_carriers == 0) return;
+
+    // --- Build OFDM frame ---
+    OfdmModulator mod(cfg);
+    ToneMap tm = get_uniform_tone_map(2, cfg);  // preset 2 = QPSK r1/2
+    printf("  ToneMap: preset=%d, %d bits/sym, FEC=r1/2\n",
+           tm.tone_map_id, tm.total_bits_per_symbol);
+
+    uint8_t payload[32];
+    for (int i = 0; i < 32; i++) payload[i] = (uint8_t)(i * 37 + 13);
+    auto iq = mod.build_ofdm_frame(payload, 32, tm, LdpcRate::RATE_1_2);
+    check("Frame generated", !iq.empty());
+    if (iq.empty()) return;
+
+    printf("  Frame: %zu complex samples (%.1f ms)\n",
+           iq.size(), 1000.0f * iq.size() / 48000.0f);
+
+    // --- Verify Hermitian symmetry: imaginary parts should be near zero ---
+    float max_imag = 0;
+    for (auto& s : iq) {
+        float ai = std::abs(s.imag());
+        if (ai > max_imag) max_imag = ai;
+    }
+    printf("  Max |imag| = %.6f (should be ~0 for real-valued output)\n", max_imag);
+    check("Hermitian symmetry: max |imag| < 0.01", max_imag < 0.01f);
+
+    // --- Extract real audio ---
+    std::vector<float> audio(iq.size());
+    for (size_t i = 0; i < iq.size(); i++)
+        audio[i] = iq[i].real();
+
+    float peak = 0;
+    for (auto s : audio) if (std::abs(s) > peak) peak = std::abs(s);
+    printf("  Audio peak = %.4f\n", peak);
+
+    // --- Test 1: Clean loopback (no FM effects) ---
+    printf("\n  --- Clean loopback (no FM) ---\n");
+    {
+        // Convert audio back to complex (real + j0)
+        std::vector<std::complex<float>> rx_iq(audio.size());
+        for (size_t i = 0; i < audio.size(); i++)
+            rx_iq[i] = std::complex<float>(audio[i], 0.0f);
+
+        // Add silence padding (generous: 1 sec before, 1 sec after)
+        size_t pad = 48000;
+        rx_iq.insert(rx_iq.begin(), pad, std::complex<float>(0, 0));
+        rx_iq.insert(rx_iq.end(), pad, std::complex<float>(0, 0));
+
+        // Detect
+        auto sync = ofdm_detect_frame(rx_iq.data(), (int)rx_iq.size(), cfg);
+        printf("  Detect: metric=%.4f, detected=%d, frame_start=%d, cfo=%.2f Hz\n",
+               sync.schmidl_metric, sync.detected, sync.frame_start, sync.cfo_hz);
+        check("Clean: frame detected", sync.detected);
+
+        if (sync.detected) {
+            // Demodulate — pass full buffer (demodulate uses sync.frame_start internally)
+            OfdmDemodulator demod(cfg);
+            auto result = demod.demodulate(
+                rx_iq.data(),
+                (int)rx_iq.size(),
+                tm, &sync);
+            printf("  Demod: success=%d, mean_H=%.3f, consumed=%d, snr=%.1f dB\n",
+                   result.success, result.mean_H_mag, result.samples_consumed, result.snr_db);
+            if (!result.llrs.empty())
+                printf("  LLRs: %zu, LDPC blocks=%d, worst_iters=%d\n",
+                       result.llrs.size(), result.n_ldpc_blocks, result.worst_ldpc_iters);
+            check("Clean: LDPC decode success", result.success);
+            if (result.success) {
+                bool match = (result.payload.size() == 32) &&
+                             (memcmp(result.payload.data(), payload, 32) == 0);
+                check("Clean: payload matches", match);
+            }
+        }
+    }
+
+    // --- FM channel helper lambda ---
+    // Runs the OFDM audio through pre-emphasis → deviation limiter → de-emphasis
+    // at a given peak level, then detects and decodes.
+    auto run_fm_test = [&](float target_peak, const char* label) -> bool {
+        float fs = 48000.0f;
+        float tau_s = 530e-6f;  // NBFM pre-emphasis (τ=530µs, fc≈300 Hz)
+
+        std::vector<float> fm_audio = audio;
+        float fm_peak = 0;
+        for (auto s : fm_audio) if (std::abs(s) > fm_peak) fm_peak = std::abs(s);
+        if (fm_peak > 0) {
+            float norm = target_peak / fm_peak;
+            for (auto& s : fm_audio) s *= norm;
+        }
+        printf("  [%s] audio normalized: peak %.4f -> %.2f\n", label, fm_peak, target_peak);
+
+        // Pre-emphasis: y[n] = x[n] - alpha * x[n-1]
+        float pe_alpha = std::exp(-1.0f / (tau_s * fs));
+        float prev = 0.0f;
+        for (size_t i = 0; i < fm_audio.size(); i++) {
+            float x = fm_audio[i];
+            fm_audio[i] = x - pe_alpha * prev;
+            prev = x;
+        }
+
+        // Deviation limiter: hard clip to ±0.95
+        int n_clips = 0;
+        for (auto& s : fm_audio) {
+            if (s > 0.95f) { s = 0.95f; n_clips++; }
+            if (s < -0.95f) { s = -0.95f; n_clips++; }
+        }
+        printf("  [%s] Pre-emphasis + clip: %d samples clipped (%.1f%%)\n",
+               label, n_clips, 100.0f * n_clips / fm_audio.size());
+
+        // De-emphasis: H(s) = 1/(1+sτ) via bilinear transform → proper IIR
+        float wc = 1.0f / tau_s;
+        float K = 2.0f * fs;
+        float a = K + wc;
+        float de_b0 = wc / a, de_b1 = wc / a, de_a1 = (wc - K) / a;
+        float de_x1 = 0.0f;  // previous input
+        float de_y1 = 0.0f;  // previous OUTPUT (IIR feedback)
+        for (size_t i = 0; i < fm_audio.size(); i++) {
+            float de = de_b0 * fm_audio[i] + de_b1 * de_x1 - de_a1 * de_y1;
+            de_x1 = fm_audio[i];
+            de_y1 = de;
+            fm_audio[i] = de;
+        }
+
+        // Convert to complex for detection/demod
+        std::vector<std::complex<float>> rx_iq(fm_audio.size());
+        for (size_t i = 0; i < fm_audio.size(); i++)
+            rx_iq[i] = std::complex<float>(fm_audio[i], 0.0f);
+
+        size_t pad = 48000;
+        rx_iq.insert(rx_iq.begin(), pad, std::complex<float>(0, 0));
+        rx_iq.insert(rx_iq.end(), pad, std::complex<float>(0, 0));
+
+        auto sync = ofdm_detect_frame(rx_iq.data(), (int)rx_iq.size(), cfg);
+        printf("  [%s] Detect: metric=%.4f, detected=%d, cfo=%.2f Hz\n",
+               label, sync.schmidl_metric, sync.detected, sync.cfo_hz);
+
+        std::string det_label = std::string(label) + ": frame detected";
+        check(det_label.c_str(), sync.detected);
+
+        if (sync.detected) {
+            OfdmDemodulator demod(cfg);
+            auto result = demod.demodulate(
+                rx_iq.data(),
+                (int)rx_iq.size(),
+                tm, &sync);
+            printf("  [%s] Demod: success=%d, mean_H=%.3f, snr=%.1f dB\n",
+                   label, result.success, result.mean_H_mag, result.snr_db);
+
+            std::string dec_label = std::string(label) + ": LDPC decode success";
+            check(dec_label.c_str(), result.success);
+            if (result.success) {
+                bool match = (result.payload.size() == 32) &&
+                             (memcmp(result.payload.data(), payload, 32) == 0);
+                std::string pay_label = std::string(label) + ": payload matches";
+                check(pay_label.c_str(), match);
+            }
+        }
+        return true;
+    };
+
+    // --- Test 2: FM channel (low level, no clipping) ---
+    printf("\n  --- FM channel (low level, no clipping) ---\n");
+    run_fm_test(0.5f, "FM-low");
+
+    // --- Test 3: FM channel (hot level, deviation limiting) ---
+    // Exercises the deviation limiter at a realistic level.
+    printf("\n  --- FM channel (hot level, deviation limiting) ---\n");
+    run_fm_test(2.5f, "FM-hot");
+
+    // --- Test 4: Verify TX de-emphasis reduces post-preemphasis peaks ---
+    // This is the key regression test for Bug #13 (backwards compensation).
+    // TX de-emphasis should attenuate high-freq carriers so that after the
+    // radio's pre-emphasis the signal is flatter.  We verify by comparing
+    // peak-after-preemphasis with and without de-emphasis.
+    printf("\n  --- TX de-emphasis effectiveness ---\n");
+    {
+        float fs = 48000.0f;
+        float tau_s = 530e-6f;
+        float pe_alpha = std::exp(-1.0f / (tau_s * fs));
+
+        // Build two frames: one with de-emphasis (current), one without
+        OfdmConfig cfg_flat = cfg;
+        cfg_flat.fm_preemph_corner_hz = 0.0f;  // disable de-emphasis
+        OfdmModulator mod_flat(cfg_flat);
+        auto iq_flat = mod_flat.build_ofdm_frame(payload, 32, tm, LdpcRate::RATE_1_2);
+
+        // Apply pre-emphasis to both and measure peaks
+        auto measure_peak_after_preemph = [&](const std::vector<std::complex<float>>& frame,
+                                               const char* label) -> float {
+            float prev = 0.0f;
+            float peak = 0.0f;
+            for (size_t i = 0; i < frame.size(); i++) {
+                float x = frame[i].real();
+                float pe = x - pe_alpha * prev;
+                prev = x;
+                if (std::abs(pe) > peak) peak = std::abs(pe);
+            }
+            printf("  [%s] peak after pre-emphasis: %.4f\n", label, peak);
+            return peak;
+        };
+
+        float peak_with_deemph = measure_peak_after_preemph(iq, "with TX de-emphasis");
+        float peak_without = measure_peak_after_preemph(iq_flat, "without TX de-emphasis");
+        float reduction_db = 20.0f * std::log10(peak_without / std::max(peak_with_deemph, 1e-6f));
+        printf("  De-emphasis reduces post-preemph peak by %.1f dB\n", reduction_db);
+
+        // TX de-emphasis must reduce post-preemphasis peaks (the whole point).
+        // With cap=3.0 (−9.5 dB) we expect at least 3 dB improvement.
+        check("TX de-emphasis reduces post-preemph peak", peak_with_deemph < peak_without);
+        check("TX de-emphasis gives >= 3 dB reduction", reduction_db >= 3.0f);
+    }
+}
+
 static void test_ofdm_kiss_loopback() {
     printf("\n=== OFDM-KISS Audio Loopback (Mode A upconvert/downconvert) ===\n");
 
@@ -635,6 +873,7 @@ int run_tests() {
     test_native_phy_loopback();
     test_native_frame_loopback();
     test_ofdm_kiss_loopback();
+    test_ofdm_phy_roundtrip();
 
     // Phase 3: Auto-upgrade
     printf("\n--- Phase 3: Auto-Upgrade ---\n");

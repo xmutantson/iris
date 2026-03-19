@@ -2,6 +2,7 @@
 #include "ax25/ax25_protocol.h"
 #include "native/frame.h"
 #include "fec/ldpc.h"
+#include "common/fft.h"
 #include "common/logging.h"
 #include <cstring>
 #include <cmath>
@@ -1221,6 +1222,15 @@ void Modem::process_rx_native(const float* audio, int count) {
                 ofdm_sync_cached_ = true;
             }
             ofdm_redetect_count_++;
+            if (ofdm_redetect_count_ > 150) {
+                IRIS_LOG("[OFDM-RX] redetect limit reached (%d) — abandoning cached sync", ofdm_redetect_count_);
+                size_t skip = (size_t)(ofdm_pending_sync_.frame_start + ofdm_config_.nfft);
+                skip = std::min(skip, ofdm_rx_audio_buf_.size());
+                ofdm_rx_audio_buf_.erase(ofdm_rx_audio_buf_.begin(), ofdm_rx_audio_buf_.begin() + skip);
+                ofdm_sync_cached_ = false;
+                ofdm_redetect_count_ = 0;
+                return;
+            }
             return;
         }
 
@@ -2406,21 +2416,43 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                     // Previous 0.35 target was 5 dB below AFSK output, causing OTA
                     // preamble detection failure (mean SNR 2 dB per carrier).
                     // OFDM bypasses tx_level (which was calibrated for native PHY).
-                    float sum_sq = 0.0f;
-                    for (auto& s : tx_buffer_) sum_sq += s * s;
-                    float ofdm_rms = std::sqrt(sum_sq / (float)tx_buffer_.size());
+                    // Normalize DATA portion only — preamble (ZC sequence with
+                    // sqrt(2) boost) is scaled separately to preserve correlation.
+                    int preamble_samples = 2 * (ofdm_config_.nfft + ofdm_config_.cp_samples);
+                    int data_start = std::min(preamble_samples, (int)tx_buffer_.size());
                     constexpr float OFDM_TARGET_RMS = 0.50f;
-                    float ofdm_scale = (ofdm_rms > 1e-6f) ? (OFDM_TARGET_RMS / ofdm_rms) : 0.1f;
-                    for (auto& s : tx_buffer_) s *= ofdm_scale;
 
-                    // Hard clip to ±0.95 (soundcard range, no tanh distortion)
+                    // RMS of data portion only
+                    float sum_sq = 0.0f;
+                    for (int i = data_start; i < (int)tx_buffer_.size(); i++)
+                        sum_sq += tx_buffer_[i] * tx_buffer_[i];
+                    int data_len = (int)tx_buffer_.size() - data_start;
+                    float ofdm_rms = (data_len > 0) ? std::sqrt(sum_sq / (float)data_len) : 0.0f;
+                    float ofdm_scale = (ofdm_rms > 1e-6f) ? (OFDM_TARGET_RMS / ofdm_rms) : 0.1f;
+                    for (int i = data_start; i < (int)tx_buffer_.size(); i++)
+                        tx_buffer_[i] *= ofdm_scale;
+
+                    // Scale preamble so its peak fits within ±0.90 (preserves ZC
+                    // correlation properties, leaves margin below 0.95 hard clip).
+                    constexpr float PREAMBLE_PEAK_LIMIT = 0.90f;
+                    float preamble_peak = 0.0f;
+                    for (int i = 0; i < data_start; i++)
+                        preamble_peak = std::max(preamble_peak, std::abs(tx_buffer_[i]));
+                    if (preamble_peak > PREAMBLE_PEAK_LIMIT) {
+                        float pscale = PREAMBLE_PEAK_LIMIT / preamble_peak;
+                        for (int i = 0; i < data_start; i++)
+                            tx_buffer_[i] *= pscale;
+                    }
+
+                    // Hard clip to ±0.95 (soundcard range, catches any remaining peaks)
                     for (auto& s : tx_buffer_) {
                         if (s > 0.95f) s = 0.95f;
                         else if (s < -0.95f) s = -0.95f;
                     }
 
-                    IRIS_LOG("[TX-OFDM] passband direct: %zu samples, RMS=%.3f->%.3f (scale=%.4f, EQ=%s)",
+                    IRIS_LOG("[TX-OFDM] passband direct: %zu samples, RMS=%.3f->%.3f (scale=%.4f, preamble=%d samp peak=%.3f, EQ=%s)",
                              tx_buffer_.size(), ofdm_rms, OFDM_TARGET_RMS, ofdm_scale,
+                             data_start, preamble_peak,
                              tx_channel_eq_.is_configured() ? "on" : "off");
                 } else {
                     // Native single-carrier PHY: IQ through upconverter as before
@@ -3593,18 +3625,18 @@ void Modem::compute_spectrum(const float* audio, int count) {
 
     spectrum_buf_pos_ = 0;
 
-    // DFT — all 256 positive bins cover 0-4 kHz
+    // Hann window + FFT (O(N log N) via pocketfft, replaces O(N²) naive DFT)
     int n_pos = NFFT / 2;
+    std::complex<float> fft_buf[NFFT];
+    for (int n = 0; n < NFFT; n++) {
+        float w = 0.5f * (1.0f - std::cos(2.0f * (float)M_PI * n / (NFFT - 1)));
+        fft_buf[n] = std::complex<float>(ds[n] * w, 0.0f);
+    }
+    fft_complex(fft_buf, NFFT);
+
     std::vector<float> spec(n_pos, 0.0f);
     for (int k = 0; k < n_pos; k++) {
-        float re = 0, im = 0;
-        for (int n = 0; n < NFFT; n++) {
-            float w = 0.5f * (1.0f - std::cos(2.0f * (float)M_PI * n / (NFFT - 1)));
-            float angle = -2.0f * (float)M_PI * k * n / NFFT;
-            re += ds[n] * w * std::cos(angle);
-            im += ds[n] * w * std::sin(angle);
-        }
-        float pwr = (re * re + im * im) / (NFFT * NFFT);
+        float pwr = std::norm(fft_buf[k]) / (float)(NFFT * NFFT);
         spec[k] = 10.0f * std::log10(std::max(pwr, 1e-12f));
     }
 
@@ -3665,19 +3697,33 @@ void Modem::tune_build_and_queue_test_frame() {
             std::vector<float> audio(ofdm_iq.size());
             for (size_t j = 0; j < ofdm_iq.size(); j++)
                 audio[j] = ofdm_iq[j].real();
-            // Normalize RMS after EQ — match OFDM_TARGET_RMS in process_tx
+            // Normalize data portion only — preamble scaled separately
+            int pre_samp = 2 * (ofdm_config_.nfft + ofdm_config_.cp_samples);
+            int dstart = std::min(pre_samp, (int)audio.size());
             float ssq = 0.0f;
-            for (auto& s : audio) ssq += s * s;
-            float rms = std::sqrt(ssq / (float)audio.size());
+            for (int k = dstart; k < (int)audio.size(); k++)
+                ssq += audio[k] * audio[k];
+            int dlen = (int)audio.size() - dstart;
+            float rms = (dlen > 0) ? std::sqrt(ssq / (float)dlen) : 0.0f;
             float sc = (rms > 1e-6f) ? (0.50f / rms) : 0.1f;
-            for (auto& s : audio) s *= sc;
+            for (int k = dstart; k < (int)audio.size(); k++)
+                audio[k] *= sc;
+            // Scale preamble peak to ±0.90
+            float ppeak = 0.0f;
+            for (int k = 0; k < dstart; k++)
+                ppeak = std::max(ppeak, std::abs(audio[k]));
+            if (ppeak > 0.90f) {
+                float ps = 0.90f / ppeak;
+                for (int k = 0; k < dstart; k++)
+                    audio[k] *= ps;
+            }
             // Hard clip to soundcard range
             for (auto& s : audio) {
                 if (s > 0.95f) s = 0.95f;
                 else if (s < -0.95f) s = -0.95f;
             }
-            IRIS_LOG("[TUNE] OFDM: RMS=%.3f->0.500 scale=%.4f EQ=%s",
-                     rms, sc, tx_channel_eq_.is_configured() ? "on" : "off");
+            IRIS_LOG("[TUNE] OFDM: RMS=%.3f->0.500 scale=%.4f preamble=%d samp peak=%.3f EQ=%s",
+                     rms, sc, dstart, ppeak, tx_channel_eq_.is_configured() ? "on" : "off");
             tx_buffer_.insert(tx_buffer_.end(), audio.begin(), audio.end());
             tune_test_frames_sent_++;
             IRIS_LOG("[TUNE] OFDM test frame %d: %zu samples (%.0f ms)",

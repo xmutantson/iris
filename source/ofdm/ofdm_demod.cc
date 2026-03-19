@@ -254,26 +254,25 @@ OfdmDemodResult OfdmDemodulator::demodulate(
     }
     pos += sym_len;  // advance past training symbol 2
 
-    // ---- 4b. Fine CFO: differential phase between training symbols ----
-    // Training sym 1 has PN (+1/-1) on even bins, training sym 2 has all +1.
-    // Differential: Y2[k]*conj(Y1[k]) = |H[k]|² * conj(PN[k]) * exp(j*φ_cfo)
-    // Multiply by PN[k] to cancel: Y2*conj(Y1)*PN = |H|² * exp(j*φ_cfo)
-    // Regenerate same PN sequence as TX (LFSR seed 0xACE1, even bins only).
-    std::complex<float> diff_corr(0, 0);
+    // ---- 4b. Fine CFO: frequency-domain correlation between training symbols ----
+    // Both training symbols are identical ZC sequences. After coarse CFO correction,
+    // the residual CFO appears as a common phase rotation:
+    //   Y2[k]*conj(Y1[k]) = |H[k]|²*|ZC[k]|² * exp(j*2π*Δf*T)
+    // where T = symbol_len / sample_rate.
+    // FFT train2 (we already have Y1 from step 3).
+    std::vector<std::complex<float>> Y2(nfft);
     {
-        uint16_t pn = 0xACE1;
-        for (int i = 0; i < n_used; i++) {
-            int bin = config_.used_carrier_bins[i];
-            if (bin % 2 == 0) {
-                float pn_val = (pn & 1) ? 1.0f : -1.0f;
-                // channel_est_.H[i] ≈ Y2[bin]/boost, Y1[bin] has PN*H*boost
-                // diff = H[i]*conj(Y1[bin]) = (Y2/boost)*conj(Y1)
-                // Multiply by pn_val to cancel PN sign
-                diff_corr += pn_val * channel_est_.H[i] * std::conj(Y1[bin]);
-                int fb = ((pn >> 14) ^ (pn >> 13)) & 1;
-                pn = (pn >> 1) | ((uint16_t)fb << 14);
-            }
-        }
+        const std::complex<float>* train2_body_ptr = iq_corrected.data()
+            + (sym_len)   // skip training symbol 1
+            + cp;         // skip CP of training symbol 2
+        std::copy(train2_body_ptr, train2_body_ptr + nfft, Y2.begin());
+        fft_complex(Y2.data(), nfft);
+    }
+
+    std::complex<float> diff_corr(0, 0);
+    for (int i = 0; i < n_used; i++) {
+        int bin = config_.used_carrier_bins[i];
+        diff_corr += Y2[bin] * std::conj(Y1[bin]);
     }
     float diff_phase = std::arg(diff_corr);
     float fine_cfo = diff_phase * config_.sample_rate / (2.0f * (float)M_PI * sym_len);
@@ -314,8 +313,8 @@ OfdmDemodResult OfdmDemodulator::demodulate(
             h_sum += std::abs(h);
         float mean_H = channel_est_.H.empty() ? 0.0f : h_sum / channel_est_.H.size();
         result.mean_H_mag = mean_H;
-        if (mean_H < 0.50f) {
-            IRIS_LOG("[OFDM-RX] quality gate: mean|H|=%.3f < 0.50, skipping decode", mean_H);
+        if (mean_H < 0.05f) {
+            IRIS_LOG("[OFDM-RX] quality gate: mean|H|=%.3f < 0.05, skipping decode", mean_H);
             result.samples_consumed = frame_start + 2 * sym_len;  // skip past preamble
             return result;
         }
@@ -384,8 +383,14 @@ OfdmDemodResult OfdmDemodulator::demodulate(
             std::copy(pilot_body, pilot_body + nfft, fft_buf.data());
             fft_complex(fft_buf.data(), nfft);
 
-            // Update channel estimate from block pilot
-            ofdm_update_channel(channel_est_, fft_buf.data(), config_);
+            // Block pilot channel update is DISABLED for FM mode.
+            // The FM radio's deviation limiter clips OFDM symbols (high PAPR),
+            // but the preamble (ZC, near-constant envelope) survives intact.
+            // Updating H[k] from a clipped block pilot corrupts the channel
+            // estimate, causing CPE to diverge from ~7° to ±110° at symbol 16.
+            // The preamble-based estimate + comb pilot CPE tracking is sufficient
+            // for FM channels that are static within a frame.
+            // ofdm_update_channel(channel_est_, fft_buf.data(), config_);
 
             // H8: SFO estimation from block pilot phase drift
             {
@@ -417,10 +422,14 @@ OfdmDemodResult OfdmDemodulator::demodulate(
                         float sfo_ppm_raw = slope * (float)config_.sample_rate
                                           / (2.0f * (float)M_PI * (float)sym_len) * 1e6f;
                         // Only apply if > 5 ppm threshold (avoid correcting noise)
-                        if (std::abs(sfo_ppm_raw) > 5.0f) {
+                        // Cap at 200 ppm — real clock SFO is <100 ppm; anything
+                        // larger is a corrupted block pilot (e.g. FM deviation clipping).
+                        if (std::abs(sfo_ppm_raw) > 5.0f && std::abs(sfo_ppm_raw) < 200.0f) {
                             sfo_ppm_estimate = sfo_ppm_raw;
                             IRIS_LOG("[OFDM-RX] SFO estimate: %.1f ppm (sym_idx=%d, slope=%.5f rad/sym)",
                                      sfo_ppm_estimate, sym_idx, slope);
+                        } else if (std::abs(sfo_ppm_raw) >= 200.0f) {
+                            IRIS_LOG("[OFDM-RX] SFO estimate rejected: %.1f ppm (too large, block pilot likely corrupted)", sfo_ppm_raw);
                         }
                     }
                 }

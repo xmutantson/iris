@@ -14,14 +14,17 @@
 #endif
 
 namespace {
-// FM pre-emphasis compensation gain for a given frequency bin.
-// Returns 1.0 if pre-emphasis compensation is disabled (corner_hz <= 0).
-inline float preemph_gain(int bin, int nfft, int sample_rate,
-                          float corner_hz, float gain_cap) {
+// FM TX de-emphasis gain: attenuate higher carriers so that AFTER the radio's
+// own pre-emphasis the signal is flat entering the deviation limiter, minimising
+// nonlinear clipping.  H_deemph(f) = 1 / sqrt(1 + (f/fc)^2).
+// Returns 1.0 if disabled (corner_hz <= 0).
+// gain_cap controls maximum attenuation ratio (e.g. 10 → −20 dB floor).
+inline float fm_tx_deemph_gain(int bin, int nfft, int sample_rate,
+                                float corner_hz, float gain_cap) {
     if (corner_hz <= 0.0f) return 1.0f;
     float fhz = (float)bin * (float)sample_rate / (float)nfft;
-    float g = std::sqrt(1.0f + (fhz / corner_hz) * (fhz / corner_hz));
-    return std::min(g, gain_cap);
+    float g = 1.0f / std::sqrt(1.0f + (fhz / corner_hz) * (fhz / corner_hz));
+    return std::max(g, 1.0f / gain_cap);  // floor at 1/cap (e.g. 0.1 for cap=10)
 }
 } // anon namespace
 
@@ -195,16 +198,15 @@ std::vector<std::complex<float>> OfdmModulator::generate_training_symbol_1() {
 
     // PN sequence for even-indexed used subcarriers (BPSK: +1 or -1).
     // Simple LFSR-based: seed = 0xACE1.
-    // Pre-emphasis compensation: boost higher carriers to counteract FM
-    // de-emphasis (6 dB/octave). This reduces spectral tilt BEFORE the
-    // deviation limiter, lowering nonlinear clipping that degrades Schmidl-Cox.
+    // TX de-emphasis: attenuate higher carriers so radio pre-emphasis
+    // produces a flat signal entering the deviation limiter.
     // Even-bin-only property preserved → halves still identical.
     uint16_t pn = 0xACE1;
     for (int i = 0; i < (int)config_.used_carrier_bins.size(); i++) {
         int bin = config_.used_carrier_bins[i];
         if (bin % 2 == 0) {  // even FFT bins only → identical halves in time domain
             float val = (pn & 1) ? 1.0f : -1.0f;
-            float g = preemph_gain(bin, nfft, config_.sample_rate,
+            float g = fm_tx_deemph_gain(bin, nfft, config_.sample_rate,
                                    config_.fm_preemph_corner_hz,
                                    config_.fm_preemph_gain_cap);
             freq[bin] = {val * g, 0.0f};
@@ -225,11 +227,11 @@ std::vector<std::complex<float>> OfdmModulator::generate_training_symbol_2() {
     int nfft = config_.nfft;
     std::vector<std::complex<float>> freq(nfft, {0.0f, 0.0f});
 
-    // Pre-emphasis compensation: same curve as train1, data, header, and pilots.
-    // H[k] from channel estimator includes gain[k]. All other symbol types
-    // also carry gain[k], so it cancels during equalization.
+    // TX de-emphasis: same curve as train1, ZC, data, and pilots.
+    // Channel estimator H[k] includes the gain. All symbol types carry the
+    // same gain, so it cancels during equalization.
     for (int bin : config_.used_carrier_bins) {
-        float g = preemph_gain(bin, config_.nfft, config_.sample_rate,
+        float g = fm_tx_deemph_gain(bin, config_.nfft, config_.sample_rate,
                                config_.fm_preemph_corner_hz,
                                config_.fm_preemph_gain_cap);
         freq[bin] = {g, 0.0f};
@@ -505,13 +507,13 @@ std::vector<std::complex<float>> OfdmModulator::build_ofdm_frame(
         }
     }
 
-    // ---- 6c. TX pre-emphasis compensation (M1) ----
-    // FM de-emphasis causes higher-frequency carriers to lose power at the
-    // receiver (6 dB/octave rolloff). Pre-compensate by boosting higher carriers
-    // so all carriers arrive at roughly equal power after de-emphasis.
-    // Same gain curve as training symbols, header, and pilots — the gain
-    // cancels in H[k] during equalization.  Disabled when corner_hz <= 0
-    // (flat audio data port connection).
+    // ---- 6c. TX de-emphasis (M1) ----
+    // Attenuate higher carriers so that AFTER the radio's own pre-emphasis
+    // the signal is flat entering the deviation limiter, minimising
+    // nonlinear clipping.  The RX radio de-emphasis restores the tilt, and
+    // the equaliser removes it using H[k].  Same gain curve as training
+    // symbols and pilots — cancels in H[k] during equalization.
+    // Disabled when corner_hz <= 0 (flat audio data port connection).
     if (config_.fm_preemph_corner_hz > 0.0f) {
         for (int s = 0; s < n_data_symbols; s++) {
             for (int k = 0; k < tone_map.n_data_carriers; k++) {
@@ -526,7 +528,7 @@ std::vector<std::complex<float>> OfdmModulator::build_ofdm_frame(
                     }
                 }
                 int bin = config_.used_carrier_bins[used_idx];
-                data_sym_carriers[s][k] *= preemph_gain(bin, config_.nfft,
+                data_sym_carriers[s][k] *= fm_tx_deemph_gain(bin, config_.nfft,
                     config_.sample_rate, config_.fm_preemph_corner_hz,
                     config_.fm_preemph_gain_cap);
             }
@@ -553,9 +555,9 @@ std::vector<std::complex<float>> OfdmModulator::build_ofdm_frame(
         int data_idx = 0;
         for (int i = 0; i < n_used; i++) {
             if (is_pilot[i]) {
-                // Comb pilot: +1 × pre-emphasis gain (must match block pilots / train2)
+                // Comb pilot: +1 × de-emphasis gain (must match block pilots / train2)
                 int bin = config_.used_carrier_bins[i];
-                float g = preemph_gain(bin, config_.nfft, config_.sample_rate,
+                float g = fm_tx_deemph_gain(bin, config_.nfft, config_.sample_rate,
                                        config_.fm_preemph_corner_hz,
                                        config_.fm_preemph_gain_cap);
                 all_used[i] = {g, 0.0f};
@@ -583,8 +585,8 @@ std::vector<std::complex<float>> OfdmModulator::build_ofdm_frame(
     auto train2 = train1;  // identical copy for CFO estimation
 
     // Preamble boost: √2 (3 dB) extra amplitude for detection headroom.
-    // FM radio pre-emphasis + deviation limiting degrades OFDM peaks;
-    // boosting the preamble ensures ZC cross-correlation stays above threshold.
+    // Even with TX de-emphasis the radio may clip some peaks; the boost
+    // ensures ZC cross-correlation stays above detection threshold.
     constexpr float PREAMBLE_BOOST = 1.4142f;  // sqrt(2)
     for (auto& s : train1) s *= PREAMBLE_BOOST;
     for (auto& s : train2) s *= PREAMBLE_BOOST;
@@ -627,44 +629,26 @@ std::vector<std::complex<float>> OfdmModulator::build_ofdm_frame(
     // Tail
     frame.insert(frame.end(), tail.begin(), tail.end());
 
-    // ---- 13. Iterative clip-and-filter for FM PAPR control ----
-    // Soft clip at 2.5x RMS (8 dB). The FM radio's audio input IS amplitude-
-    // sensitive — its deviation limiter hard-clips uncontrolled peaks, destroying
-    // subcarrier orthogonality. Controlled soft clipping is much less harmful
-    // than uncontrolled hard clipping.
-    // Three iterations of clip-and-filter to better control spectral regrowth.
+    // ---- 13. PAPR management ----
+    // Soft clipping is DISABLED: it corrupts pilot symbols (both comb pilots
+    // in data symbols and block pilot symbols), destroying channel estimation.
+    // The receiver's CPE tracker sees 80°+ phase errors after the first block
+    // pilot update because the clipped pilot values don't match the reference.
     //
-    // CRITICAL: Only clip data/header/pilot symbols — NOT the training preamble.
-    // Clipping destroys the half-symbol repetition property that Schmidl-Cox
-    // relies on for frame detection. The preamble has √2 boost and relatively
-    // low PAPR (BPSK on even carriers), so it doesn't need clipping.
+    // The FM radio's deviation limiter handles amplitude control. The TX should
+    // send the linear OFDM signal and let the radio clip naturally — the
+    // receiver is designed to handle the resulting distortion via its channel
+    // estimation and LDPC FEC.
     int n_clipped = 0;
 
-    constexpr float CLIP_RATIO = 2.5f;  // 8 dB PAPR — keeps signal within FM radio's linear deviation range
-    constexpr int CLIP_ITERS = 3;
-
-    // Skip the 2 training symbols (train1 + train2)
-    int preamble_samples = 2 * sym_len;
-    if ((int)frame.size() > preamble_samples) {
-        // Create a view of the data portion only
-        std::vector<std::complex<float>> data_part(
-            frame.begin() + preamble_samples, frame.end());
-        for (int iter = 0; iter < CLIP_ITERS; iter++) {
-            n_clipped += soft_clip(data_part, CLIP_RATIO);
-        }
-        // Copy clipped data back
-        std::copy(data_part.begin(), data_part.end(),
-                  frame.begin() + preamble_samples);
-    }
-    if (n_clipped > 0)
-        IRIS_LOG("[OFDM-TX] clip-filter: %d iters, ratio=%.1f, %d samples clipped",
-                 CLIP_ITERS, CLIP_RATIO, n_clipped);
-
-    // ---- 13b. TX bandpass filter (frequency-domain windowing) ----
-    // Suppress out-of-band spectral regrowth from clipping.
-    // FFT entire frame, zero bins outside passband with raised-cosine taper, IFFT back.
-    // FFT requires power-of-2 length, so pad frame and truncate after IFFT.
-    {
+    // ---- 13b. TX bandpass filter ----
+    // DISABLED: frame-level FFT windowing creates spectral leakage between OFDM
+    // symbols (Gibbs effect from zero-padding the frame to power-of-2 length).
+    // This corrupts inter-symbol phase relationships and prevents LDPC decode.
+    // The real FM radio already bandpass-filters the audio; additional TX filtering
+    // is unnecessary and harmful.  If needed in the future, use a time-domain FIR
+    // or per-symbol frequency-domain windowing instead.
+    if (false) {
         int frame_len = (int)frame.size();
         if (frame_len > 0) {
             // Round up to next power of 2
@@ -720,12 +704,12 @@ std::vector<std::complex<float>> OfdmModulator::build_ofdm_frame(
             }
 
             // IFFT back to time domain
+            // fft_complex (forward, no 1/N) + ifft_complex (backward, 1/N) = identity
+            // No additional scaling needed.
             iris::ifft_complex(spectrum.data(), N);
 
-            // ifft_complex divides by N internally; scale by N to recover original amplitude
-            float scale = (float)N;
             for (int i = 0; i < frame_len; i++)
-                frame[i] = spectrum[i] * scale;
+                frame[i] = spectrum[i];
         }
     }
 

@@ -114,6 +114,8 @@ static void print_usage() {
     printf("  --noaudio          Disable audio I/O (for testing)\n");
     printf("  --loopback         Internal audio loopback (TX->RX, no hardware)\n");
     printf("  --noise <amp>      Add AWGN noise to loopback (amplitude, e.g. 0.01)\n");
+    printf("  --fm-channel       Enable FM channel simulator in loopback\n");
+    printf("  --fm-cfo <Hz>      FM channel frequency offset (default: 0)\n");
     printf("  --list-audio       List audio devices and exit\n");
     printf("  --capture <id>     Capture device ID (-1 = default)\n");
     printf("  --playback <id>    Playback device ID (-1 = default)\n");
@@ -193,6 +195,8 @@ int main(int argc, char** argv) {
     float cli_noise = 0.0f;
     float cli_bp_low = 0.0f, cli_bp_high = 0.0f;
     float cli_deemph_us = 0.0f;
+    bool cli_fm_channel = false;
+    float cli_fm_cfo = 0.0f;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--test") == 0) {
@@ -295,6 +299,10 @@ int main(int argc, char** argv) {
             }
         } else if (strcmp(argv[i], "--deemphasis") == 0 && i + 1 < argc) {
             cli_deemph_us = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--fm-channel") == 0) {
+            cli_fm_channel = true;
+        } else if (strcmp(argv[i], "--fm-cfo") == 0 && i + 1 < argc) {
+            cli_fm_cfo = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage();
             return 0;
@@ -446,6 +454,11 @@ int main(int argc, char** argv) {
         modem.set_loopback_mode(true);
     if (cli_noise > 0.0f)
         loopback_set_noise(cli_noise);
+    if (cli_fm_channel) {
+        // Standard NBFM channel: 530µs pre/de-emphasis, 300-3000 Hz bandpass
+        loopback_set_fm_channel(530.0f, 300.0f, 3000.0f, cli_fm_cfo, 0.95f);
+        printf("  FM channel sim: pre-emphasis=530µs, BP=300-3000 Hz, CFO=%.1f Hz\n", cli_fm_cfo);
+    }
     if (cli_speed_level >= 0)
         modem.force_speed_level(cli_speed_level);
 
