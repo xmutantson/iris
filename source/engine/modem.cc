@@ -3183,24 +3183,15 @@ void Modem::tick() {
                 }
             } else if (ts == TuneState::SEND_REPORT) {
                 // Send our measurement to peer (twice for reliability).
-                // OFDM power-ramp: pick best frame (fewest LDPC iters) and report index.
-                char report[64];
+                // OFDM power-ramp: send all 3 (iters, H) pairs for parabolic fit.
+                char report[128];
                 if (ofdm_phy_active_ && ofdm_mod_) {
-                    // Find best ramp frame: fewest LDPC iters among decoded frames
-                    int best = -1;
-                    int best_iters = 999;
-                    for (int r = 0; r < TUNE_RAMP_LEVELS; r++) {
-                        if (tune_rx_frame_iters_[r] >= 0 && tune_rx_frame_iters_[r] < best_iters) {
-                            best_iters = tune_rx_frame_iters_[r];
-                            best = r;
-                        }
-                    }
-                    // Tie-break: among frames with same iters, prefer louder (lower index)
-                    // (already handled — loop goes 0→2, first match wins)
-                    snprintf(report, sizeof(report), "TUNE:RAMP=%d,%d,%.4f",
-                             best, best_iters, tune_my_gain_);
-                    IRIS_LOG("[TUNE] OFDM ramp report: best=%d iters=%d H=[%.2f,%.2f,%.2f]",
-                             best, best_iters,
+                    snprintf(report, sizeof(report), "TUNE:RAMP3=%d,%.4f,%d,%.4f,%d,%.4f",
+                             tune_rx_frame_iters_[0], tune_rx_frame_H_[0],
+                             tune_rx_frame_iters_[1], tune_rx_frame_H_[1],
+                             tune_rx_frame_iters_[2], tune_rx_frame_H_[2]);
+                    IRIS_LOG("[TUNE] OFDM ramp report: iters=[%d,%d,%d] H=[%.2f,%.2f,%.2f]",
+                             tune_rx_frame_iters_[0], tune_rx_frame_iters_[1], tune_rx_frame_iters_[2],
                              tune_rx_frame_H_[0], tune_rx_frame_H_[1], tune_rx_frame_H_[2]);
                 } else {
                     snprintf(report, sizeof(report), "TUNE:GAIN=%.4f", tune_my_gain_);
@@ -3219,16 +3210,12 @@ void Modem::tick() {
                 // sent while the peer was still transmitting (PTT on, rx_muted).
                 tune_report_resend_cd_--;
                 if (tune_report_resend_cd_ <= 0) {
-                    char report[64];
+                    char report[128];
                     if (ofdm_phy_active_ && ofdm_mod_) {
-                        int best = -1, best_iters = 999;
-                        for (int r = 0; r < TUNE_RAMP_LEVELS; r++) {
-                            if (tune_rx_frame_iters_[r] >= 0 && tune_rx_frame_iters_[r] < best_iters) {
-                                best_iters = tune_rx_frame_iters_[r]; best = r;
-                            }
-                        }
-                        snprintf(report, sizeof(report), "TUNE:RAMP=%d,%d,%.4f",
-                                 best, best_iters, tune_my_gain_);
+                        snprintf(report, sizeof(report), "TUNE:RAMP3=%d,%.4f,%d,%.4f,%d,%.4f",
+                                 tune_rx_frame_iters_[0], tune_rx_frame_H_[0],
+                                 tune_rx_frame_iters_[1], tune_rx_frame_H_[1],
+                                 tune_rx_frame_iters_[2], tune_rx_frame_H_[2]);
                     } else {
                         snprintf(report, sizeof(report), "TUNE:GAIN=%.4f", tune_my_gain_);
                     }
@@ -3239,16 +3226,12 @@ void Modem::tick() {
                 }
             } else if (ts == TuneState::SEND_REPORT_AND_TEST) {
                 // Responder: send ramp/gain report via AFSK (twice), then test frames.
-                char report[64];
+                char report[128];
                 if (ofdm_phy_active_ && ofdm_mod_) {
-                    int best = -1, best_iters = 999;
-                    for (int r = 0; r < TUNE_RAMP_LEVELS; r++) {
-                        if (tune_rx_frame_iters_[r] >= 0 && tune_rx_frame_iters_[r] < best_iters) {
-                            best_iters = tune_rx_frame_iters_[r]; best = r;
-                        }
-                    }
-                    snprintf(report, sizeof(report), "TUNE:RAMP=%d,%d,%.4f",
-                             best, best_iters, tune_my_gain_);
+                    snprintf(report, sizeof(report), "TUNE:RAMP3=%d,%.4f,%d,%.4f,%d,%.4f",
+                             tune_rx_frame_iters_[0], tune_rx_frame_H_[0],
+                             tune_rx_frame_iters_[1], tune_rx_frame_H_[1],
+                             tune_rx_frame_iters_[2], tune_rx_frame_H_[2]);
                 } else {
                     snprintf(report, sizeof(report), "TUNE:GAIN=%.4f", tune_my_gain_);
                 }
@@ -3913,7 +3896,7 @@ void Modem::tune_build_and_queue_test_frame() {
 
             // Apply power-ramp level for this frame: scales [1.4, 1.0, 0.6] × tx_level.
             // Record actual tx_level used so we can adopt the best one later.
-            float ramp_scale = (i < TUNE_RAMP_LEVELS) ? tune_ramp_scales_[i] : 1.0f;
+            float ramp_scale = (i < TUNE_RAMP_LEVELS) ? TUNE_RAMP_SCALES[i] : 1.0f;
             float frame_tx = std::clamp(config_.tx_level * ramp_scale, 0.05f, 1.0f);
             if (i < TUNE_RAMP_LEVELS) tune_ramp_tx_levels_[i] = frame_tx;
             for (auto& s : audio) s *= frame_tx;
@@ -4001,30 +3984,31 @@ void Modem::handle_tune_frame(const uint8_t* info, size_t len) {
             tune_test_frames_sent_ = 0;
             tune_frames_measured_ = 0;
             tune_wait_peer_ticks_ = 0;
-            tune_ramp_best_ = -1;
-            tune_ramp_best_iters_ = 999;
             for (int i = 0; i < TUNE_RAMP_LEVELS; i++) {
                 tune_rx_frame_iters_[i] = -1;
                 tune_rx_frame_H_[i] = 0;
+                tune_peer_iters_[i] = -1;
+                tune_peer_H_[i] = 0;
                 tune_ramp_tx_levels_[i] = 0;
             }
         }
-    } else if (payload.find("TUNE:RAMP=") != std::string::npos) {
-        // OFDM power-ramp report: peer tells us which of our 3 frames was best.
-        // Format: "TUNE:RAMP=<best_idx>,<ldpc_iters>,<mean_H>"
-        size_t pos = payload.find("TUNE:RAMP=");
-        int best = -1, iters = 999;
-        float h = 0.0f;
-        if (sscanf(payload.c_str() + pos + 10, "%d,%d,%f", &best, &iters, &h) >= 2) {
-            IRIS_LOG("[TUNE] Peer ramp report: best=%d iters=%d H=%.3f (state=%d)",
-                     best, iters, h, (int)tune_state_.load());
-            tune_ramp_best_ = best;
-            tune_ramp_best_iters_ = iters;
-            tune_peer_gain_ = h > 0.01f ? h : 1.0f;  // fallback for APPLY
-            tune_audit("RAMP_REPORT best=%d iters=%d H=%.4f state=%d",
-                       best, iters, h, (int)tune_state_.load());
+    } else if (payload.find("TUNE:RAMP3=") != std::string::npos) {
+        // OFDM power-ramp report: peer sends all 3 (iters, H) pairs for parabolic fit.
+        // Format: "TUNE:RAMP3=<i0>,<h0>,<i1>,<h1>,<i2>,<h2>"
+        size_t pos = payload.find("TUNE:RAMP3=");
+        int i0, i1, i2;
+        float h0, h1, h2;
+        if (sscanf(payload.c_str() + pos + 11, "%d,%f,%d,%f,%d,%f",
+                   &i0, &h0, &i1, &h1, &i2, &h2) >= 6) {
+            tune_peer_iters_[0] = i0; tune_peer_H_[0] = h0;
+            tune_peer_iters_[1] = i1; tune_peer_H_[1] = h1;
+            tune_peer_iters_[2] = i2; tune_peer_H_[2] = h2;
+            IRIS_LOG("[TUNE] Peer ramp3 report: iters=[%d,%d,%d] H=[%.3f,%.3f,%.3f] (state=%d)",
+                     i0, i1, i2, h0, h1, h2, (int)tune_state_.load());
+            tune_audit("RAMP3_REPORT iters=[%d,%d,%d] H=[%.4f,%.4f,%.4f] state=%d",
+                       i0, i1, i2, h0, h1, h2, (int)tune_state_.load());
         } else {
-            IRIS_LOG("[TUNE] Invalid RAMP format in payload");
+            IRIS_LOG("[TUNE] Invalid RAMP3 format in payload");
             return;
         }
 
@@ -4073,8 +4057,115 @@ void Modem::handle_tune_frame(const uint8_t* info, size_t len) {
     }
 }
 
-// Static constexpr member definition (C++14 ODR-use)
+// Static constexpr member definitions (C++14 ODR-use)
 constexpr float Modem::ofdm_level_offset_db_[8];
+constexpr float Modem::TUNE_RAMP_SCALES[3];
+
+float Modem::tune_parabolic_fit() const {
+    // Fit iters(x) = a·x² + b·x + c where x = 20·log10(tx_level).
+    // The quality-vs-drive curve is U-shaped in dB space:
+    //   too quiet → high iters (noise-limited)
+    //   optimal   → low iters
+    //   too loud  → high iters (FM clipping)
+    // Minimum of parabola at x_opt = -b/(2a), convert back: tx = 10^(x_opt/20).
+
+    // Collect valid data points: (x_dB, iters)
+    float x[TUNE_RAMP_LEVELS], y[TUNE_RAMP_LEVELS];
+    int n = 0;
+    for (int i = 0; i < TUNE_RAMP_LEVELS; i++) {
+        if (tune_peer_iters_[i] < 0) continue;  // not decoded
+        float tx = tune_ramp_tx_levels_[i];
+        if (tx < 0.001f) continue;
+        x[n] = 20.0f * std::log10(tx);
+        // Map LDPC iters: use raw value. Failed frames (iters=50) naturally
+        // create high y-values that push the parabola away from those levels.
+        y[n] = (float)tune_peer_iters_[i];
+        n++;
+    }
+
+    if (n == 0) {
+        IRIS_LOG("[TUNE] parabolic fit: no valid data points");
+        return config_.tx_level;  // no change
+    }
+
+    if (n == 1) {
+        // Only one frame decoded — use channel gain to estimate optimal.
+        // H = k * tx, so optimal tx = H_target / k. Target H ≈ 1.0.
+        int idx = -1;
+        for (int i = 0; i < TUNE_RAMP_LEVELS; i++)
+            if (tune_peer_iters_[i] >= 0 && tune_peer_H_[i] > 0.01f) { idx = i; break; }
+        if (idx >= 0 && tune_ramp_tx_levels_[idx] > 0.001f) {
+            float k = tune_peer_H_[idx] / tune_ramp_tx_levels_[idx];
+            float opt = 1.0f / k;  // target mean|H| = 1.0
+            IRIS_LOG("[TUNE] parabolic fit: 1 point, k=%.2f, opt=%.4f (H-based)", k, opt);
+            return std::clamp(opt, 0.05f, 1.0f);
+        }
+        return config_.tx_level;
+    }
+
+    if (n == 2) {
+        // Two frames decoded — can't fit parabola. Use the better one, then
+        // interpolate toward it (midpoint between the two in dB space, biased
+        // toward the one with fewer LDPC iterations).
+        int better = (y[0] <= y[1]) ? 0 : 1;
+        // Weight toward the better frame: 70% better, 30% worse
+        float x_opt = 0.7f * x[better] + 0.3f * x[1 - better];
+        float tx_opt = std::pow(10.0f, x_opt / 20.0f);
+        IRIS_LOG("[TUNE] parabolic fit: 2 points, x=[%.1f,%.1f] y=[%.0f,%.0f] -> x_opt=%.1f dB (tx=%.4f)",
+                 x[0], x[1], y[0], y[1], x_opt, tx_opt);
+        return std::clamp(tx_opt, 0.05f, 1.0f);
+    }
+
+    // 3 points: fit parabola y = a·x² + b·x + c via normal equations
+    // [S0  S1  S2 ] [c]   [Sy0]
+    // [S1  S2  S3 ] [b] = [Sy1]
+    // [S2  S3  S4 ] [a]   [Sy2]
+    float S0 = (float)n, S1 = 0, S2 = 0, S3 = 0, S4 = 0;
+    float Sy0 = 0, Sy1 = 0, Sy2 = 0;
+    for (int i = 0; i < n; i++) {
+        float xi = x[i], yi = y[i];
+        S1 += xi; S2 += xi*xi; S3 += xi*xi*xi; S4 += xi*xi*xi*xi;
+        Sy0 += yi; Sy1 += xi*yi; Sy2 += xi*xi*yi;
+    }
+
+    // Solve 3×3 system (Cramer's rule for simplicity)
+    float D = S0*(S2*S4 - S3*S3) - S1*(S1*S4 - S3*S2) + S2*(S1*S3 - S2*S2);
+    if (std::abs(D) < 1e-12f) {
+        // Degenerate — just pick the best frame
+        int best = 0;
+        for (int i = 1; i < n; i++) if (y[i] < y[best]) best = i;
+        float tx_opt = std::pow(10.0f, x[best] / 20.0f);
+        IRIS_LOG("[TUNE] parabolic fit: degenerate (D=%.2e), using best frame x=%.1f dB", D, x[best]);
+        return std::clamp(tx_opt, 0.05f, 1.0f);
+    }
+
+    float Da = S0*(S2*Sy2 - S3*Sy1) - S1*(S1*Sy2 - S3*Sy0) + S2*(S1*Sy1 - S2*Sy0);
+    float Db = S0*(Sy1*S4 - S3*Sy2) - S1*(Sy0*S4 - Sy2*S2) + S2*(Sy0*S3 - Sy1*S2);
+
+    float a = Da / D;
+    float b = Db / D;
+
+    IRIS_LOG("[TUNE] parabolic fit: x=[%.1f,%.1f,%.1f] y=[%.0f,%.0f,%.0f] a=%.4f b=%.4f",
+             x[0], x[1], x[2], y[0], y[1], y[2], a, b);
+
+    if (a <= 0.0f) {
+        // Concave (not convex) — no minimum. This means the relationship is
+        // monotonic across our range. Pick the frame with fewest iters.
+        int best = 0;
+        for (int i = 1; i < n; i++) if (y[i] < y[best]) best = i;
+        float tx_opt = std::pow(10.0f, x[best] / 20.0f);
+        IRIS_LOG("[TUNE] parabolic fit: concave (a=%.4f), monotonic -> best frame x=%.1f dB (tx=%.4f)",
+                 a, x[best], tx_opt);
+        return std::clamp(tx_opt, 0.05f, 1.0f);
+    }
+
+    // Minimum at x_opt = -b / (2a)
+    float x_opt = -b / (2.0f * a);
+    float tx_opt = std::pow(10.0f, x_opt / 20.0f);
+
+    IRIS_LOG("[TUNE] parabolic fit: minimum at %.1f dB -> tx=%.4f", x_opt, tx_opt);
+    return std::clamp(tx_opt, 0.05f, 1.0f);
+}
 
 float Modem::ofdm_effective_tx_level() const {
     if (ofdm_tx_base_ <= 0.0f) return config_.tx_level;
@@ -4105,25 +4196,21 @@ void Modem::tune_apply_corrections() {
     float old_level = config_.tx_level;
 
     if (native_mode_ || ofdm_kiss_) {
-        // OFDM power-ramp TUNE: peer reported which of our 3 ramp frames (at
-        // different TX levels) decoded best. Adopt that level as O0 baseline.
+        // OFDM power-ramp TUNE: peer reported (iters, H) for each of our 3 ramp
+        // frames at different TX levels. Use parabolic fit to find optimal tx_level.
         //
-        // If peer sent a RAMP report: use the exact tx_level that produced the
-        // best LDPC performance at the peer's receiver.
-        // If peer sent a legacy GAIN report: fall back to mean|H| targeting.
-        if (tune_ramp_best_ >= 0 && tune_ramp_best_ < TUNE_RAMP_LEVELS) {
-            float best_level = tune_ramp_tx_levels_[tune_ramp_best_];
-            IRIS_LOG("[TUNE] OFDM ramp: peer picked frame %d (tx=%.3f, %d LDPC iters)",
-                     tune_ramp_best_, best_level, tune_ramp_best_iters_);
-
-            // If the best frame had very few LDPC iterations, we could push
-            // slightly louder. If it had many, we're at the edge — keep as-is.
-            // Conservative: just adopt the winning level directly.
-            config_.tx_level = best_level;
+        // If peer sent RAMP3 report: fit parabola to find optimal drive level.
+        // If peer sent legacy GAIN report: fall back to mean|H| targeting.
+        bool have_ramp3 = (tune_peer_iters_[0] >= 0 || tune_peer_iters_[1] >= 0 ||
+                           tune_peer_iters_[2] >= 0);
+        if (have_ramp3) {
+            float fitted_tx = tune_parabolic_fit();
+            config_.tx_level = std::clamp(fitted_tx, 0.05f, 1.0f);
             config_.calibrated_tx_level = config_.tx_level;
             ofdm_tx_base_ = config_.tx_level;
-            IRIS_LOG("[TUNE] OFDM TX: level %.3f → %.3f (ramp frame %d, %d iters)",
-                     old_level, config_.tx_level, tune_ramp_best_, tune_ramp_best_iters_);
+            IRIS_LOG("[TUNE] OFDM TX: parabolic fit → %.3f (was %.3f), peer iters=[%d,%d,%d]",
+                     config_.tx_level, old_level,
+                     tune_peer_iters_[0], tune_peer_iters_[1], tune_peer_iters_[2]);
         } else if (tune_peer_gain_ > 0.01f) {
             // Fallback: legacy GAIN report from peer (backward compat or no frames decoded)
             constexpr float OFDM_TARGET_H = 1.0f;
@@ -4280,11 +4367,11 @@ void Modem::start_autotune(const std::string& remote_callsign) {
     tune_frames_measured_ = 0;
     tune_wait_peer_ticks_ = 0;
     tune_timeout_ = 400;  // 20s at 50ms/tick
-    tune_ramp_best_ = -1;
-    tune_ramp_best_iters_ = 999;
     for (int i = 0; i < TUNE_RAMP_LEVELS; i++) {
         tune_rx_frame_iters_[i] = -1;
         tune_rx_frame_H_[i] = 0;
+        tune_peer_iters_[i] = -1;
+        tune_peer_H_[i] = 0;
         tune_ramp_tx_levels_[i] = 0;
     }
 

@@ -467,15 +467,24 @@ private:
     int tune_wait_peer_ticks_ = 0;       // Ticks spent in WAIT_PEER (for timeout transition)
     int tune_report_resend_cd_ = 0;      // Countdown to resend TUNE:GAIN in WAIT_REPORT
 
-    // OFDM power-ramp TUNE: send 3 frames at different levels, peer picks best.
+    // OFDM power-ramp TUNE: send 3 frames at geometrically-spaced TX levels,
+    // peer measures LDPC quality for each, reports all 3 data points.
+    // Sender fits a parabola in dB space to find the optimal drive level.
+    //
+    // Ramp scales: [4.0, 1.0, 0.125] → 30 dB range, covers full [0.05, 1.0].
+    // Quality vs tx_dB is U-shaped (parabolic): too quiet = poor SNR,
+    // too loud = FM deviation limiter clipping. Minimum = optimal.
     static constexpr int TUNE_RAMP_LEVELS = 3;
-    float tune_ramp_scales_[TUNE_RAMP_LEVELS] = {1.4f, 1.0f, 0.6f}; // relative to current tx_level
+    static constexpr float TUNE_RAMP_SCALES[TUNE_RAMP_LEVELS] = {4.0f, 1.0f, 0.125f};
     float tune_ramp_tx_levels_[TUNE_RAMP_LEVELS] = {};  // actual tx_level per ramp frame
-    int tune_ramp_best_ = -1;            // best frame index reported by peer
-    int tune_ramp_best_iters_ = 999;     // LDPC iters of best frame
-    // RX side: track quality of each received ramp frame
-    int tune_rx_frame_iters_[TUNE_RAMP_LEVELS] = {-1, -1, -1};  // LDPC iters (-1=not decoded)
-    float tune_rx_frame_H_[TUNE_RAMP_LEVELS] = {};  // mean|H| per frame
+    // Peer's report: iters and H for each of our ramp frames
+    int tune_peer_iters_[TUNE_RAMP_LEVELS] = {-1, -1, -1};
+    float tune_peer_H_[TUNE_RAMP_LEVELS] = {};
+    // RX side: track quality of each received ramp frame from peer
+    int tune_rx_frame_iters_[TUNE_RAMP_LEVELS] = {-1, -1, -1};
+    float tune_rx_frame_H_[TUNE_RAMP_LEVELS] = {};
+    // Compute optimal tx_level from parabolic fit of (tx_dB, iters) data
+    float tune_parabolic_fit() const;
 
     // Per-O-level TX drive offset (dB below O0 baseline).
     // Higher modulations have tighter constellations → more sensitive to FM
