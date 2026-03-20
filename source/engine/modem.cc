@@ -2509,12 +2509,10 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                     // per-carrier equalization via training symbols internally.
 
                     // Normalize RMS AFTER EQ to control total power.
-                    // Target 0.50: FM deviation limiter clips anyway, so maximize
-                    // average deviation for best received SNR. Peaks at ~2.5×RMS=1.25
-                    // get hard-clipped to 0.95 — acceptable on FM (radio clips similarly).
-                    // Previous 0.35 target was 5 dB below AFSK output, causing OTA
-                    // preamble detection failure (mean SNR 2 dB per carrier).
-                    // OFDM bypasses tx_level (which was calibrated for native PHY).
+                    // Target 0.50 is the "full scale" OFDM output before tx_level
+                    // scaling. tx_level (set by TUNE) controls actual drive into FM
+                    // transmitter. Default tx_level=0.50 → output RMS≈0.25.
+                    // TUNE adjusts tx_level targeting mean|H|≈1.0 at the receiver.
                     // Normalize DATA portion only — preamble (ZC sequence with
                     // sqrt(2) boost) is scaled separately to preserve correlation.
                     int preamble_samples = 2 * (ofdm_config_.nfft + ofdm_config_.cp_samples);
@@ -2638,11 +2636,13 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
             if (gui_log_)
                 gui_log_("[TX] " + std::to_string(air_ms) + " ms on air");
 
-            // OFDM manages its own level (normalized after EQ); native uses tx_level.
-            if (!(ofdm_phy_active_ && ofdm_mod_)) {
-                for (auto& s : tx_buffer_)
-                    s *= config_.tx_level;
-            }
+            // Apply tx_level gain control to TX buffer.
+            // OFDM: tx_level scales the already-normalized signal (RMS=0.50).
+            //   TUNE adjusts tx_level to avoid overdriving FM deviation limiter.
+            //   Default tx_level=0.50 → output RMS=0.25 — conservative for FM.
+            // Native: tx_level applied directly to upconverted audio.
+            for (auto& s : tx_buffer_)
+                s *= config_.tx_level;
 
             // Pre-TX silence for PTT hardware settle.
             // AX.25: 50ms hardware settle + flag bytes provide the rest of TXDELAY.
@@ -3821,8 +3821,9 @@ void Modem::tune_build_and_queue_test_frame() {
 
     for (int i = 0; i < tune_test_frames_target_; i++) {
         if (ofdm_phy_active_ && ofdm_mod_) {
-            // OFDM TUNE frame: use QPSK r1/2 (preset 2) for maximum reliability
-            ToneMap tune_map = get_uniform_tone_map(2, ofdm_config_);
+            // OFDM TUNE frame: use BPSK r1/2 (O0) for maximum reliability at
+            // possibly-wrong TX levels (the whole point of TUNE is to calibrate).
+            ToneMap tune_map = get_uniform_tone_map(1, ofdm_config_);
             auto ofdm_iq = ofdm_mod_->build_ofdm_frame(
                 test_payload, sizeof(test_payload) - 1, tune_map, LdpcRate::RATE_1_2);
             if (ofdm_iq.empty()) {
@@ -3893,10 +3894,10 @@ void Modem::tune_build_and_queue_test_frame() {
         }
     }
 
-    // Apply tx_level for native TUNE frames only; OFDM manages its own level.
-    if (!(ofdm_phy_active_ && ofdm_mod_)) {
-        for (auto& s : tx_buffer_) s *= config_.tx_level;
-    }
+    // Apply tx_level to TUNE frames (both OFDM and native).
+    // OFDM test frames are already normalized to 0.50 RMS, tx_level scales
+    // from there. This ensures TUNE measures gain at the actual TX level.
+    for (auto& s : tx_buffer_) s *= config_.tx_level;
 
     // TUNE uses OFDM frames — need full TXDELAY for radio settle
     int pre_ms = config_.ptt_pre_delay_ms;
@@ -3997,21 +3998,38 @@ void Modem::tune_apply_corrections() {
 
     float old_level = config_.tx_level;
 
-    // OFDM native mode: skip BOTH TX and RX adjustments.
-    // The OFDM channel estimate mean|H| includes the FFT N-factor (512), so
-    // mean|H| ≈ 3-8 for normal audio levels. TUNE interprets this as "3-8x
-    // too loud" and attenuates both TX (tx_level /= peer_gain → 0.11-0.14)
-    // and RX (rx_gain = 1/my_gain → 0.16). Combined: 14-37x attenuation per
-    // direction. OTA confirmed: 3/3 decoded before TUNE, 0/everything after.
-    // The MMSE equalizer handles arbitrary channel gain, and the FM radio's
-    // deviation limiter handles PAPR. Gain calibration adds nothing for OFDM.
-    // TX adjustment is especially dangerous: calibrated_tx_level persists
-    // across modes, so OFDM over-correction also kills FX.25 fallback.
     if (native_mode_ || ofdm_kiss_) {
-        IRIS_LOG("[TUNE] OFDM mode: skipping TX/RX correction (mean|H| includes FFT N-factor,"
-                 " peer_gain=%.3f, my_gain=%.3f — normal for OFDM, native=%d kiss=%d)",
-                 tune_peer_gain_, tune_my_gain_, (int)native_mode_, (int)ofdm_kiss_);
+        // OFDM mode: mean|H| reflects end-to-end channel gain (TX audio → FM →
+        // air → FM → RX audio). Target mean|H| ≈ 1.0 — unity equalizer gain,
+        // which means FM deviation is well-utilized without clipping.
+        //
+        // OTA observation: mean|H| = 4-7 causes ZC preamble corruption (the FM
+        // deviation limiter clips peaks, destroying ZC cross-correlation). Too low
+        // means poor SNR. Target 1.0 is the sweet spot.
+        //
+        // TX adjustment uses peer_gain (what THEY measured from OUR frames):
+        //   new_tx = old_tx * (OFDM_TARGET_H / peer_gain)
+        // RX adjustment uses my_gain (what WE measured from THEIR frames):
+        //   No RX gain change — MMSE equalizer handles arbitrary channel gain.
+        //   (Unlike Mode A's hard slicer, OFDM doesn't need gain=1.0 at demod input.)
+        constexpr float OFDM_TARGET_H = 1.0f;
+
+        if (tune_peer_gain_ > 0.01f) {
+            float ratio = OFDM_TARGET_H / tune_peer_gain_;
+            config_.tx_level *= ratio;
+            config_.tx_level = std::clamp(config_.tx_level, 0.05f, 1.0f);
+            config_.calibrated_tx_level = config_.tx_level;
+            IRIS_LOG("[TUNE] OFDM TX: peer saw mean|H|=%.3f (target=%.1f), level %.3f → %.3f",
+                     tune_peer_gain_, OFDM_TARGET_H, old_level, config_.tx_level);
+        } else {
+            IRIS_LOG("[TUNE] OFDM TX: no peer gain report, keeping level %.3f", config_.tx_level);
+        }
+
+        // RX: MMSE equalizer handles arbitrary gain. No RX correction needed.
+        // (If we boosted RX gain here, noise would scale equally → no SNR benefit.
+        // The equalizer already normalizes constellation amplitude via H[k].)
         native_rx_gain_ = 1.0f;
+        IRIS_LOG("[TUNE] OFDM RX: rx_gain=1.0 (MMSE equalizer handles channel gain)");
     } else {
         // Mode A (single-carrier): apply TX and RX corrections as before.
         // TX: adjust toward peer_gain=1.0.
