@@ -1389,9 +1389,11 @@ void Modem::process_rx_native(const float* audio, int count) {
                      result.payload.size(), result.snr_db, result.mean_channel_snr_db,
                      result.n_ldpc_blocks);
 
-            // TUNE gain measurement from OFDM channel estimate
+            // TUNE gain measurement from OFDM channel estimate.
+            // Power-ramp: track per-frame LDPC iters and mean|H|.
+            // The 3 frames were sent at different TX levels — we pick the one
+            // with fewest LDPC iterations (best signal quality without clipping).
             if (tune_state_ == TuneState::WAIT_PEER && native_selfhear_guard_ <= 0) {
-                // Use mean |H| from channel estimate as "gain" equivalent
                 float gain = 0.0f;
                 const auto& est = ofdm_demod_->last_channel_estimate();
                 if (!est.H.empty()) {
@@ -1400,15 +1402,22 @@ void Modem::process_rx_native(const float* audio, int count) {
                     gain = sum / (float)est.H.size();
                 }
                 if (gain > 0.01f) {
+                    int idx = tune_frames_measured_;
                     tune_frames_measured_++;
+                    // Store per-ramp-frame quality
+                    if (idx < TUNE_RAMP_LEVELS) {
+                        tune_rx_frame_iters_[idx] = result.worst_ldpc_iters;
+                        tune_rx_frame_H_[idx] = gain;
+                    }
+                    // EMA for backward compat (gain report fallback)
                     if (tune_my_gain_ == 0)
                         tune_my_gain_ = gain;
                     else
                         tune_my_gain_ = 0.7f * tune_my_gain_ + 0.3f * gain;
-                    IRIS_LOG("[TUNE] OFDM frame %d: gain=%.4f avg=%.4f",
-                             tune_frames_measured_, gain, tune_my_gain_);
-                    tune_audit("MEASURE peer=%s frame=%d raw_gain=%.4f ema_gain=%.4f decode=OK",
-                               tune_peer_call_.c_str(), tune_frames_measured_, gain, tune_my_gain_);
+                    IRIS_LOG("[TUNE] OFDM ramp frame %d: H=%.3f ldpc=%d iters (avg_H=%.3f)",
+                             idx + 1, gain, result.worst_ldpc_iters, tune_my_gain_);
+                    tune_audit("MEASURE peer=%s frame=%d raw_gain=%.4f ldpc_iters=%d decode=OK",
+                               tune_peer_call_.c_str(), idx + 1, gain, result.worst_ldpc_iters);
                 }
             }
 
@@ -1430,10 +1439,11 @@ void Modem::process_rx_native(const float* audio, int count) {
                 arq_.set_modem_gearshift(ofdm_speed_level_, gearshift_.smoothed_snr(),
                                          gearshift_.cooldown());
                 if (ofdm_speed_level_ != old_level) {
-                    IRIS_LOG("[OFDM-RX] gearshift: O%d -> O%d (frame_SNR=%.1f dB, ch_SNR=%.1f, boost=%.1f, cd=%d)",
+                    float eff_tx = ofdm_effective_tx_level();
+                    IRIS_LOG("[OFDM-RX] gearshift: O%d -> O%d (frame_SNR=%.1f dB, ch_SNR=%.1f, boost=%.1f, cd=%d, tx=%.3f)",
                              old_level, ofdm_speed_level_, result.snr_db,
                              result.mean_channel_snr_db,
-                             gearshift_.boost(), gearshift_.cooldown());
+                             gearshift_.boost(), gearshift_.cooldown(), eff_tx);
                     // Speed level changed — stored Chase LLRs are for a different
                     // tone map / FEC rate and would corrupt combining
                     ofdm_chase_llrs_.clear();
@@ -2637,12 +2647,17 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                 gui_log_("[TX] " + std::to_string(air_ms) + " ms on air");
 
             // Apply tx_level gain control to TX buffer.
-            // OFDM: tx_level scales the already-normalized signal (RMS=0.50).
-            //   TUNE adjusts tx_level to avoid overdriving FM deviation limiter.
-            //   Default tx_level=0.50 → output RMS=0.25 — conservative for FM.
+            // OFDM: per-O-level tx_level (base from TUNE + offset for modulation).
+            //   TUNE calibrates ofdm_tx_base_ for O0, higher modes get dB offsets
+            //   to account for tighter constellations (more sensitive to FM clipping).
             // Native: tx_level applied directly to upconverted audio.
-            for (auto& s : tx_buffer_)
-                s *= config_.tx_level;
+            {
+                float tx_gain = (ofdm_phy_active_ && ofdm_mod_)
+                    ? ofdm_effective_tx_level()
+                    : config_.tx_level;
+                for (auto& s : tx_buffer_)
+                    s *= tx_gain;
+            }
 
             // Pre-TX silence for PTT hardware settle.
             // AX.25: 50ms hardware settle + flag bytes provide the rest of TXDELAY.
@@ -3167,12 +3182,30 @@ void Modem::tick() {
                     }
                 }
             } else if (ts == TuneState::SEND_REPORT) {
-                // Send our gain measurement to peer (twice for reliability)
-                char report[48];
-                snprintf(report, sizeof(report), "TUNE:GAIN=%.4f", tune_my_gain_);
-                send_tune_ui(report);
-                send_tune_ui(report);
-                IRIS_LOG("[TUNE] Sending gain report: %.4f", tune_my_gain_);
+                // Send our measurement to peer (twice for reliability).
+                // OFDM power-ramp: pick best frame (fewest LDPC iters) and report index.
+                char report[64];
+                if (ofdm_phy_active_ && ofdm_mod_) {
+                    // Find best ramp frame: fewest LDPC iters among decoded frames
+                    int best = -1;
+                    int best_iters = 999;
+                    for (int r = 0; r < TUNE_RAMP_LEVELS; r++) {
+                        if (tune_rx_frame_iters_[r] >= 0 && tune_rx_frame_iters_[r] < best_iters) {
+                            best_iters = tune_rx_frame_iters_[r];
+                            best = r;
+                        }
+                    }
+                    // Tie-break: among frames with same iters, prefer louder (lower index)
+                    // (already handled — loop goes 0→2, first match wins)
+                    snprintf(report, sizeof(report), "TUNE:RAMP=%d,%d,%.4f",
+                             best, best_iters, tune_my_gain_);
+                    IRIS_LOG("[TUNE] OFDM ramp report: best=%d iters=%d H=[%.2f,%.2f,%.2f]",
+                             best, best_iters,
+                             tune_rx_frame_H_[0], tune_rx_frame_H_[1], tune_rx_frame_H_[2]);
+                } else {
+                    snprintf(report, sizeof(report), "TUNE:GAIN=%.4f", tune_my_gain_);
+                    IRIS_LOG("[TUNE] Sending gain report: %.4f", tune_my_gain_);
+                }
                 tune_state_ = TuneState::WAIT_REPORT;
                 tune_report_resend_cd_ = 100;  // Resend after 5s if no response
                 // Fast-track: if peer_gain already received (arrived during WAIT_PEER)
@@ -3186,21 +3219,43 @@ void Modem::tick() {
                 // sent while the peer was still transmitting (PTT on, rx_muted).
                 tune_report_resend_cd_--;
                 if (tune_report_resend_cd_ <= 0) {
-                    char report[48];
-                    snprintf(report, sizeof(report), "TUNE:GAIN=%.4f", tune_my_gain_);
+                    char report[64];
+                    if (ofdm_phy_active_ && ofdm_mod_) {
+                        int best = -1, best_iters = 999;
+                        for (int r = 0; r < TUNE_RAMP_LEVELS; r++) {
+                            if (tune_rx_frame_iters_[r] >= 0 && tune_rx_frame_iters_[r] < best_iters) {
+                                best_iters = tune_rx_frame_iters_[r]; best = r;
+                            }
+                        }
+                        snprintf(report, sizeof(report), "TUNE:RAMP=%d,%d,%.4f",
+                                 best, best_iters, tune_my_gain_);
+                    } else {
+                        snprintf(report, sizeof(report), "TUNE:GAIN=%.4f", tune_my_gain_);
+                    }
                     send_tune_ui(report);
                     send_tune_ui(report);
                     tune_report_resend_cd_ = 100;  // retry again in 5s
-                    IRIS_LOG("[TUNE] Resending gain report (%.4f) — peer may have missed it", tune_my_gain_);
+                    IRIS_LOG("[TUNE] Resending report (%s) — peer may have missed it", report);
                 }
             } else if (ts == TuneState::SEND_REPORT_AND_TEST) {
-                // Responder: send gain report via AFSK (twice for reliability), then native test frames.
-                char report[48];
-                snprintf(report, sizeof(report), "TUNE:GAIN=%.4f", tune_my_gain_);
+                // Responder: send ramp/gain report via AFSK (twice), then test frames.
+                char report[64];
+                if (ofdm_phy_active_ && ofdm_mod_) {
+                    int best = -1, best_iters = 999;
+                    for (int r = 0; r < TUNE_RAMP_LEVELS; r++) {
+                        if (tune_rx_frame_iters_[r] >= 0 && tune_rx_frame_iters_[r] < best_iters) {
+                            best_iters = tune_rx_frame_iters_[r]; best = r;
+                        }
+                    }
+                    snprintf(report, sizeof(report), "TUNE:RAMP=%d,%d,%.4f",
+                             best, best_iters, tune_my_gain_);
+                } else {
+                    snprintf(report, sizeof(report), "TUNE:GAIN=%.4f", tune_my_gain_);
+                }
                 send_tune_ui(report);
                 send_tune_ui(report);
-                IRIS_LOG("[TUNE] Responder: sending gain report (%.4f), test frames queued after drain",
-                         tune_my_gain_);
+                IRIS_LOG("[TUNE] Responder: sending report (%s), test frames queued after drain",
+                         report);
                 if (gui_log_) gui_log_("[TUNE] Sending report + test frames...");
                 tune_test_frames_sent_ = 0;
                 // Go to a sub-state: wait for AFSK report to drain, then send native test frames
@@ -3821,20 +3876,22 @@ void Modem::tune_build_and_queue_test_frame() {
 
     for (int i = 0; i < tune_test_frames_target_; i++) {
         if (ofdm_phy_active_ && ofdm_mod_) {
-            // OFDM TUNE frame: use BPSK r1/2 (O0) for maximum reliability at
-            // possibly-wrong TX levels (the whole point of TUNE is to calibrate).
-            ToneMap tune_map = get_uniform_tone_map(1, ofdm_config_);
+            // OFDM power-ramp TUNE: each of the 3 frames is sent at a different
+            // TX level (hot/current/conservative). Peer measures LDPC quality for
+            // each and reports which one decoded best. This finds the optimal drive
+            // level in a single exchange (3 frames, ~3.4 seconds airtime).
+            ToneMap tune_map = get_uniform_tone_map(1, ofdm_config_);  // BPSK r1/2 (O0)
             auto ofdm_iq = ofdm_mod_->build_ofdm_frame(
                 test_payload, sizeof(test_payload) - 1, tune_map, LdpcRate::RATE_1_2);
             if (ofdm_iq.empty()) {
                 IRIS_LOG("[TUNE] Failed to build OFDM test frame %d", i + 1);
                 continue;
             }
-            // Extract real passband — bypass TX EQ for OFDM (127-tap FIR > CP=16)
+            // Extract real passband
             std::vector<float> audio(ofdm_iq.size());
             for (size_t j = 0; j < ofdm_iq.size(); j++)
                 audio[j] = ofdm_iq[j].real();
-            // Normalize data portion only — preamble scaled separately
+            // Normalize data portion to 0.50 RMS, preamble peak to ±0.90
             int pre_samp = 2 * (ofdm_config_.nfft + ofdm_config_.cp_samples);
             int dstart = std::min(pre_samp, (int)audio.size());
             float ssq = 0.0f;
@@ -3845,7 +3902,6 @@ void Modem::tune_build_and_queue_test_frame() {
             float sc = (rms > 1e-6f) ? (0.50f / rms) : 0.1f;
             for (int k = dstart; k < (int)audio.size(); k++)
                 audio[k] *= sc;
-            // Scale preamble peak to ±0.90
             float ppeak = 0.0f;
             for (int k = 0; k < dstart; k++)
                 ppeak = std::max(ppeak, std::abs(audio[k]));
@@ -3854,17 +3910,23 @@ void Modem::tune_build_and_queue_test_frame() {
                 for (int k = 0; k < dstart; k++)
                     audio[k] *= ps;
             }
+
+            // Apply power-ramp level for this frame: scales [1.4, 1.0, 0.6] × tx_level.
+            // Record actual tx_level used so we can adopt the best one later.
+            float ramp_scale = (i < TUNE_RAMP_LEVELS) ? tune_ramp_scales_[i] : 1.0f;
+            float frame_tx = std::clamp(config_.tx_level * ramp_scale, 0.05f, 1.0f);
+            if (i < TUNE_RAMP_LEVELS) tune_ramp_tx_levels_[i] = frame_tx;
+            for (auto& s : audio) s *= frame_tx;
+
             // Hard clip to soundcard range
             for (auto& s : audio) {
                 if (s > 0.95f) s = 0.95f;
                 else if (s < -0.95f) s = -0.95f;
             }
-            IRIS_LOG("[TUNE] OFDM: RMS=%.3f->0.500 scale=%.4f preamble=%d samp peak=%.3f EQ=%s",
-                     rms, sc, dstart, ppeak, tx_channel_eq_.is_configured() ? "on" : "off");
+            IRIS_LOG("[TUNE] OFDM ramp frame %d: scale=%.2f tx=%.3f (base=%.3f) %zu samples",
+                     i + 1, ramp_scale, frame_tx, config_.tx_level, audio.size());
             tx_buffer_.insert(tx_buffer_.end(), audio.begin(), audio.end());
             tune_test_frames_sent_++;
-            IRIS_LOG("[TUNE] OFDM test frame %d: %zu samples (%.0f ms)",
-                     i + 1, audio.size(), audio.size() * 1000.0f / config_.sample_rate);
         } else {
             // Native Mode A TUNE frame
             auto iq = build_native_frame(test_payload, sizeof(test_payload) - 1,
@@ -3894,10 +3956,11 @@ void Modem::tune_build_and_queue_test_frame() {
         }
     }
 
-    // Apply tx_level to TUNE frames (both OFDM and native).
-    // OFDM test frames are already normalized to 0.50 RMS, tx_level scales
-    // from there. This ensures TUNE measures gain at the actual TX level.
-    for (auto& s : tx_buffer_) s *= config_.tx_level;
+    // Apply tx_level to native TUNE frames only.
+    // OFDM ramp frames already have per-frame tx_level baked in above.
+    if (!(ofdm_phy_active_ && ofdm_mod_)) {
+        for (auto& s : tx_buffer_) s *= config_.tx_level;
+    }
 
     // TUNE uses OFDM frames — need full TXDELAY for radio settle
     int pre_ms = config_.ptt_pre_delay_ms;
@@ -3938,9 +4001,46 @@ void Modem::handle_tune_frame(const uint8_t* info, size_t len) {
             tune_test_frames_sent_ = 0;
             tune_frames_measured_ = 0;
             tune_wait_peer_ticks_ = 0;
+            tune_ramp_best_ = -1;
+            tune_ramp_best_iters_ = 999;
+            for (int i = 0; i < TUNE_RAMP_LEVELS; i++) {
+                tune_rx_frame_iters_[i] = -1;
+                tune_rx_frame_H_[i] = 0;
+                tune_ramp_tx_levels_[i] = 0;
+            }
+        }
+    } else if (payload.find("TUNE:RAMP=") != std::string::npos) {
+        // OFDM power-ramp report: peer tells us which of our 3 frames was best.
+        // Format: "TUNE:RAMP=<best_idx>,<ldpc_iters>,<mean_H>"
+        size_t pos = payload.find("TUNE:RAMP=");
+        int best = -1, iters = 999;
+        float h = 0.0f;
+        if (sscanf(payload.c_str() + pos + 10, "%d,%d,%f", &best, &iters, &h) >= 2) {
+            IRIS_LOG("[TUNE] Peer ramp report: best=%d iters=%d H=%.3f (state=%d)",
+                     best, iters, h, (int)tune_state_.load());
+            tune_ramp_best_ = best;
+            tune_ramp_best_iters_ = iters;
+            tune_peer_gain_ = h > 0.01f ? h : 1.0f;  // fallback for APPLY
+            tune_audit("RAMP_REPORT best=%d iters=%d H=%.4f state=%d",
+                       best, iters, h, (int)tune_state_.load());
+        } else {
+            IRIS_LOG("[TUNE] Invalid RAMP format in payload");
+            return;
+        }
+
+        if (tune_is_initiator_) {
+            if (tune_my_gain_ > 0 && tune_state_ == TuneState::WAIT_REPORT) {
+                tune_state_ = TuneState::APPLY;
+            } else if (tune_state_ == TuneState::WAIT_PEER) {
+                IRIS_LOG("[TUNE] Stored peer ramp report (still measuring their frames)");
+            }
+        } else {
+            if (tune_state_ == TuneState::WAIT_REPORT) {
+                tune_state_ = TuneState::APPLY;
+            }
         }
     } else if (payload.find("TUNE:GAIN=") != std::string::npos) {
-        // Remote is reporting the gain they measured from our test frames
+        // Legacy/Mode A gain report. Also serves as OFDM fallback.
         size_t pos = payload.find("TUNE:GAIN=");
         float remote_gain = 0;
         try {
@@ -3960,23 +4060,29 @@ void Modem::handle_tune_frame(const uint8_t* info, size_t len) {
         tune_peer_gain_ = remote_gain;
 
         if (tune_is_initiator_) {
-            // Only APPLY if we also measured the peer's gain.
-            // The peer's TUNE:GAIN report can arrive before their test frames
-            // (AFSK is shorter than native), so we may still be in WAIT_PEER.
             if (tune_my_gain_ > 0 && tune_state_ == TuneState::WAIT_REPORT) {
                 tune_state_ = TuneState::APPLY;
             } else if (tune_state_ == TuneState::WAIT_PEER) {
                 IRIS_LOG("[TUNE] Stored peer gain (still measuring their frames)");
-                // Stay in WAIT_PEER — tick() will handle transition after measuring
             }
-            // If in SEND_REPORT, tick() will fast-track to APPLY after transitioning
         } else {
-            // Responder: only APPLY from WAIT_REPORT
             if (tune_state_ == TuneState::WAIT_REPORT) {
                 tune_state_ = TuneState::APPLY;
             }
         }
     }
+}
+
+// Static constexpr member definition (C++14 ODR-use)
+constexpr float Modem::ofdm_level_offset_db_[8];
+
+float Modem::ofdm_effective_tx_level() const {
+    if (ofdm_tx_base_ <= 0.0f) return config_.tx_level;
+    int level = std::clamp(ofdm_speed_level_, 0, 7);
+    float offset_db = ofdm_level_offset_db_[level];
+    float scale = std::pow(10.0f, offset_db / 20.0f);
+    float eff = ofdm_tx_base_ * scale;
+    return std::clamp(eff, 0.05f, 1.0f);
 }
 
 void Modem::tune_apply_corrections() {
@@ -3999,37 +4105,44 @@ void Modem::tune_apply_corrections() {
     float old_level = config_.tx_level;
 
     if (native_mode_ || ofdm_kiss_) {
-        // OFDM mode: mean|H| reflects end-to-end channel gain (TX audio → FM →
-        // air → FM → RX audio). Target mean|H| ≈ 1.0 — unity equalizer gain,
-        // which means FM deviation is well-utilized without clipping.
+        // OFDM power-ramp TUNE: peer reported which of our 3 ramp frames (at
+        // different TX levels) decoded best. Adopt that level as O0 baseline.
         //
-        // OTA observation: mean|H| = 4-7 causes ZC preamble corruption (the FM
-        // deviation limiter clips peaks, destroying ZC cross-correlation). Too low
-        // means poor SNR. Target 1.0 is the sweet spot.
-        //
-        // TX adjustment uses peer_gain (what THEY measured from OUR frames):
-        //   new_tx = old_tx * (OFDM_TARGET_H / peer_gain)
-        // RX adjustment uses my_gain (what WE measured from THEIR frames):
-        //   No RX gain change — MMSE equalizer handles arbitrary channel gain.
-        //   (Unlike Mode A's hard slicer, OFDM doesn't need gain=1.0 at demod input.)
-        constexpr float OFDM_TARGET_H = 1.0f;
+        // If peer sent a RAMP report: use the exact tx_level that produced the
+        // best LDPC performance at the peer's receiver.
+        // If peer sent a legacy GAIN report: fall back to mean|H| targeting.
+        if (tune_ramp_best_ >= 0 && tune_ramp_best_ < TUNE_RAMP_LEVELS) {
+            float best_level = tune_ramp_tx_levels_[tune_ramp_best_];
+            IRIS_LOG("[TUNE] OFDM ramp: peer picked frame %d (tx=%.3f, %d LDPC iters)",
+                     tune_ramp_best_, best_level, tune_ramp_best_iters_);
 
-        if (tune_peer_gain_ > 0.01f) {
+            // If the best frame had very few LDPC iterations, we could push
+            // slightly louder. If it had many, we're at the edge — keep as-is.
+            // Conservative: just adopt the winning level directly.
+            config_.tx_level = best_level;
+            config_.calibrated_tx_level = config_.tx_level;
+            ofdm_tx_base_ = config_.tx_level;
+            IRIS_LOG("[TUNE] OFDM TX: level %.3f → %.3f (ramp frame %d, %d iters)",
+                     old_level, config_.tx_level, tune_ramp_best_, tune_ramp_best_iters_);
+        } else if (tune_peer_gain_ > 0.01f) {
+            // Fallback: legacy GAIN report from peer (backward compat or no frames decoded)
+            constexpr float OFDM_TARGET_H = 1.0f;
             float ratio = OFDM_TARGET_H / tune_peer_gain_;
             config_.tx_level *= ratio;
             config_.tx_level = std::clamp(config_.tx_level, 0.05f, 1.0f);
             config_.calibrated_tx_level = config_.tx_level;
-            IRIS_LOG("[TUNE] OFDM TX: peer saw mean|H|=%.3f (target=%.1f), level %.3f → %.3f",
-                     tune_peer_gain_, OFDM_TARGET_H, old_level, config_.tx_level);
+            ofdm_tx_base_ = config_.tx_level;
+            IRIS_LOG("[TUNE] OFDM TX fallback: peer saw H=%.3f, level %.3f → %.3f",
+                     tune_peer_gain_, old_level, config_.tx_level);
         } else {
-            IRIS_LOG("[TUNE] OFDM TX: no peer gain report, keeping level %.3f", config_.tx_level);
+            IRIS_LOG("[TUNE] OFDM TX: no peer report, keeping level %.3f", config_.tx_level);
+            ofdm_tx_base_ = config_.tx_level;
         }
 
         // RX: MMSE equalizer handles arbitrary gain. No RX correction needed.
-        // (If we boosted RX gain here, noise would scale equally → no SNR benefit.
-        // The equalizer already normalizes constellation amplitude via H[k].)
         native_rx_gain_ = 1.0f;
-        IRIS_LOG("[TUNE] OFDM RX: rx_gain=1.0 (MMSE equalizer handles channel gain)");
+        IRIS_LOG("[TUNE] OFDM: base=%.3f (O0), offsets: O3=-1dB O5=-2dB O7=-3dB",
+                 ofdm_tx_base_);
     } else {
         // Mode A (single-carrier): apply TX and RX corrections as before.
         // TX: adjust toward peer_gain=1.0.
@@ -4167,6 +4280,13 @@ void Modem::start_autotune(const std::string& remote_callsign) {
     tune_frames_measured_ = 0;
     tune_wait_peer_ticks_ = 0;
     tune_timeout_ = 400;  // 20s at 50ms/tick
+    tune_ramp_best_ = -1;
+    tune_ramp_best_iters_ = 999;
+    for (int i = 0; i < TUNE_RAMP_LEVELS; i++) {
+        tune_rx_frame_iters_[i] = -1;
+        tune_rx_frame_H_[i] = 0;
+        tune_ramp_tx_levels_[i] = 0;
+    }
 
     // Send TUNE:START twice for reliability
     tune_state_ = TuneState::SEND_START;

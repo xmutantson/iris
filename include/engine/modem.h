@@ -466,6 +466,33 @@ private:
     int tune_frames_measured_ = 0;       // Peer test frames we've measured gain from
     int tune_wait_peer_ticks_ = 0;       // Ticks spent in WAIT_PEER (for timeout transition)
     int tune_report_resend_cd_ = 0;      // Countdown to resend TUNE:GAIN in WAIT_REPORT
+
+    // OFDM power-ramp TUNE: send 3 frames at different levels, peer picks best.
+    static constexpr int TUNE_RAMP_LEVELS = 3;
+    float tune_ramp_scales_[TUNE_RAMP_LEVELS] = {1.4f, 1.0f, 0.6f}; // relative to current tx_level
+    float tune_ramp_tx_levels_[TUNE_RAMP_LEVELS] = {};  // actual tx_level per ramp frame
+    int tune_ramp_best_ = -1;            // best frame index reported by peer
+    int tune_ramp_best_iters_ = 999;     // LDPC iters of best frame
+    // RX side: track quality of each received ramp frame
+    int tune_rx_frame_iters_[TUNE_RAMP_LEVELS] = {-1, -1, -1};  // LDPC iters (-1=not decoded)
+    float tune_rx_frame_H_[TUNE_RAMP_LEVELS] = {};  // mean|H| per frame
+
+    // Per-O-level TX drive offset (dB below O0 baseline).
+    // Higher modulations have tighter constellations → more sensitive to FM
+    // deviation limiter clipping. Applied multiplicatively at TX time.
+    float ofdm_tx_base_ = 0.0f;         // O0 baseline tx_level (set by TUNE)
+    static constexpr float ofdm_level_offset_db_[8] = {
+         0.0f,   // O0 BPSK r1/2
+         0.0f,   // O1 QPSK r1/2
+         0.0f,   // O2 QPSK r3/4
+        -1.0f,   // O3 16QAM r1/2
+        -1.0f,   // O4 16QAM r3/4
+        -2.0f,   // O5 64QAM r3/4
+        -2.0f,   // O6 64QAM r7/8
+        -3.0f,   // O7 256QAM r7/8
+    };
+    float ofdm_effective_tx_level() const;  // base * 10^(offset/20)
+
     void send_tune_ui(const char* payload);
     void handle_tune_frame(const uint8_t* info, size_t len);
     void tune_build_and_queue_test_frame();
