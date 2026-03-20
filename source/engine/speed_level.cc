@@ -24,7 +24,7 @@ const SpeedLevel SPEED_LEVELS[NUM_SPEED_LEVELS] = {
 const SpeedLevel OFDM_SPEED_LEVELS[NUM_OFDM_SPEED_LEVELS] = {
     // name   mod                num den  min_snr  net_bits/baud
     {"O0",  Modulation::BPSK,    1, 2,   0.0f,  0},   // BPSK r1/2 — most robust
-    {"O1",  Modulation::QPSK,    1, 2,   4.0f,  0},   // QPSK r1/2
+    {"O1",  Modulation::QPSK,    1, 2,   6.0f,  0},   // QPSK r1/2 (raised: FM distortion ≠ AWGN)
     {"O2",  Modulation::QPSK,    3, 4,   8.0f,  0},   // QPSK r3/4
     {"O3",  Modulation::QAM16,   1, 2,  12.0f,  0},   // 16QAM r1/2
     {"O4",  Modulation::QAM16,   3, 4,  16.0f,  0},   // 16QAM r3/4

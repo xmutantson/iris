@@ -112,7 +112,7 @@ struct IrisConfig {
     // OFDM PHY settings
     bool ofdm_enable = true;           // Master OFDM enable/disable
     int ofdm_nfft = 512;              // FFT size (256, 512, or 1024)
-    int ofdm_cp_samples = 64;         // Cyclic prefix samples
+    int ofdm_cp_samples = 32;         // Cyclic prefix samples (0.67ms, FM delay spread < 0.5ms)
     bool ofdm_auto_spacing = false;   // Auto-train subcarrier spacing
     bool ofdm_waterfill = true;       // Per-subcarrier adaptive bit loading
     bool ofdm_nuc = true;             // Non-uniform constellations

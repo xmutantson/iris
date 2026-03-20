@@ -21,6 +21,7 @@ struct ToneMap {
     int nfft = 512;
     uint8_t tone_map_id = 0;  // 0=waterfill, 1-8=uniform presets
     bool use_nuc = false;     // Use Non-Uniform Constellations (ATSC 3.0 optimized)
+    int n_codewords = 1;      // LDPC blocks per frame (>1 = multi-codeword)
 };
 
 // Build a uniform tone map (all data carriers same modulation).
@@ -52,10 +53,12 @@ public:
     std::vector<std::complex<float>> generate_pilot_symbol();
 
     // Build complete OFDM frame from payload bytes.
+    // n_codewords: number of LDPC blocks (1 = legacy, >1 = multi-codeword).
     // Returns baseband IQ samples (complex) ready for upconversion.
     std::vector<std::complex<float>> build_ofdm_frame(
         const uint8_t* payload, size_t len,
-        const ToneMap& tone_map, LdpcRate fec);
+        const ToneMap& tone_map, LdpcRate fec,
+        int n_codewords = 1);
 
 private:
     OfdmConfig config_;

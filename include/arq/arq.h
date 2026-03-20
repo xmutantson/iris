@@ -71,15 +71,15 @@ enum class BreakPhase {
 // Sliding window size (3-bit sequence, window of 8)
 static constexpr int ARQ_WINDOW_SIZE = 8;
 static constexpr int ARQ_MAX_RETRIES = 10;
-static constexpr int ARQ_CONNECT_TIMEOUT_MS = 5000;
+static constexpr int ARQ_CONNECT_TIMEOUT_MS = 3000;
 static constexpr int ARQ_DEFAULT_ACK_TIMEOUT_MS = 2000;
 static constexpr int ARQ_MIN_ACK_TIMEOUT_MS = 300;
 static constexpr int ARQ_MAX_ACK_TIMEOUT_MS = 10000;
 static constexpr int ARQ_MAX_PAYLOAD = 1024;
 
 // HAIL beacon constants
-static constexpr int HAIL_INTERVAL_MS = 3500;   // Must exceed full round-trip: TX(717ms) + responder accumulate/decode(~800ms) + response TX(717ms)
-static constexpr int HAIL_MAX_ATTEMPTS = 10;     // ~35 seconds of hailing
+static constexpr int HAIL_INTERVAL_MS = 2000;   // Tighter interval (~2s): still exceeds round-trip (TX+decode+response ~1.5s)
+static constexpr int HAIL_MAX_ATTEMPTS = 8;      // ~16 seconds of hailing (was 35s)
 
 // Turboshift constants
 static constexpr int TURBO_PROBE_RETRIES = 2;

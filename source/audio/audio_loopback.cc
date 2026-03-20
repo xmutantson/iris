@@ -1,4 +1,5 @@
 #include "audio/audio.h"
+#include "common/logging.h"
 #include <thread>
 #include <atomic>
 #include <mutex>
@@ -40,11 +41,14 @@ struct FmChannelState {
     bool enabled = false;
     float sample_rate = 48000.0f;
 
-    // Pre-emphasis: first-order highpass, H(s) = 1+sτ (6 dB/octave boost above corner)
-    // Standard NBFM: τ=530µs → corner=300 Hz (TIA/EIA-603)
+    // Pre-emphasis: first-order shelving boost, H(s) = (1+s·τ₁)/(1+s·τ₂)
+    // Standard NBFM: τ₁=530µs → corner=300 Hz (TIA/EIA-603)
+    // τ₂ adds a stabilizing pole at ~15 kHz (well above audio band)
     float preemph_tau_us = 530.0f;
-    float preemph_alpha = 0.0f;     // coefficient: 1-pole IIR
-    float preemph_prev = 0.0f;      // filter state
+    float preemph_b0 = 1.0f, preemph_b1 = 0.0f;  // IIR numerator
+    float preemph_a1 = 0.0f;                       // IIR denominator (feedback)
+    float preemph_x1 = 0.0f;    // previous input
+    float preemph_y1 = 0.0f;    // previous output (IIR feedback)
 
     // Deviation limiter: hard-clips audio to simulate FM deviation limiting
     // Real FM radios limit to ±5 kHz deviation. The limiter clips the
@@ -60,7 +64,10 @@ struct FmChannelState {
     float deemph_prev = 0.0f;   // previous input
 
     // Audio bandpass filter: models radio's audio passband (typically 300-3000 Hz)
-    // 4th-order Butterworth (2 cascaded biquad sections per HP/LP edge)
+    // 2nd-order Butterworth (1 biquad section per HP/LP edge).
+    // Reduced from 4th-order: the IIR group delay at low carriers (44 samples
+    // for 4th-order at 468 Hz) exceeded CP=32, creating an ISI/ICI floor at
+    // ~22 dB that broke 64QAM+. 2nd-order has ~20 sample GD, fits within CP.
     struct Biquad {
         float b0=1,b1=0,b2=0,a1=0,a2=0,z1=0,z2=0;
         float process(float x) {
@@ -71,7 +78,7 @@ struct FmChannelState {
             return y;
         }
     };
-    Biquad bp_hi[2], bp_lo[2];     // 2-stage HP + 2-stage LP = 4th order BP
+    Biquad bp_hi[2], bp_lo[2];     // Only [0] used; [1] reserved for future
     bool bp_enabled = false;
     float bp_low_hz = 300.0f;
     float bp_high_hz = 3000.0f;
@@ -80,20 +87,45 @@ struct FmChannelState {
     float cfo_hz = 0.0f;           // Hz (typically ±10-50 Hz for FM)
     float cfo_phase = 0.0f;        // accumulator (radians)
 
-    // Noise (AWGN is already separate, but we track FM-specific SNR here)
-    float snr_db = 30.0f;          // FM audio SNR after demod (30 dB = clean, 10 dB = noisy)
+    // f²-shaped FM discriminator noise
+    // Real FM discriminator output noise PSD ∝ f². We generate white noise,
+    // filter through a differentiator (y[n] = x[n] - x[n-1]) for f² shaping,
+    // and inject BEFORE de-emphasis so the combined PSD ∝ f²/(1+(2πfτ)²).
+    float noise_amplitude = 0.0f;  // 0 = no noise
+    float noise_prev = 0.0f;       // differentiator state
+    std::mt19937 noise_rng{42};
+    std::normal_distribution<float> noise_dist{0.0f, 1.0f};
+
+    // Multipath: 2-tap delay line (direct + delayed reflection)
+    // Models RF multipath causing time-domain echoes in the audio.
+    // delay_samples: reflection delay (e.g., 10 samples = 0.21ms at 48kHz)
+    // reflection_gain: amplitude of reflection (e.g., 0.3 = -10.5 dB)
+    int multipath_delay = 0;         // 0 = disabled
+    float multipath_gain = 0.0f;     // reflection amplitude (0-1)
+    static constexpr int MP_MAX_DELAY = 480;  // max 10ms at 48kHz
+    float mp_delay_line[480] = {};
+    int mp_write_pos = 0;
 
     void init(float fs) {
         sample_rate = fs;
 
-        // Pre-emphasis: y[n] = x[n] - α*x[n-1] (first-order highpass)
-        // α = exp(-1/(τ*fs)) ≈ 1 - 1/(τ*fs) for small 1/(τ*fs)
-        float tau_s = preemph_tau_us * 1e-6f;
-        preemph_alpha = std::exp(-1.0f / (tau_s * fs));
-        preemph_prev = 0.0f;
+        // Pre-emphasis: H(s) = (1+s·τ₁)/(1+s·τ₂) via bilinear transform
+        // τ₁ = audio pre-emphasis time constant (530µs for NBFM)
+        // τ₂ = stabilizing pole at ~15 kHz (prevents infinite gain at Nyquist)
+        // Bilinear: H(z) = [(1+c₁)+(1-c₁)z⁻¹] / [(1+c₂)+(1-c₂)z⁻¹]
+        float tau1_s = preemph_tau_us * 1e-6f;
+        float tau2_s = 1.0f / (2.0f * (float)M_PI * 15000.0f);  // 10.61µs
+        float c1 = 2.0f * fs * tau1_s;  // ~50.88
+        float c2 = 2.0f * fs * tau2_s;  // ~1.02
+        float pe_a0 = 1.0f + c2;
+        preemph_b0 = (1.0f + c1) / pe_a0;
+        preemph_b1 = (1.0f - c1) / pe_a0;
+        preemph_a1 = (1.0f - c2) / pe_a0;
+        preemph_x1 = 0.0f;
+        preemph_y1 = 0.0f;
 
         // De-emphasis: H(s) = 1/(1+sτ) → bilinear transform
-        float wc = 1.0f / tau_s;
+        float wc = 1.0f / tau1_s;
         float K = 2.0f * fs;
         float a = K + wc;
         deemph_b0 = wc / a;
@@ -102,53 +134,67 @@ struct FmChannelState {
         deemph_z1 = 0.0f;
         deemph_prev = 0.0f;
 
-        // Bandpass filter (4th-order Butterworth = 2 biquad sections per edge)
+        // Bandpass filter (2nd-order Butterworth = 1 biquad section per edge)
         if (bp_low_hz > 0 && bp_high_hz > bp_low_hz) {
             bp_enabled = true;
-            const float Q4[2] = {0.5412f, 1.3066f};  // 4th-order Butterworth Q values
+            const float Q = 0.7071f;  // 2nd-order Butterworth Q
 
-            // Highpass sections
-            for (int i = 0; i < 2; i++) {
+            // Highpass (1 section)
+            {
                 float f0 = bp_low_hz;
                 float w0 = 2.0f * (float)M_PI * f0 / fs;
                 float c = std::cos(w0), s = std::sin(w0);
-                float alpha = s / (2.0f * Q4[i]);
+                float alpha = s / (2.0f * Q);
                 float a0 = 1.0f + alpha;
-                bp_hi[i] = {};
-                bp_hi[i].b0 = ((1.0f + c) / 2.0f) / a0;
-                bp_hi[i].b1 = -(1.0f + c) / a0;
-                bp_hi[i].b2 = ((1.0f + c) / 2.0f) / a0;
-                bp_hi[i].a1 = (-2.0f * c) / a0;
-                bp_hi[i].a2 = (1.0f - alpha) / a0;
+                bp_hi[0] = {};
+                bp_hi[0].b0 = ((1.0f + c) / 2.0f) / a0;
+                bp_hi[0].b1 = -(1.0f + c) / a0;
+                bp_hi[0].b2 = ((1.0f + c) / 2.0f) / a0;
+                bp_hi[0].a1 = (-2.0f * c) / a0;
+                bp_hi[0].a2 = (1.0f - alpha) / a0;
             }
-            // Lowpass sections
-            for (int i = 0; i < 2; i++) {
+            // Lowpass (1 section)
+            {
                 float f0 = bp_high_hz;
                 float w0 = 2.0f * (float)M_PI * f0 / fs;
                 float c = std::cos(w0), s = std::sin(w0);
-                float alpha = s / (2.0f * Q4[i]);
+                float alpha = s / (2.0f * Q);
                 float a0 = 1.0f + alpha;
-                bp_lo[i] = {};
-                bp_lo[i].b0 = ((1.0f - c) / 2.0f) / a0;
-                bp_lo[i].b1 = (1.0f - c) / a0;
-                bp_lo[i].b2 = ((1.0f - c) / 2.0f) / a0;
-                bp_lo[i].a1 = (-2.0f * c) / a0;
-                bp_lo[i].a2 = (1.0f - alpha) / a0;
+                bp_lo[0] = {};
+                bp_lo[0].b0 = ((1.0f - c) / 2.0f) / a0;
+                bp_lo[0].b1 = (1.0f - c) / a0;
+                bp_lo[0].b2 = ((1.0f - c) / 2.0f) / a0;
+                bp_lo[0].a1 = (-2.0f * c) / a0;
+                bp_lo[0].a2 = (1.0f - alpha) / a0;
             }
         }
 
         cfo_phase = 0.0f;
+
+        // Reset multipath delay line
+        memset(mp_delay_line, 0, sizeof(mp_delay_line));
+        mp_write_pos = 0;
     }
 
     // Process one sample through the full FM channel model
     float process(float x) {
         // 1. Pre-emphasis (TX radio mic input processing)
-        float pe = x - preemph_alpha * preemph_prev;
-        preemph_prev = x;
+        // IIR: y[n] = b0·x[n] + b1·x[n-1] - a1·y[n-1]
+        float pe = preemph_b0 * x + preemph_b1 * preemph_x1 - preemph_a1 * preemph_y1;
+        preemph_x1 = x;
+        preemph_y1 = pe;
 
         // 2. Deviation limiter (FM radio clips to max deviation)
         if (pe > deviation_limit) pe = deviation_limit;
         if (pe < -deviation_limit) pe = -deviation_limit;
+
+        // 2.5. f²-shaped FM discriminator noise (before de-emphasis)
+        if (noise_amplitude > 0.0f) {
+            float wn = noise_amplitude * noise_dist(noise_rng);
+            float shaped = wn - noise_prev;  // differentiator: +6 dB/octave → f² PSD
+            noise_prev = wn;
+            pe += shaped;
+        }
 
         // 3. De-emphasis (RX radio audio output processing)
         // Proper IIR: y[n] = b0*x[n] + b1*x[n-1] - a1*y[n-1]
@@ -157,14 +203,22 @@ struct FmChannelState {
         deemph_prev = pe;
         deemph_z1 = de;
 
-        // 4. Audio bandpass filter (radio's audio passband)
+        // 4. Audio bandpass filter (radio's audio passband, 2nd-order)
         float bp = de;
         if (bp_enabled) {
-            for (int i = 0; i < 2; i++) bp = bp_hi[i].process(bp);
-            for (int i = 0; i < 2; i++) bp = bp_lo[i].process(bp);
+            bp = bp_hi[0].process(bp);
+            bp = bp_lo[0].process(bp);
         }
 
-        // 5. Frequency offset (VCO drift between radios)
+        // 5. Multipath: direct + delayed reflection
+        if (multipath_delay > 0 && multipath_delay < MP_MAX_DELAY) {
+            mp_delay_line[mp_write_pos] = bp;
+            int read_pos = (mp_write_pos - multipath_delay + MP_MAX_DELAY) % MP_MAX_DELAY;
+            bp = bp + multipath_gain * mp_delay_line[read_pos];
+            mp_write_pos = (mp_write_pos + 1) % MP_MAX_DELAY;
+        }
+
+        // 6. Frequency offset (VCO drift between radios)
         // For real-valued audio, frequency offset shifts the entire spectrum.
         // Model as: multiply by cos(2π*cfo*t) which shifts energy by ±cfo Hz.
         // This is a simplification — true FM offset shifts the demodulated
@@ -214,6 +268,22 @@ void loopback_set_fm_channel(float preemph_us, float bp_low, float bp_high,
     }
 }
 
+void loopback_set_fm_multipath(float delay_ms, float gain) {
+    std::lock_guard<std::mutex> lock(g_loop_mutex);
+    int delay_samples = (int)(delay_ms * 48000.0f / 1000.0f + 0.5f);
+    if (delay_samples < 0) delay_samples = 0;
+    if (delay_samples >= FmChannelState::MP_MAX_DELAY) delay_samples = FmChannelState::MP_MAX_DELAY - 1;
+    g_fm_channel.multipath_delay = delay_samples;
+    g_fm_channel.multipath_gain = std::max(0.0f, std::min(1.0f, gain));
+    if (delay_samples > 0) {
+        memset(g_fm_channel.mp_delay_line, 0, sizeof(g_fm_channel.mp_delay_line));
+        g_fm_channel.mp_write_pos = 0;
+    }
+    IRIS_LOG("[FM-MULTIPATH] delay=%d samples (%.2f ms), gain=%.2f (%.1f dB)",
+             delay_samples, delay_ms, g_fm_channel.multipath_gain,
+             g_fm_channel.multipath_gain > 0 ? 20.0f * std::log10(g_fm_channel.multipath_gain) : -999.0f);
+}
+
 class LoopbackCapture : public AudioCapture {
 public:
     bool open(int, int sample_rate, int, int frames_per_buffer) override {
@@ -258,6 +328,7 @@ private:
 
                         // Apply FM channel model if enabled
                         if (g_fm_channel.enabled) {
+                            g_fm_channel.noise_amplitude = noise_amp;
                             sample = g_fm_channel.process(sample);
                         }
 
@@ -267,10 +338,15 @@ private:
                     std::memset(buf.data(), 0, buf_size_ * sizeof(float));
                 }
             }
-            // Inject AWGN if configured
+            // Inject noise: f²-shaped if FM channel enabled, flat AWGN otherwise
             if (noise_amp > 0.0f) {
-                for (int i = 0; i < buf_size_; i++)
-                    buf[i] += noise_amp * gauss(rng);
+                if (g_fm_channel.enabled) {
+                    // Noise already injected inside FM channel process() with f² shaping.
+                    // Just update the amplitude (process() reads it each sample).
+                } else {
+                    for (int i = 0; i < buf_size_; i++)
+                        buf[i] += noise_amp * gauss(rng);
+                }
             }
             if (cb_) cb_(buf.data(), buf_size_, 1);
             // Sleep to match real-time rate (~10ms chunks)

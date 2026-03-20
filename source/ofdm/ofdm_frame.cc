@@ -299,7 +299,11 @@ float tone_map_throughput(const ToneMap& map, const OfdmConfig& config, int n_co
     int n_block_pilots = (n_data_symbols > 0)
         ? (n_data_symbols - 1) / config.pilot_symbol_spacing
         : 0;
-    int n_overhead = 2 + config.n_header_symbols + n_block_pilots + 1;
+    // Dense pilot rows inserted every pilot_row_spacing data symbols
+    int n_pilot_rows = (config.pilot_row_spacing > 0 && n_data_symbols > 0)
+        ? (n_data_symbols - 1) / config.pilot_row_spacing
+        : 0;
+    int n_overhead = 2 + config.n_header_symbols + n_block_pilots + n_pilot_rows + 1;
     int n_total = n_data_symbols + n_overhead;
 
     float data_fraction = static_cast<float>(n_data_symbols) / static_cast<float>(n_total);
@@ -328,6 +332,9 @@ std::vector<uint8_t> serialize_tone_map(const ToneMap& map) {
     }
     // For uniform maps (id 1-8), the header byte alone is sufficient — the
     // receiver reconstructs from the preset table + its own n_data_carriers.
+
+    // Trailing byte: n_codewords (0 = not present / old peer, treated as 1)
+    out.push_back(static_cast<uint8_t>(map.n_codewords));
 
     return out;
 }
@@ -370,6 +377,20 @@ bool deserialize_tone_map(const uint8_t* data, size_t len, ToneMap& map) {
         map.n_data_carriers = 0;
         map.bits_per_carrier.clear();
         map.total_bits_per_symbol = 0;
+    }
+
+    // Trailing byte: n_codewords (optional, old peers don't send it)
+    // For waterfill: after header + (n_carriers+1)/2 carrier bytes
+    // For uniform: after header byte (1 byte)
+    size_t expected_prefix = 1;  // header byte
+    if (map.tone_map_id == 0) {
+        expected_prefix += (map.n_data_carriers + 1) / 2;  // carrier nibbles
+    }
+    if (len > expected_prefix) {
+        map.n_codewords = data[expected_prefix];
+        if (map.n_codewords < 1) map.n_codewords = 1;
+    } else {
+        map.n_codewords = 1;  // old peer or missing
     }
 
     return true;

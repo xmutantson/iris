@@ -23,6 +23,7 @@ struct OfdmDemodResult {
     // Diagnostics
     float snr_db = 0;             // From sync
     float cfo_hz = 0;             // Estimated CFO
+    float cpe_drift_hz = 0;       // Residual CFO from CPE slope feedback
     float mean_channel_snr_db = 0; // From channel estimation
     float mean_H_mag = 0;         // Mean |H| (quality gate diagnostic)
     int n_data_symbols = 0;

@@ -15,6 +15,24 @@
 #endif
 
 namespace {
+
+// Small-N DFT/IDFT for DFT-spread OFDM (SC-FDMA).
+// O(N²) — fine for N < 100 (our data carrier count).
+// forward=true: DFT (analysis), forward=false: IDFT (synthesis, divides by N).
+static void small_dft(const std::complex<float>* in, std::complex<float>* out,
+                       int N, bool forward) {
+    float sign = forward ? -1.0f : 1.0f;
+    float scale = forward ? 1.0f / std::sqrt((float)N) : 1.0f / std::sqrt((float)N);
+    for (int k = 0; k < N; k++) {
+        std::complex<float> sum(0.0f, 0.0f);
+        for (int n = 0; n < N; n++) {
+            float angle = sign * 2.0f * (float)M_PI * (float)k * (float)n / (float)N;
+            sum += in[n] * std::complex<float>(std::cos(angle), std::sin(angle));
+        }
+        out[k] = sum * scale;
+    }
+}
+
 // FM TX de-emphasis gain: attenuate higher carriers so that AFTER the radio's
 // own pre-emphasis the signal is flat entering the deviation limiter, minimising
 // nonlinear clipping.  H_deemph(f) = 1 / sqrt(1 + (f/fc)^2).
@@ -324,63 +342,82 @@ std::vector<uint8_t> OfdmModulator::encode_ofdm_header(
 //  build_ofdm_frame: complete TX chain
 // ============================================================================
 std::vector<std::complex<float>> OfdmModulator::build_ofdm_frame(
-    const uint8_t* payload, size_t len, const ToneMap& tone_map, LdpcRate fec)
+    const uint8_t* payload, size_t len, const ToneMap& tone_map, LdpcRate fec,
+    int n_codewords)
 {
-    // ---- 1. Prepend 2-byte length prefix, then append CRC-32 ----
-    // Headerless frame (Mercury approach): payload length is embedded inside
-    // the LDPC-protected data.  Format: [len_lo][len_hi][payload...][CRC32].
-    // CRC-32 covers the length prefix + payload.
-    if (fec != LdpcRate::NONE) {
-        int k = LdpcCodec::block_size(fec);
-        int max_payload = k / 8 - 4 - 2;  // minus CRC-32 and length prefix
-        if ((int)len > max_payload) {
-            IRIS_LOG("[OFDM-TX] payload %zu bytes exceeds capacity %d — rejected", len, max_payload);
-            return {};
-        }
-    }
-    uint16_t payload_len_u16 = (uint16_t)len;
-    std::vector<uint8_t> payload_with_crc(2 + len + 4);
-    payload_with_crc[0] = payload_len_u16 & 0xFF;
-    payload_with_crc[1] = (payload_len_u16 >> 8) & 0xFF;
-    std::memcpy(payload_with_crc.data() + 2, payload, len);
-    uint32_t crc = crc32(payload_with_crc.data(), 2 + len);
-    payload_with_crc[2 + len + 0] = (crc >>  0) & 0xFF;
-    payload_with_crc[2 + len + 1] = (crc >>  8) & 0xFF;
-    payload_with_crc[2 + len + 2] = (crc >> 16) & 0xFF;
-    payload_with_crc[2 + len + 3] = (crc >> 24) & 0xFF;
+    if (n_codewords < 1) n_codewords = 1;
 
-    // ---- 2. Convert to bits ----
-    std::vector<uint8_t> data_bits;
-    data_bits.reserve(payload_with_crc.size() * 8);
-    for (size_t i = 0; i < payload_with_crc.size(); i++) {
-        for (int j = 0; j < 8; j++) {
-            data_bits.push_back((payload_with_crc[i] >> j) & 1);
-        }
+    // ---- 1. Prepend 2-byte length prefix, then append CRC-32 per block ----
+    // Each LDPC block carries: [len_lo][len_hi][payload_chunk...][CRC32].
+    // Multi-codeword: payload is split across blocks, each self-contained.
+    int k = (fec != LdpcRate::NONE) ? LdpcCodec::block_size(fec) : 0;
+    int max_payload_per_block = (k > 0) ? (k / 8 - 4 - 2) : (int)len;
+    int total_capacity = max_payload_per_block * n_codewords;
+
+    if ((int)len > total_capacity) {
+        IRIS_LOG("[OFDM-TX] payload %zu bytes exceeds %d-block capacity %d — rejected",
+                 len, n_codewords, total_capacity);
+        return {};
     }
 
-    // ---- 3. LDPC encode ----
+    // Split payload across blocks
     std::vector<uint8_t> coded_bits;
-    if (fec != LdpcRate::NONE) {
-        coded_bits = LdpcCodec::encode(data_bits, fec);
+    size_t payload_offset = 0;
 
-        // Interleave each LDPC block (stride-41, same as native)
-        int n_fec = LdpcCodec::codeword_size(fec);
-        constexpr int INTERLEAVE_STRIDE = 41;  // coprime to 1600
-        for (size_t blk = 0; blk + n_fec <= coded_bits.size(); blk += n_fec) {
-            std::vector<uint8_t> tmp(n_fec);
-            for (int i = 0; i < n_fec; i++)
-                tmp[(i * INTERLEAVE_STRIDE) % n_fec] = coded_bits[blk + i];
-            std::copy(tmp.begin(), tmp.end(), coded_bits.begin() + blk);
+    for (int blk = 0; blk < n_codewords; blk++) {
+        // Compute chunk size for this block
+        size_t remaining = len - payload_offset;
+        size_t chunk = std::min(remaining, (size_t)max_payload_per_block);
+
+        // Build [len][payload_chunk][CRC32]
+        uint16_t chunk_len = (uint16_t)chunk;
+        std::vector<uint8_t> block_data(2 + chunk + 4);
+        block_data[0] = chunk_len & 0xFF;
+        block_data[1] = (chunk_len >> 8) & 0xFF;
+        if (chunk > 0)
+            std::memcpy(block_data.data() + 2, payload + payload_offset, chunk);
+        uint32_t crc = crc32(block_data.data(), 2 + chunk);
+        block_data[2 + chunk + 0] = (crc >>  0) & 0xFF;
+        block_data[2 + chunk + 1] = (crc >>  8) & 0xFF;
+        block_data[2 + chunk + 2] = (crc >> 16) & 0xFF;
+        block_data[2 + chunk + 3] = (crc >> 24) & 0xFF;
+        payload_offset += chunk;
+
+        // Convert to bits
+        std::vector<uint8_t> data_bits;
+        data_bits.reserve(block_data.size() * 8);
+        for (size_t i = 0; i < block_data.size(); i++) {
+            for (int j = 0; j < 8; j++) {
+                data_bits.push_back((block_data[i] >> j) & 1);
+            }
         }
-    } else {
-        coded_bits = std::move(data_bits);
+
+        // LDPC encode this block
+        if (fec != LdpcRate::NONE) {
+            auto block_coded = LdpcCodec::encode(data_bits, fec);
+
+            // Interleave within block (stride-41)
+            int n_fec = LdpcCodec::codeword_size(fec);
+            constexpr int INTERLEAVE_STRIDE = 41;
+            {
+                std::vector<uint8_t> tmp(n_fec);
+                for (int i = 0; i < n_fec; i++)
+                    tmp[(i * INTERLEAVE_STRIDE) % n_fec] = block_coded[i];
+                block_coded = std::move(tmp);
+            }
+
+            // Pad/truncate to exact codeword size
+            block_coded.resize(n_fec, 0);
+            coded_bits.insert(coded_bits.end(), block_coded.begin(), block_coded.end());
+        } else {
+            coded_bits.insert(coded_bits.end(), data_bits.begin(), data_bits.end());
+        }
     }
 
-    // ---- 3b. Fixed frame: exactly 1 LDPC block ----
-    // Both TX and RX compute n_data_symbols from this, so frame size is deterministic.
+    // ---- 3b. Frame size: exactly n_codewords LDPC blocks ----
     if (fec != LdpcRate::NONE) {
-        int n_fec_expected = LdpcCodec::codeword_size(fec);
-        coded_bits.resize(n_fec_expected, 0);  // pad or truncate to exactly 1 block
+        int n_fec_expected = n_codewords * LdpcCodec::codeword_size(fec);
+        coded_bits.resize(n_fec_expected, 0);
     }
 
     // ---- 4. BICM interleave (column-row per OFDM symbol, QAM16+ uniform) ----
@@ -491,30 +528,47 @@ std::vector<std::complex<float>> OfdmModulator::build_ofdm_frame(
         }
     }
 
-    // ---- 6b. Per-carrier power normalization (M7) ----
-    // Different modulations have different average constellation energies
-    // (BPSK ~1, QPSK ~1, 16QAM ~10, 64QAM ~42, 256QAM ~170 for integer grids).
-    // Normalize each carrier's symbol to unit average power so all carriers
-    // contribute equally to total deviation regardless of modulation order.
-    for (int s = 0; s < n_data_symbols; s++) {
-        for (int k = 0; k < tone_map.n_data_carriers; k++) {
-            int bpc = tone_map.bits_per_carrier[k];
-            if (bpc == 0) continue;
-            // Average energy for standard QAM: E = 2/3 * (M-1) where M = constellation size
-            int M_order = 1 << bpc;
-            float avg_energy = (M_order <= 2) ? 1.0f : (2.0f/3.0f) * (M_order - 1);
-            float norm = std::sqrt(avg_energy);
-            data_sym_carriers[s][k] /= norm;
+    // ---- 6b. Per-carrier power normalization: REMOVED ----
+    // map_symbol() / qam_map() already normalize to unit average power.
+    // The previous code here divided by sqrt(avg_energy) a SECOND time,
+    // which scaled 16QAM+ symbols down by 1/sqrt(10) (16QAM), 1/sqrt(42)
+    // (64QAM), etc. BPSK/QPSK survived because their demap only checks
+    // sign, but 16QAM+ demap/DD-CPE made wrong hard decisions and LDPC
+    // decode failed from incorrect LLRs.
+
+    // ---- 6c. DFT-spread (SC-FDMA precoding) ----
+    // Apply N_data-point DFT to each OFDM symbol's data carriers BEFORE
+    // de-emphasis and inserting into the OFDM grid. This spreads each QAM
+    // symbol across all data subcarriers, making the time-domain signal
+    // single-carrier-like with much lower PAPR (~5-7 dB vs ~10-11 dB for
+    // plain OFDM). The RX applies IDFT after equalization to recover QAM
+    // symbols.
+    //
+    // IMPORTANT: DFT-spread must happen BEFORE de-emphasis. De-emphasis is a
+    // per-carrier frequency-domain operation that the RX channel equalizer
+    // can undo (it's part of H[k]). If de-emphasis were applied before
+    // DFT-spread, the per-carrier scaling would be baked into the spread
+    // signal and the RX IDFT would recover scaled QAM symbols instead of
+    // the originals — breaking 16QAM+ demapping (BPSK/QPSK survive because
+    // their demappers only check sign, not amplitude).
+    if (config_.dft_spread && tone_map.n_data_carriers > 1) {
+        int N = tone_map.n_data_carriers;
+        std::vector<std::complex<float>> dft_out(N);
+        for (int s = 0; s < n_data_symbols; s++) {
+            small_dft(data_sym_carriers[s].data(), dft_out.data(), N, true);
+            data_sym_carriers[s] = dft_out;
         }
+        IRIS_LOG("[OFDM-TX] DFT-spread: %d-point DFT on %d data symbols", N, n_data_symbols);
     }
 
-    // ---- 6c. TX de-emphasis (M1) ----
+    // ---- 6d. TX de-emphasis (M1) ----
     // Attenuate higher carriers so that AFTER the radio's own pre-emphasis
     // the signal is flat entering the deviation limiter, minimising
     // nonlinear clipping.  The RX radio de-emphasis restores the tilt, and
     // the equaliser removes it using H[k].  Same gain curve as training
     // symbols and pilots — cancels in H[k] during equalization.
     // Disabled when corner_hz <= 0 (flat audio data port connection).
+    // Applied AFTER DFT-spread so the equalizer can cleanly undo it.
     if (config_.fm_preemph_corner_hz > 0.0f) {
         for (int s = 0; s < n_data_symbols; s++) {
             for (int k = 0; k < tone_map.n_data_carriers; k++) {
@@ -594,9 +648,10 @@ std::vector<std::complex<float>> OfdmModulator::build_ofdm_frame(
 
     // ---- 9. (Header removed — config pre-negotiated, Mercury approach) ----
 
-    // ---- 10. Assemble data symbols with block pilots every 8th ----
+    // ---- 10. Assemble data symbols with block pilots + dense pilot rows ----
     std::vector<std::vector<std::complex<float>>> all_data_time;
     int data_sym_count = 0;
+    int pilot_rows_inserted = 0;
     for (int s = 0; s < n_data_symbols; s++) {
         // Insert block pilot every pilot_symbol_spacing data symbols
         if (data_sym_count > 0 &&
@@ -604,9 +659,22 @@ std::vector<std::complex<float>> OfdmModulator::build_ofdm_frame(
         {
             all_data_time.push_back(generate_pilot_symbol());
         }
+        // Insert dense pilot row every pilot_row_spacing data symbols
+        // (distinct from block pilots — pilot rows are more frequent and
+        // provide full channel re-estimation within long frames)
+        if (config_.pilot_row_spacing > 0 && data_sym_count > 0 &&
+            (data_sym_count % config_.pilot_row_spacing) == 0)
+        {
+            all_data_time.push_back(generate_pilot_symbol());
+            pilot_rows_inserted++;
+        }
         auto used = build_used_carrier_symbols(data_sym_carriers[s]);
         all_data_time.push_back(generate_data_symbol(used));
         data_sym_count++;
+    }
+    if (pilot_rows_inserted > 0) {
+        IRIS_LOG("[OFDM-TX] inserted %d dense pilot rows (every %d data syms)",
+                 pilot_rows_inserted, config_.pilot_row_spacing);
     }
 
     // ---- 11. Tail symbol (all used subcarriers = +1) ----
@@ -640,16 +708,97 @@ std::vector<std::complex<float>> OfdmModulator::build_ofdm_frame(
     // filter OOB regrowth), the Hilbert clipper preserves in-band signal
     // structure: pilots and data carriers remain valid at the cost of ~1 dB
     // EVM penalty (acceptable tradeoff vs 15+ dB loss from deviation clipping).
-    auto papr_result = ofdm_papr_clip(frame, config_, 7.0f, 4);
-    int n_clipped = papr_result.n_clipped_samples;
+    // Skip preamble (2 training symbols) to keep channel estimate clean.
+    // Preamble has inherently lower PAPR (ZC sequence ≈ constant envelope)
+    // and doesn't go through the deviation limiter independently.
+    int preamble_samples = 2 * sym_len;
+    std::vector<std::complex<float>> data_part(frame.begin() + preamble_samples, frame.end());
+    // Adaptive PAPR target based on modulation order: higher-order QAM needs
+    // gentler clipping to keep EVM low enough for LDPC convergence.
+    // With DFT-spread, 16QAM+ should skip clipping entirely — DFT-spread
+    // already reduces PAPR to ~5-7 dB, and any residual clipping creates
+    // EVM that breaks higher-order constellations.
+    int max_bpc = 0;
+    for (int k = 0; k < tone_map.n_data_carriers; k++)
+        if (tone_map.bits_per_carrier[k] > max_bpc)
+            max_bpc = tone_map.bits_per_carrier[k];
+    float papr_target;
+    bool skip_clip = false;
+    if (config_.dft_spread && max_bpc >= 4) {
+        skip_clip = true;  // DFT-spread alone is sufficient for 16QAM+
+        papr_target = 99.0f;
+    } else if (config_.dft_spread) {
+        papr_target = 7.0f;   // BPSK/QPSK with DFT-spread
+    } else {
+        // No DFT-spread: gentle targets
+        if (max_bpc >= 8)      papr_target = 15.0f;
+        else if (max_bpc >= 6) papr_target = 13.0f;
+        else if (max_bpc >= 4) papr_target = 11.0f;
+        else                   papr_target = 9.0f;
+    }
+    int n_clipped = 0;
+    float papr_before_db = 0.0f, papr_after_db = 0.0f;
+    if (!skip_clip) {
+        auto papr_result = ofdm_papr_clip(data_part, config_, papr_target, 4);
+        std::copy(data_part.begin(), data_part.end(), frame.begin() + preamble_samples);
+        n_clipped = papr_result.n_clipped_samples;
+        papr_before_db = papr_result.papr_before_db;
+        papr_after_db = papr_result.papr_after_db;
+    }
 
-    // ---- 13b. TX bandpass filter ----
-    // DISABLED: frame-level FFT windowing creates spectral leakage between OFDM
-    // symbols (Gibbs effect from zero-padding the frame to power-of-2 length).
-    // This corrupts inter-symbol phase relationships and prevents LDPC decode.
-    // The real FM radio already bandpass-filters the audio; additional TX filtering
-    // is unnecessary and harmful.  If needed in the future, use a time-domain FIR
-    // or per-symbol frequency-domain windowing instead.
+    // ---- 13b. Pilot restoration after PAPR clipping ----
+    // The PAPR clipper modifies pilot symbols along with data. Restore pilots
+    // to their known values (zero pilot EVM → clean channel estimation/CPE).
+    if (n_clipped > 0) {
+        int sym_len = config_.symbol_samples();
+        int n_data_syms = (int)all_data_time.size();
+        for (int sym = 0; sym < n_data_syms; sym++) {
+            int sym_start = preamble_samples + sym * sym_len;
+            int body_start = sym_start + config_.cp_samples;
+            if (body_start + config_.nfft > (int)frame.size()) break;
+
+            // FFT the symbol body
+            std::vector<std::complex<float>> fbuf(config_.nfft);
+            std::copy(frame.begin() + body_start,
+                      frame.begin() + body_start + config_.nfft, fbuf.begin());
+            fft_complex(fbuf.data(), config_.nfft);
+
+            // Restore pilot bins to known values
+            bool modified = false;
+            for (int i = 0; i < n_used; i++) {
+                if (!is_pilot[i]) continue;
+                int bin = config_.used_carrier_bins[i];
+                float g = fm_tx_deemph_gain(bin, config_.nfft, config_.sample_rate,
+                                       config_.fm_preemph_corner_hz,
+                                       config_.fm_preemph_gain_cap);
+                // Pilot value = +g (real), Hermitian mirror = conj
+                std::complex<float> known_pilot(g * (float)config_.nfft, 0.0f);
+                // The FFT includes the ×nfft scaling from symbol_to_time
+                if (std::abs(fbuf[bin] - known_pilot) > 0.01f * std::abs(known_pilot)) {
+                    fbuf[bin] = known_pilot;
+                    int mirror = config_.nfft - bin;
+                    if (mirror > 0 && mirror < config_.nfft)
+                        fbuf[mirror] = std::conj(known_pilot);
+                    modified = true;
+                }
+            }
+
+            if (modified) {
+                // IFFT back and regenerate CP
+                ifft_complex(fbuf.data(), config_.nfft);
+                std::copy(fbuf.begin(), fbuf.end(),
+                          frame.begin() + body_start);
+                // Regenerate CP
+                std::copy(frame.begin() + body_start + config_.nfft - config_.cp_samples,
+                          frame.begin() + body_start + config_.nfft,
+                          frame.begin() + sym_start);
+            }
+        }
+        IRIS_LOG("[OFDM-TX] pilot restoration: restored pilots in %d data symbols", n_data_syms);
+    }
+
+    // ---- 13c. TX bandpass filter ----
+    // DISABLED — radio already bandpass-filters. Frame-level FFT causes Gibbs leakage.
     if (false) {
         int frame_len = (int)frame.size();
         if (frame_len > 0) {
@@ -716,10 +865,11 @@ std::vector<std::complex<float>> OfdmModulator::build_ofdm_frame(
     }
 
     // ---- 14. Log frame stats ----
-    IRIS_LOG("[OFDM-TX] frame: %d OFDM syms, %d bytes, PAPR=%.1f->%.1f dB, %d clipped, NUC=%s",
+    IRIS_LOG("[OFDM-TX] frame: %d OFDM syms, %d bytes, PAPR=%.1f->%.1f dB, %d clipped, NUC=%s%s",
              total_ofdm_symbols, (int)len,
-             papr_result.papr_before_db, papr_result.papr_after_db,
-             n_clipped, tone_map.use_nuc ? "ON" : "off");
+             papr_before_db, papr_after_db,
+             n_clipped, tone_map.use_nuc ? "ON" : "off",
+             skip_clip ? " (clip skipped)" : "");
 
     return frame;
 }

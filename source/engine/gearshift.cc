@@ -81,8 +81,8 @@ int Gearshift::update(float snr_db) {
     // behavior where any success instantly reset fail_count_ to 0.
     if (fail_count_ > 0) fail_count_--;
 
-    if (target > current_level_ && cooldown_ == 0) {
-        // Upshift: hold for stability (suppressed during cooldown)
+    if (target > current_level_ && cooldown_ == 0 && !ldpc_hard_gate_) {
+        // Upshift: hold for stability (suppressed during cooldown + LDPC gate)
         hold_count_++;
         if (hold_count_ >= HOLD_FRAMES) {
             int old = current_level_;
@@ -130,7 +130,7 @@ int Gearshift::ofdm_update(float snr_db) {
     }
     if (fail_count_ > 0) fail_count_--;
 
-    if (target > ofdm_level_ && cooldown_ == 0) {
+    if (target > ofdm_level_ && cooldown_ == 0 && !ldpc_hard_gate_) {
         hold_count_++;
         if (hold_count_ >= HOLD_FRAMES) {
             int old = ofdm_level_;
@@ -177,14 +177,18 @@ void Gearshift::report_failure() {
 void Gearshift::feed_ldpc_iters(int iters, int max_iters) {
     if (locked_ || max_iters <= 0) return;
 
+    // Hard gate: block upshift when LDPC barely converges (>30 of 50 iters).
+    // This prevents upshift to a mode where LDPC will fail outright.
+    ldpc_hard_gate_ = (iters > 30);
+
     // Convergence ratio: 1 = converged immediately, 0 = used all iterations
     float ratio = 1.0f - (float)(iters - 1) / (float)max_iters;
 
     // If LDPC converges in ≤2 iterations, the channel has significant margin.
-    // Grant up to 3 dB boost (smoothed to avoid oscillation).
+    // Grant up to 2 dB boost (smoothed to avoid oscillation).
     float target_boost = 0;
     if (ratio > 0.95f)       // 1-2 iters: huge margin
-        target_boost = 2.0f;  // capped at 2 dB (was 3: too aggressive for FM)
+        target_boost = 2.0f;
     else if (ratio > 0.85f)  // 3-7 iters: good margin
         target_boost = 1.0f;
     // else: working hard, no boost

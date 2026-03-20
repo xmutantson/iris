@@ -633,8 +633,13 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
     {
         int tp = net_throughput(diag.speed_level,
             mode_baud_rate(config.mode.empty() ? 'A' : config.mode[0]));
-        ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "Speed: %s",
-                           SPEED_LEVELS[diag.speed_level].name);
+        if (diag.ofdm_active) {
+            ImGui::TextColored(ImVec4(0.4f, 0.7f, 1.0f, 1.0f), "Speed: %s (OFDM)",
+                               OFDM_SPEED_LEVELS[diag.ofdm_speed_level].name);
+        } else {
+            ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "Speed: %s",
+                               SPEED_LEVELS[diag.speed_level].name);
+        }
         if (tp >= 1000)
             ImGui::Text("%.1f kbps", tp / 1000.0f);
         else
@@ -749,12 +754,27 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
                                     : ImVec4(0.22f, 0.22f, 0.25f, 1.0f);
                 ImVec4 text_col = active ? ImVec4(1, 1, 1, 1) : ImVec4(0.5f, 0.5f, 0.5f, 1);
                 ImGui::PushStyleColor(ImGuiCol_Button, col);
-                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, col);  // No hover effect
-                ImGui::PushStyleColor(ImGuiCol_ButtonActive, col);   // No click effect
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, col);
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, col);
                 ImGui::PushStyleColor(ImGuiCol_Text, text_col);
                 ImGui::SmallButton(SPEED_LEVELS[i].name);
                 ImGui::PopStyleColor(4);
                 if (i < NUM_SPEED_LEVELS - 1) ImGui::SameLine();
+            }
+            // OFDM O-mode indicators (shown when OFDM PHY is active or always for awareness)
+            ImGui::Text("OFDM Level:");
+            for (int i = 0; i < NUM_OFDM_SPEED_LEVELS; i++) {
+                bool active = diag.ofdm_active && (i == diag.ofdm_speed_level);
+                ImVec4 col = active ? ImVec4(0.2f, 0.5f, 0.8f, 1.0f)    // blue for OFDM
+                                    : ImVec4(0.22f, 0.22f, 0.25f, 1.0f);
+                ImVec4 text_col = active ? ImVec4(1, 1, 1, 1) : ImVec4(0.5f, 0.5f, 0.5f, 1);
+                ImGui::PushStyleColor(ImGuiCol_Button, col);
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, col);
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, col);
+                ImGui::PushStyleColor(ImGuiCol_Text, text_col);
+                ImGui::SmallButton(OFDM_SPEED_LEVELS[i].name);
+                ImGui::PopStyleColor(4);
+                if (i < NUM_OFDM_SPEED_LEVELS - 1) ImGui::SameLine();
             }
         }
         ImGui::EndGroup();

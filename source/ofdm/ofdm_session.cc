@@ -161,13 +161,28 @@ std::vector<std::complex<float>> OfdmSession::build_tx_frame(const uint8_t* payl
     }
 
     LdpcRate fec = speed_level_to_fec(speed_level_);
-    auto iq = modulator_->build_ofdm_frame(payload, len, tx_tone_map_, fec);
+
+    // Choose n_codewords based on payload size and per-block capacity.
+    // More codewords = less preamble overhead per byte, but longer frame
+    // (more vulnerable to channel changes). Cap at 4 for FM.
+    int n_cw = 1;
+    if (fec != LdpcRate::NONE) {
+        int k = LdpcCodec::block_size(fec);
+        int max_per_block = k / 8 - 4 - 2;  // minus CRC + length prefix
+        if (max_per_block > 0 && (int)len > max_per_block) {
+            n_cw = ((int)len + max_per_block - 1) / max_per_block;
+            n_cw = std::min(n_cw, 4);  // cap at 4 blocks for FM channel stability
+        }
+    }
+    tx_tone_map_.n_codewords = n_cw;
+
+    auto iq = modulator_->build_ofdm_frame(payload, len, tx_tone_map_, fec, n_cw);
 
     n_frames_tx_++;
 
     if ((n_frames_tx_ % 100) == 1) {
-        IRIS_LOG("[OFDM-SESSION] TX frame #%d: %zu payload bytes, %zu IQ samples, O%d fec=%s",
-                 n_frames_tx_, len, iq.size(), speed_level_, fec_name(fec));
+        IRIS_LOG("[OFDM-SESSION] TX frame #%d: %zu payload bytes, %zu IQ samples, O%d fec=%s, %d blocks",
+                 n_frames_tx_, len, iq.size(), speed_level_, fec_name(fec), n_cw);
     }
 
     return iq;

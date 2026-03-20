@@ -494,14 +494,20 @@ bool Modem::init(const IrisConfig& config) {
             ax25_session_.we_initiated() &&
             !config_.ax25_only && !ofdm_kiss_probing_ &&
             ofdm_kiss_probe_cd_ == 0 && !ofdm_kiss_probe_done_) {
-            // Defer PROBE:START — this callback may fire from queue_tx_frame().
-            // Set flag and let tick() send it.
-            xid_peer_call_ = remote;
-            probe_start_pending_ = true;
-            ofdm_kiss_probe_cd_ = 60;  // 3s countdown before tones (3 PROBE:START sends)
-            probe_connect_timeout_ = 700;  // 35s overall timeout (15s initiator + 12s responder captures)
-            IRIS_LOG("Probe-after-connect: probing %s, I-frames held until done", remote.c_str());
-            if (gui_log_) gui_log_("Probing " + remote + "...");
+            // Check probe cache first — skip re-probing within 24h
+            if (try_use_cached_probe(remote)) {
+                IRIS_LOG("Probe cache hit for %s — skipping probe", remote.c_str());
+                if (gui_log_) gui_log_("Cached probe for " + remote);
+            } else {
+                // Defer PROBE:START — this callback may fire from queue_tx_frame().
+                // Set flag and let tick() send it.
+                xid_peer_call_ = remote;
+                probe_start_pending_ = true;
+                ofdm_kiss_probe_cd_ = 60;  // 3s countdown before tones (3 PROBE:START sends)
+                probe_connect_timeout_ = 700;  // 35s overall timeout (15s initiator + 12s responder captures)
+                IRIS_LOG("Probe-after-connect: probing %s, I-frames held until done", remote.c_str());
+                if (gui_log_) gui_log_("Probing " + remote + "...");
+            }
         }
 
         // AWAITING_RELEASE (DISCONNECTING): immediately fall back to AX.25.
@@ -549,6 +555,7 @@ bool Modem::init(const IrisConfig& config) {
                 ofdm_sync_cached_ = false;
                 ofdm_chase_llrs_.clear();
                 ofdm_chase_combines_ = 0;
+                ofdm_txdelay_ms_ = 0;  // Reset adaptive TXDELAY on disconnect
                 batch_airtime_s_ = BATCH_AIRTIME_MIN;
                 tx_no_ack_count_ = 0;
                 last_peer_nr_ = 0xFF;
@@ -1228,15 +1235,19 @@ void Modem::process_rx_native(const float* audio, int count) {
         // once when all samples are available.
         {
             int bps = ofdm_tone_map_.total_bits_per_symbol;
+            int n_cw = std::max(1, ofdm_tone_map_.n_codewords);
             int coded_bits = (ofdm_tone_map_.fec_rate != LdpcRate::NONE)
-                ? LdpcCodec::codeword_size(ofdm_tone_map_.fec_rate)
+                ? n_cw * LdpcCodec::codeword_size(ofdm_tone_map_.fec_rate)
                 : bps;
             int n_data_syms = (bps > 0) ? (coded_bits + bps - 1) / bps : 1;
             // Block pilots: one every pilot_symbol_spacing data symbols
             int n_block_pilots = (ofdm_config_.pilot_symbol_spacing > 0)
                 ? n_data_syms / ofdm_config_.pilot_symbol_spacing : 0;
-            // Total: 2 training + data + block pilots + 1 tail
-            int total_syms = 2 + n_data_syms + n_block_pilots + 1;
+            // Dense pilot rows: one every pilot_row_spacing data symbols
+            int n_pilot_rows = (ofdm_config_.pilot_row_spacing > 0)
+                ? n_data_syms / ofdm_config_.pilot_row_spacing : 0;
+            // Total: 2 training + data + block pilots + pilot rows + 1 tail
+            int total_syms = 2 + n_data_syms + n_block_pilots + n_pilot_rows + 1;
             size_t frame_samples = (size_t)(total_syms * sym_len);
             size_t available = n_samples - (size_t)sync.frame_start;
 
@@ -2257,7 +2268,9 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                 }
                 size_t max_batch = std::min(max_payload,
                                              (size_t)(phy_bps * batch_airtime_s_ / 8));
-                if (max_batch < 200) max_batch = 200;  // at least one frame
+                // Floor ensures at least one frame fits, but never exceed LDPC capacity
+                size_t batch_floor = std::min((size_t)200, max_payload);
+                if (max_batch < batch_floor) max_batch = batch_floor;
 
                 std::vector<std::vector<uint8_t>> batch;
                 size_t total_bytes = 0;
@@ -2406,6 +2419,10 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                     // Build OFDM frame (returns complex samples, real-valued via Hermitian symmetry)
                     ofdm_iq = ofdm_mod_->build_ofdm_frame(
                         frame_data.data(), frame_data.size(), ofdm_tone_map_, fec);
+                    if (ofdm_iq.empty()) {
+                        IRIS_LOG("[TX-OFDM] build_ofdm_frame rejected %zu bytes — skipping TX",
+                                 frame_data.size());
+                    }
                 } else {
                     // ============ Legacy single-carrier PHY TX path ============
                     int level = gearshift_.current_level();
@@ -2464,6 +2481,16 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
 
                 // Raise T1 floor to account for this frame's airtime.
                 float frame_airtime_s;
+
+                if (ofdm_phy_active_ && ofdm_mod_ && ofdm_iq.empty()) {
+                    // OFDM frame rejected (payload too large for LDPC blocks).
+                    // Skip TX entirely — don't key PTT with no audio.
+                    // Frames remain in queue for retry on next cycle.
+                    tx_buffer_.clear();
+                    IRIS_LOG("[TX-OFDM] empty frame — suppressing PTT");
+                    state_ = ModemState::IDLE;
+                    return;
+                }
 
                 if (ofdm_phy_active_ && ofdm_mod_) {
                     // OFDM: IFFT with Hermitian symmetry produces real-valued audio.
@@ -2622,8 +2649,10 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
             // OFDM: full TXDELAY needed — no flag preamble, training symbols are first.
             int ptt_settle_ms;
             if (ofdm_phy_active_ && ofdm_mod_) {
-                ptt_settle_ms = config_.ptt_pre_delay_ms;  // full TXDELAY for OFDM
-                IRIS_LOG("[TX-OFDM] pre-delay: %d ms (TXDELAY)", ptt_settle_ms);
+                // Use adaptive TXDELAY if set (reduced after successful probe/tune)
+                ptt_settle_ms = (ofdm_txdelay_ms_ > 0) ? ofdm_txdelay_ms_ : config_.ptt_pre_delay_ms;
+                IRIS_LOG("[TX-OFDM] pre-delay: %d ms (TXDELAY%s)", ptt_settle_ms,
+                         ofdm_txdelay_ms_ > 0 ? ", adaptive" : "");
             } else {
                 ptt_settle_ms = 50;  // native: flag preamble handles the rest
             }
@@ -3357,8 +3386,8 @@ void Modem::tick() {
                 // (max CP, min pilot spacings) so both sides compute identical config.
                 // Old peers (v3 or earlier) have ofdm_* = 0, meaning "use defaults."
                 int cp = config_.ofdm_cp_samples;
-                int carrier_pilot_spacing = 4;  // safe default
-                int block_pilot_spacing = 14;   // safe default
+                int carrier_pilot_spacing = 6;  // default (was 4, widened for throughput)
+                int block_pilot_spacing = 24;   // default (was 14, widened for throughput)
                 int nfft = config_.ofdm_nfft;
                 {
                     const ProbeResult& peer = probe_.my_tx_result();  // peer's advertised config
@@ -3587,6 +3616,15 @@ void Modem::tick() {
             probe_connect_timeout_ = 0;
             IRIS_LOG("Probe done — releasing held I-frames via native");
 
+            // Cache probe result for this peer (24h expiry, skip re-probe on reconnect)
+            cache_probe_result(ax25_session_.remote_callsign());
+
+            // Adaptive TXDELAY: after successful probe, reduce OFDM TX pre-delay.
+            // Probe success proves radio link works; training symbols handle the rest.
+            ofdm_txdelay_ms_ = std::max(50, config_.ptt_pre_delay_ms / 2);
+            IRIS_LOG("[TXDELAY] adaptive: %d ms -> %d ms (post-probe)",
+                     config_.ptt_pre_delay_ms, ofdm_txdelay_ms_);
+
             // Auto-tune after probe: gain characteristics change with bandwidth/baud,
             // so recalibrate TX level for the newly discovered passband.
             // Only the probe initiator triggers auto-tune — the responder will
@@ -3633,6 +3671,8 @@ ModemDiag Modem::get_diagnostics() const {
     ModemDiag diag;
     diag.state = state_;
     diag.speed_level = gearshift_.current_level();
+    diag.ofdm_speed_level = gearshift_.current_ofdm_level();
+    diag.ofdm_active = ofdm_phy_active_;
     diag.snr_db = gearshift_.smoothed_snr();
     diag.agc_gain = agc_.gain();
     diag.tx_level = config_.tx_level;
@@ -4308,6 +4348,167 @@ void Modem::process_calibration_rx(const float* audio, int count) {
             }
         }
     }
+}
+
+void Modem::cache_probe_result(const std::string& callsign) {
+    if (callsign.empty() || !probe_.has_results() || !probe_.negotiated().valid)
+        return;
+
+    ProbeCacheEntry entry;
+    entry.negotiated = probe_.negotiated();
+    entry.my_tx = probe_.my_tx_result();
+    entry.their_tx = probe_.their_tx_result();
+    entry.timestamp = std::chrono::steady_clock::now();
+    probe_cache_[callsign] = std::move(entry);
+
+    IRIS_LOG("[PROBE-CACHE] cached result for %s (band %.0f-%.0f Hz, BW=%.0f Hz)",
+             callsign.c_str(), entry.negotiated.low_hz, entry.negotiated.high_hz,
+             entry.negotiated.bandwidth_hz);
+}
+
+bool Modem::try_use_cached_probe(const std::string& callsign) {
+    auto it = probe_cache_.find(callsign);
+    if (it == probe_cache_.end())
+        return false;
+
+    auto& entry = it->second;
+    auto age = std::chrono::steady_clock::now() - entry.timestamp;
+    int age_s = (int)std::chrono::duration_cast<std::chrono::seconds>(age).count();
+    if (age_s > PROBE_CACHE_EXPIRY_S) {
+        IRIS_LOG("[PROBE-CACHE] expired for %s (%d s old)", callsign.c_str(), age_s);
+        probe_cache_.erase(it);
+        return false;
+    }
+
+    // Replay probe results: apply cached passband, configure PHY, enable native mode.
+    // This mirrors the probe completion path in tick() but skips the actual probe.
+    ofdm_kiss_probe_done_ = true;
+    dcd_holdoff_ = 0;
+
+    float low = entry.negotiated.low_hz;
+    float high = entry.negotiated.high_hz;
+    float bandwidth = high - low;
+    float center = (low + high) / 2.0f;
+    config_.band_low_hz = low;
+    config_.band_high_hz = high;
+
+    if (use_upconvert_) {
+        upconverter_ = Upconverter(center, config_.sample_rate);
+        downconverter_ = Downconverter(center, config_.sample_rate);
+
+        constexpr float MAX_OCCUPIED_BW_HZ = 20000.0f;
+        float usable_bw = std::min(bandwidth - 200.0f, MAX_OCCUPIED_BW_HZ);
+        constexpr int SPS_MIN = 6;
+        constexpr int SPS_MAX = 80;
+        int new_sps = -1;
+        int new_baud = 0;
+        for (int sps = SPS_MIN; sps <= SPS_MAX; sps++) {
+            int baud = config_.sample_rate / sps;
+            float sig_bw = baud * (1.0f + phy_config_.rrc_alpha);
+            if (sig_bw <= usable_bw) {
+                new_sps = sps;
+                new_baud = baud;
+                break;
+            }
+        }
+        if (new_sps < 0) {
+            new_sps = phy_config_.samples_per_symbol;
+            new_baud = phy_config_.baud_rate;
+        }
+
+        if (new_baud != phy_config_.baud_rate) {
+            phy_config_.baud_rate = new_baud;
+            phy_config_.samples_per_symbol = new_sps;
+            native_mod_ = std::make_unique<NativeModulator>(phy_config_, config_.sample_rate);
+            native_demod_ = std::make_unique<NativeDemodulator>(phy_config_, config_.sample_rate);
+        }
+    }
+
+    // Channel equalization from cached probe data
+    rx_channel_eq_.configure(entry.their_tx, entry.negotiated, config_.sample_rate, 3.0f);
+    tx_channel_eq_.configure(entry.my_tx, entry.negotiated, config_.sample_rate, 6.0f);
+
+    // Enable native mode
+    peer_is_iris_ = true;
+    ofdm_kiss_ = true;
+    ofdm_kiss_tx_ = true;
+    ax25_session_.set_native_active(true);
+
+    // OFDM PHY setup from cached passband
+    if (config_.ofdm_enable) {
+        NegotiatedPassband ofdm_pb;
+        ofdm_pb.low_hz = low;
+        ofdm_pb.high_hz = high;
+        ofdm_pb.center_hz = center;
+        ofdm_pb.bandwidth_hz = bandwidth;
+        ofdm_pb.valid = true;
+
+        int cp = config_.ofdm_cp_samples;
+        int carrier_pilot_spacing = 6;
+        int block_pilot_spacing = 24;
+        int nfft = config_.ofdm_nfft;
+
+        // Use negotiated params from cached peer result
+        if (entry.my_tx.ofdm_cp_samples > 0)
+            cp = std::max(cp, (int)entry.my_tx.ofdm_cp_samples);
+        if (entry.my_tx.ofdm_pilot_carrier_spacing > 0)
+            carrier_pilot_spacing = std::min(carrier_pilot_spacing, (int)entry.my_tx.ofdm_pilot_carrier_spacing);
+        if (entry.my_tx.ofdm_pilot_symbol_spacing > 0)
+            block_pilot_spacing = std::min(block_pilot_spacing, (int)entry.my_tx.ofdm_pilot_symbol_spacing);
+        if (entry.my_tx.ofdm_nfft_code > 0) {
+            int peer_nfft = 512;
+            if (entry.my_tx.ofdm_nfft_code == 1) peer_nfft = 256;
+            else if (entry.my_tx.ofdm_nfft_code == 2) peer_nfft = 1024;
+            nfft = std::min(nfft, peer_nfft);
+        }
+
+        ofdm_config_ = ofdm_config_from_probe(ofdm_pb, nfft, cp,
+                                               carrier_pilot_spacing, block_pilot_spacing);
+        ofdm_config_.fm_preemph_corner_hz = config_.ofdm_preemph_corner_hz;
+        ofdm_mod_ = std::make_unique<OfdmModulator>(ofdm_config_);
+        ofdm_demod_ = std::make_unique<OfdmDemodulator>(ofdm_config_);
+        ofdm_rx_iq_.clear();
+        ofdm_rx_audio_buf_.clear();
+        ofdm_sync_cached_ = false;
+
+        gearshift_.set_max_ofdm_level(NUM_OFDM_SPEED_LEVELS - 1);
+        ofdm_speed_level_ = 0;
+        gearshift_.force_ofdm_level(0);
+        ofdm_tone_map_ = get_uniform_tone_map(1, ofdm_config_);
+        ofdm_tone_map_.use_nuc = config_.ofdm_nuc;
+
+        // Peer caps from cached probe
+        uint16_t peer_caps = entry.my_tx.capabilities;
+        ofdm_kiss_peer_caps_ = local_cap_.capabilities & peer_caps;
+
+        if (ofdm_kiss_peer_caps_ & CAP_COMPRESSION) {
+            ofdm_kiss_tx_compressor_.init();
+            ofdm_kiss_rx_compressor_.init();
+        }
+
+        if (config_.ofdm_enable && ofdm_mod_ && (ofdm_kiss_peer_caps_ & CAP_OFDM)) {
+            ofdm_phy_active_ = true;
+            IRIS_LOG("[PROBE-CACHE] OFDM PHY ACTIVE: %d carriers, BW=%.0f Hz",
+                     ofdm_config_.n_data_carriers, ofdm_config_.bandwidth_hz);
+        }
+    }
+
+    // Speed level cache
+    int cached_level = gearshift_.load_cached_level(callsign);
+    if (cached_level > 0) {
+        gearshift_.force_level(cached_level);
+        IRIS_LOG("[PROBE-CACHE] gearshift: cached level %d", cached_level);
+    }
+
+    // Shorter listen window for cached probe (no probe tones to wait for)
+    csma_holdoff_ = config_.sample_rate;  // 1s listen (vs 3s for fresh probe)
+
+    // Adaptive TXDELAY for cached probe
+    ofdm_txdelay_ms_ = std::max(50, config_.ptt_pre_delay_ms / 2);
+
+    IRIS_LOG("[PROBE-CACHE] applied cached probe for %s (age=%ds, band %.0f-%.0f Hz)",
+             callsign.c_str(), age_s, low, high);
+    return true;
 }
 
 } // namespace iris

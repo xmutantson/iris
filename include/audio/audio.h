@@ -82,6 +82,11 @@ void loopback_set_noise(float amplitude);  // AWGN noise amplitude (0 = off)
 void loopback_set_fm_channel(float preemph_us, float bp_low, float bp_high,
                               float cfo_hz, float deviation_limit);
 
+// Configure FM multipath simulation (2-tap: direct + delayed reflection).
+// delay_ms: reflection delay in ms (0 = disabled, typical 0.2-2.0 ms)
+// gain: reflection amplitude (0-1, e.g., 0.3 = -10.5 dB reflection)
+void loopback_set_fm_multipath(float delay_ms, float gain);
+
 std::unique_ptr<AudioCapture> create_loopback_capture();
 std::unique_ptr<AudioPlayback> create_loopback_playback();
 

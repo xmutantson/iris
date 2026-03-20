@@ -14,6 +14,8 @@ struct OfdmSyncResult {
     float schmidl_metric = 0;    // Peak metric value [0,1] (ZC cross-correlation peak)
     float cfo_hz = 0;            // Estimated carrier frequency offset
     float snr_est = 0;           // SNR estimate from training symbols (dB)
+    float zc_metric = 0;         // ZC cross-correlation peak [0,1]
+    float sc_metric = 0;         // Schmidl-Cox autocorrelation peak [0,1]
 };
 
 // ---------------------------------------------------------------------------

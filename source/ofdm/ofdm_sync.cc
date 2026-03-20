@@ -242,8 +242,8 @@ OfdmSyncResult ofdm_detect_frame(const std::complex<float>* iq, int n_samples,
     // SC has a plateau of width cp (due to cyclic prefix periodicity).
     // ZC xcorr has a sharp peak at the exact body start.
     // We use ZC to refine timing but NOT for detection thresholding.
+    float best_zc_metric = 0.0f;
     {
-        float best_zc_metric = 0.0f;
         int best_zc_d = peak_d;
 
         int refine_lo = std::max(0, peak_d - cp);
@@ -273,14 +273,15 @@ OfdmSyncResult ofdm_detect_frame(const std::complex<float>* iq, int n_samples,
         }
 
         // ZC quality gate: SC can false-trigger on repetitive non-OFDM structure.
-        // ZC metric degrades with carrier count (channel distortion across wider BW):
-        //   15 carriers (1.4 kHz): ZC ≥ 0.98    → threshold 0.55
-        //   30 carriers (2.8 kHz): ZC ≥ 0.47    → threshold 0.475
-        //   64 carriers (6.0 kHz): ZC ≈ 0.35-40 → threshold 0.305
-        // False positives: ZC ≤ 0.42 across all tested configs.
-        // Formula: max(0.25, 0.55 - 0.005 * max(0, n_used - 15))
+        // ZC metric degrades with carrier count (channel distortion across wider BW)
+        // AND with FM channel impairments (pre-emphasis, deviation limiting).
+        // OTA observations (30 carriers, 2.8 kHz):
+        //   Legitimate frames: ZC 0.35-0.79, noise/false: ZC < 0.15
+        //   Loopback: ZC ≥ 0.47, but FM channel degrades by ~10 dB
+        // Reduced from 0.55 - 0.005*N to 0.45 - 0.005*N for OTA margin.
+        // Threshold at 30 carriers: 0.375 (was 0.475).
         const int n_used = config.n_used_carriers;
-        const float zc_threshold = std::max(0.25f, 0.55f - 0.005f * std::max(0, n_used - 15));
+        const float zc_threshold = std::max(0.20f, 0.45f - 0.005f * std::max(0, n_used - 15));
         if (best_zc_metric < zc_threshold) {
             IRIS_LOG("[OFDM-SYNC] SC passed (%.3f) but ZC too low (%.3f < %.2f, n_used=%d) — false positive rejected",
                      peak_metric, best_zc_metric, zc_threshold, n_used);
@@ -361,6 +362,8 @@ OfdmSyncResult ofdm_detect_frame(const std::complex<float>* iq, int n_samples,
     }
 
     result.detected = true;
+    result.sc_metric = peak_metric;
+    result.zc_metric = best_zc_metric;
 
     // Track detection statistics
     {
@@ -384,6 +387,16 @@ OfdmSyncResult ofdm_detect_frame(const std::complex<float>* iq, int n_samples,
 // ---------------------------------------------------------------------------
 // CFO correction (in-place)
 // ---------------------------------------------------------------------------
+// Complex derotation exp(-jθ) correctly shifts the positive-frequency carriers
+// (bins 4-33) that the demodulator extracts. For real-valued OFDM inputs
+// (imag=0), this creates an imaginary component, but that's fine — we only
+// read positive-frequency FFT bins.
+//
+// NOTE: The frequency-domain CFO ESTIMATOR is biased toward zero for real-valued
+// signals. At each bin k, Y[k] = A·exp(jφ) + conj(A)·exp(-jφ) (from Hermitian
+// symmetry), so Y2·conj(Y1) ≈ 2|A|²·cos(Δφ) — a REAL quantity whose arg() ≈ 0
+// regardless of true CFO. The residual frequency offset manifests as CPE drift
+// (~2°/symbol OTA) which the per-symbol pilot CPE tracker corrects.
 void ofdm_correct_cfo(std::complex<float>* iq, int n_samples,
                        float cfo_hz, int sample_rate)
 {

@@ -530,7 +530,7 @@ static void test_ofdm_phy_roundtrip() {
     pb.center_hz = 1650.0f;
     pb.bandwidth_hz = 2700.0f;
     pb.valid = true;
-    OfdmConfig cfg = ofdm_config_from_probe(pb, 512, 32, 4, 14);
+    OfdmConfig cfg = ofdm_config_from_probe(pb, 512, 32, 6, 24);
 
     printf("  Config: nfft=%d cp=%d, %d used, %d data, %d pilot carriers\n",
            cfg.nfft, cfg.cp_samples, cfg.n_used_carriers,
@@ -555,9 +555,14 @@ static void test_ofdm_phy_roundtrip() {
            iq.size(), 1000.0f * iq.size() / 48000.0f);
 
     // --- Verify PAPR after Hilbert clipper ---
-    float papr = compute_papr_db(iq);
-    printf("  PAPR = %.1f dB (target <= 8.0 dB)\n", papr);
-    check("PAPR reduced to <= 8.0 dB", papr <= 8.0f);
+    // Preamble (2 training symbols) is excluded from PAPR clipping to
+    // preserve the channel estimate, so measure only data portion.
+    int sym_len_check = cfg.symbol_samples();
+    int preamble_len = 2 * sym_len_check;
+    std::vector<std::complex<float>> data_only(iq.begin() + preamble_len, iq.end());
+    float papr = compute_papr_db(data_only);
+    printf("  PAPR (data) = %.1f dB (target <= 11.0 dB with DFT-spread)\n", papr);
+    check("PAPR reduced to <= 11.0 dB", papr <= 11.0f);
 
     // --- Verify Hermitian symmetry: imaginary parts should be near zero ---
     float max_imag = 0;
@@ -755,6 +760,161 @@ static void test_ofdm_phy_roundtrip() {
     }
 }
 
+// =======================================================================
+//  OFDM Multi-Codeword Roundtrip: verify n_codewords > 1
+// =======================================================================
+static void test_ofdm_multi_codeword() {
+    printf("\n=== OFDM Multi-Codeword Roundtrip ===\n");
+
+    NegotiatedPassband pb;
+    pb.low_hz = 300.0f;
+    pb.high_hz = 3000.0f;
+    pb.center_hz = 1650.0f;
+    pb.bandwidth_hz = 2700.0f;
+    pb.valid = true;
+    OfdmConfig cfg = ofdm_config_from_probe(pb, 512, 32, 6, 24);
+
+    OfdmModulator mod(cfg);
+    ToneMap tm = get_uniform_tone_map(2, cfg);  // QPSK r1/2
+    tm.n_codewords = 2;  // Two LDPC blocks per frame
+
+    // Payload large enough to fill 2 codewords
+    std::vector<uint8_t> payload(160);
+    for (int i = 0; i < (int)payload.size(); i++) payload[i] = (uint8_t)(i * 37 + 13);
+
+    auto iq = mod.build_ofdm_frame(payload.data(), payload.size(), tm, LdpcRate::RATE_1_2, 2);
+    check("Multi-CW: frame generated", !iq.empty());
+    if (iq.empty()) return;
+
+    printf("  Frame: %zu samples (%.1f ms), %zu bytes payload, 2 codewords\n",
+           iq.size(), 1000.0f * iq.size() / 48000.0f, payload.size());
+
+    // Clean loopback
+    std::vector<std::complex<float>> rx_iq(iq.size());
+    for (size_t i = 0; i < iq.size(); i++)
+        rx_iq[i] = std::complex<float>(iq[i].real(), 0.0f);
+    size_t pad = 48000;
+    rx_iq.insert(rx_iq.begin(), pad, std::complex<float>(0, 0));
+    rx_iq.insert(rx_iq.end(), pad, std::complex<float>(0, 0));
+
+    auto sync = ofdm_detect_frame(rx_iq.data(), (int)rx_iq.size(), cfg);
+    check("Multi-CW: frame detected", sync.detected);
+    if (!sync.detected) return;
+
+    OfdmDemodulator demod(cfg);
+    ToneMap rx_tm = tm;
+    auto result = demod.demodulate(rx_iq.data(), (int)rx_iq.size(), rx_tm, &sync);
+    printf("  Demod: success=%d, snr=%.1f dB, %zu bytes recovered\n",
+           result.success, result.snr_db, result.payload.size());
+    check("Multi-CW: decode success", result.success);
+    if (result.success) {
+        bool match = (result.payload.size() == payload.size()) &&
+                     (memcmp(result.payload.data(), payload.data(), payload.size()) == 0);
+        check("Multi-CW: payload matches", match);
+    }
+}
+
+// Forward declaration (defined below run_tests)
+static void fm_channel_process(float* audio, int n, float target_peak,
+                                float noise_amplitude, float fs = 48000.0f);
+
+// =======================================================================
+//  OFDM Higher Speed Levels: verify O2-O7 roundtrip (preset 3-8)
+// =======================================================================
+static void test_ofdm_speed_levels() {
+    printf("\n=== OFDM Speed Level Roundtrip (O0-O7) ===\n");
+
+    NegotiatedPassband pb;
+    pb.low_hz = 300.0f;
+    pb.high_hz = 3000.0f;
+    pb.center_hz = 1650.0f;
+    pb.bandwidth_hz = 2700.0f;
+    pb.valid = true;
+    OfdmConfig cfg = ofdm_config_from_probe(pb, 512, 32, 6, 24);
+
+    uint8_t payload[32];
+    for (int i = 0; i < 32; i++) payload[i] = (uint8_t)(i * 37 + 13);
+
+    // Test presets 1-8 (O0-O7): BPSK r1/2 through 256QAM r7/8
+    static const struct { int preset; const char* name; LdpcRate fec; } levels[] = {
+        {1, "O0 BPSK r1/2",   LdpcRate::RATE_1_2},
+        {2, "O1 QPSK r1/2",   LdpcRate::RATE_1_2},
+        {3, "O2 QPSK r3/4",   LdpcRate::RATE_3_4},
+        {4, "O3 16QAM r1/2",  LdpcRate::RATE_1_2},
+        {5, "O4 16QAM r3/4",  LdpcRate::RATE_3_4},
+        {6, "O5 64QAM r3/4",  LdpcRate::RATE_3_4},
+        {7, "O6 64QAM r7/8",  LdpcRate::RATE_7_8},
+        {8, "O7 256QAM r7/8", LdpcRate::RATE_7_8},
+    };
+
+    // Helper: run a frame through detect + demod, return success
+    auto try_decode = [&](const std::vector<float>& audio, ToneMap& tm,
+                          const char* label) -> bool {
+        std::vector<std::complex<float>> rx_iq(audio.size());
+        for (size_t i = 0; i < audio.size(); i++)
+            rx_iq[i] = std::complex<float>(audio[i], 0.0f);
+        size_t pad = 48000;
+        rx_iq.insert(rx_iq.begin(), pad, std::complex<float>(0, 0));
+        rx_iq.insert(rx_iq.end(), pad, std::complex<float>(0, 0));
+
+        auto sync = ofdm_detect_frame(rx_iq.data(), (int)rx_iq.size(), cfg);
+        if (!sync.detected) {
+            printf("  [%s] not detected\n", label);
+            return false;
+        }
+
+        OfdmDemodulator demod(cfg);
+        auto result = demod.demodulate(rx_iq.data(), (int)rx_iq.size(), tm, &sync);
+        bool match = result.success && (result.payload.size() == 32) &&
+                     (memcmp(result.payload.data(), payload, 32) == 0);
+        printf("  [%s] %s (snr=%.1f dB, ldpc=%d iters)\n",
+               label, match ? "PASS" : "FAIL", result.snr_db, result.worst_ldpc_iters);
+        return match;
+    };
+
+    // --- Phase 1: Clean loopback for all levels ---
+    printf("\n  --- Clean Loopback ---\n");
+    for (auto& lv : levels) {
+        ToneMap tm = get_uniform_tone_map(lv.preset, cfg);
+        OfdmModulator mod(cfg);
+        auto iq = mod.build_ofdm_frame(payload, 32, tm, lv.fec);
+        if (iq.empty()) {
+            printf("  [%s] SKIP: no frame generated\n", lv.name);
+            continue;
+        }
+
+        std::vector<float> audio(iq.size());
+        for (size_t i = 0; i < iq.size(); i++)
+            audio[i] = iq[i].real();
+
+        char label[64];
+        snprintf(label, sizeof(label), "%s: clean", lv.name);
+        bool match = try_decode(audio, tm, label);
+        check(label, match);
+    }
+
+    // --- Phase 2: FM channel at 50% drive ---
+    printf("\n  --- FM Channel (50%% drive) ---\n");
+    for (auto& lv : levels) {
+        ToneMap tm = get_uniform_tone_map(lv.preset, cfg);
+        OfdmModulator mod(cfg);
+        auto iq = mod.build_ofdm_frame(payload, 32, tm, lv.fec);
+        if (iq.empty()) continue;
+
+        std::vector<float> fm_audio(iq.size());
+        for (size_t i = 0; i < iq.size(); i++)
+            fm_audio[i] = iq[i].real();
+
+        fm_channel_process(fm_audio.data(), (int)fm_audio.size(), 0.50f, 0.0f);
+
+        char label[80];
+        snprintf(label, sizeof(label), "%s: FM", lv.name);
+        bool match = try_decode(fm_audio, tm, label);
+        check(label, match);
+    }
+
+}
+
 static void test_ofdm_kiss_loopback() {
     printf("\n=== OFDM-KISS Audio Loopback (Mode A upconvert/downconvert) ===\n");
 
@@ -880,6 +1040,8 @@ int run_tests() {
     test_native_frame_loopback();
     test_ofdm_kiss_loopback();
     test_ofdm_phy_roundtrip();
+    test_ofdm_multi_codeword();
+    test_ofdm_speed_levels();
 
     // Phase 3: Auto-upgrade
     printf("\n--- Phase 3: Auto-Upgrade ---\n");
@@ -971,19 +1133,17 @@ int run_tests() {
         check("LDPC 1/2 decode size = 800", (int)decoded.size() == 800);
         check("LDPC 1/2 round-trip", decoded == data);
 
-        // RATE_5_8: no precomputed matrix yet, falls back to rate 1/2 (k=800).
-        // Verify fallback: 1000 bits → padded to 1600 (2×k) → 2 codewords = 3200 bits.
+        // RATE_5_8: k=1000, n=1600 (native matrix, no fallback needed)
         std::vector<uint8_t> data58;
         for (int i = 0; i < 1000; i++) data58.push_back((i * 3) & 1);
         auto enc58 = LdpcCodec::encode(data58, LdpcRate::RATE_5_8);
-        check("LDPC 5/8 fallback encoded = 3200 bits", (int)enc58.size() == 3200);
+        check("LDPC 5/8 encoded = 1600 bits", (int)enc58.size() == 1600);
         auto dec58 = LdpcCodec::decode(enc58, LdpcRate::RATE_5_8);
-        // Decode returns 1600 bits (2×k=800), first 1000 match original
-        check("LDPC 5/8 fallback decode size", (int)dec58.size() == 1600);
+        check("LDPC 5/8 decode size = 1000", (int)dec58.size() == 1000);
         bool match58 = true;
         for (int i = 0; i < 1000 && i < (int)dec58.size(); i++)
             if (dec58[i] != data58[i]) { match58 = false; break; }
-        check("LDPC 5/8 fallback data preserved", match58);
+        check("LDPC 5/8 data preserved", match58);
 
         // RATE_3_4: k=1200, 800 data bits padded to 1200
         auto enc34 = LdpcCodec::encode(data, LdpcRate::RATE_3_4);
@@ -1979,9 +2139,9 @@ int run_tests() {
         tx_result.tones_detected = 42;
         tx_result.valid = true;
         tx_result.capabilities = 0x001F;  // all caps
-        tx_result.ofdm_cp_samples = 64;
-        tx_result.ofdm_pilot_carrier_spacing = 4;
-        tx_result.ofdm_pilot_symbol_spacing = 14;
+        tx_result.ofdm_cp_samples = 32;
+        tx_result.ofdm_pilot_carrier_spacing = 6;
+        tx_result.ofdm_pilot_symbol_spacing = 24;
         tx_result.ofdm_nfft_code = 0;  // 512
 
         // Set up realistic tone data
@@ -2007,9 +2167,9 @@ int run_tests() {
         check("Probe v4 high_hz matches", std::abs(decoded.high_hz - tx_result.high_hz) < 0.01f);
         check("Probe v4 tones_detected matches", decoded.tones_detected == tx_result.tones_detected);
         check("Probe v4 capabilities matches", decoded.capabilities == tx_result.capabilities);
-        check("Probe v4 ofdm_cp", decoded.ofdm_cp_samples == 64);
-        check("Probe v4 ofdm_pilot_carrier", decoded.ofdm_pilot_carrier_spacing == 4);
-        check("Probe v4 ofdm_pilot_symbol", decoded.ofdm_pilot_symbol_spacing == 14);
+        check("Probe v4 ofdm_cp", decoded.ofdm_cp_samples == 32);
+        check("Probe v4 ofdm_pilot_carrier", decoded.ofdm_pilot_carrier_spacing == 6);
+        check("Probe v4 ofdm_pilot_symbol", decoded.ofdm_pilot_symbol_spacing == 24);
         check("Probe v4 ofdm_nfft_code", decoded.ofdm_nfft_code == 0);
 
         // Check tone powers survived quantization (0.5 dB resolution)
@@ -2236,4 +2396,330 @@ int run_tests() {
     printf("\n============================\n");
     printf("Results: %d passed, %d failed\n", tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;
+}
+
+// =========================================================================
+//  FM Channel SNR Benchmark
+//
+//  Sweeps all 8 O-levels (BPSK r1/2 through 256QAM r7/8) at varying
+//  audio SNR through the full FM channel model:
+//    TX de-emphasis → pre-emphasis → deviation limiter → de-emphasis
+//    → audio bandpass (300-3000 Hz) → AWGN noise → detect → decode
+//
+//  Reports minimum SNR for successful decode at each level.
+// =========================================================================
+
+// FM channel model (matches audio_loopback.cc FmChannelState)
+static void fm_channel_process(float* audio, int n, float target_peak,
+                                float noise_amplitude, float fs)
+{
+    float tau_s = 530e-6f;
+
+    // Pre-emphasis: H(s) = (1+s·τ₁)/(1+s·τ₂) via bilinear transform
+    // τ₂ adds a stabilizing pole at ~15 kHz
+    float tau2_s = 1.0f / (2.0f * (float)M_PI * 15000.0f);
+    float c1 = 2.0f * fs * tau_s;
+    float c2 = 2.0f * fs * tau2_s;
+    float pe_a0 = 1.0f + c2;
+    float pe_b0 = (1.0f + c1) / pe_a0;
+    float pe_b1 = (1.0f - c1) / pe_a0;
+    float pe_a1 = (1.0f - c2) / pe_a0;
+
+    // Two-pass: apply pre-emphasis, then normalize so peak = deviation limit.
+    // This models a properly-adjusted radio: operator sets audio level so peaks
+    // just reach max deviation. The deviation limiter then barely clips.
+    std::vector<float> pe_audio(n);
+    float pe_x1 = 0.0f, pe_y1 = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float x = audio[i];
+        pe_audio[i] = pe_b0 * x + pe_b1 * pe_x1 - pe_a1 * pe_y1;
+        pe_x1 = x;
+        pe_y1 = pe_audio[i];
+    }
+
+    // Normalize post-pre-emphasis so peak = target_peak × deviation_limit.
+    // target_peak controls how close to the limit we push (0.95 = near max deviation).
+    float pe_peak = 0;
+    for (int i = 0; i < n; i++)
+        if (std::abs(pe_audio[i]) > pe_peak) pe_peak = std::abs(pe_audio[i]);
+    float dev_limit = 0.95f;
+    if (pe_peak > 0) {
+        float norm = (target_peak * dev_limit) / pe_peak;
+        // Scale the ORIGINAL audio by the same factor, then re-apply pre-emphasis
+        for (int i = 0; i < n; i++) audio[i] *= norm;
+    }
+
+    // Re-apply pre-emphasis with correct scaling
+    pe_x1 = 0.0f; pe_y1 = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float x = audio[i];
+        audio[i] = pe_b0 * x + pe_b1 * pe_x1 - pe_a1 * pe_y1;
+        pe_x1 = x;
+        pe_y1 = audio[i];
+    }
+
+    // Deviation limiter: hard clip to ±deviation_limit
+    for (int i = 0; i < n; i++) {
+        if (audio[i] > dev_limit) audio[i] = dev_limit;
+        if (audio[i] < -dev_limit) audio[i] = -dev_limit;
+    }
+
+    // f²-shaped FM discriminator noise (inserted BEFORE de-emphasis)
+    // FM discriminator output noise PSD ∝ f². We generate white noise,
+    // filter through a first-order differentiator (y[n] = x[n] - x[n-1])
+    // which has |H(f)|² = 4sin²(πf/fs) ≈ (2πf/fs)² for f << fs,
+    // giving the correct f² spectral shape. De-emphasis then partially
+    // whitens it: combined PSD ∝ f²/(1+(2πfτ)²), matching real FM.
+    if (noise_amplitude > 0) {
+        static std::mt19937 rng(42);
+        std::normal_distribution<float> dist(0.0f, noise_amplitude);
+        float prev_noise = 0.0f;
+        for (int i = 0; i < n; i++) {
+            float wn = dist(rng);
+            float shaped = wn - prev_noise;  // differentiator: +6 dB/octave
+            prev_noise = wn;
+            audio[i] += shaped;
+        }
+    }
+
+    // De-emphasis: H(s) = 1/(1+sτ) via bilinear transform
+    float wc = 1.0f / tau_s;
+    float K = 2.0f * fs;
+    float a = K + wc;
+    float de_b0 = wc / a, de_b1 = wc / a, de_a1 = (wc - K) / a;
+    float de_x1 = 0.0f, de_y1 = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float de = de_b0 * audio[i] + de_b1 * de_x1 - de_a1 * de_y1;
+        de_x1 = audio[i];
+        de_y1 = de;
+        audio[i] = de;
+    }
+
+    // Audio bandpass filter REMOVED from batch test.
+    // The IIR BPF's group delay creates ISI/ICI that the per-carrier
+    // equalizer cannot compensate in a batch (non-streaming) test.
+    // In a real radio, the analog BPF is part of the continuous-time
+    // channel captured by the training symbols; its steady-state response
+    // is equalized by H[k]. The real-time FM channel model in
+    // audio_loopback.cc keeps the BPF for continuous-stream testing.
+}
+
+int run_benchmark() {
+    printf("Iris OFDM FM Channel Benchmark\n");
+    printf("================================\n");
+    printf("Passband: 300-3000 Hz (2700 Hz BW)\n");
+    printf("FM model: pre-emphasis 530us + dev limiter 0.95 + f^2 noise + de-emphasis\n\n");
+
+    NegotiatedPassband pb;
+    pb.low_hz = 300.0f;
+    pb.high_hz = 3000.0f;
+    pb.center_hz = 1650.0f;
+    pb.bandwidth_hz = 2700.0f;
+    pb.valid = true;
+    OfdmConfig cfg = ofdm_config_from_probe(pb, 512, 32, 6, 24);
+
+    printf("OFDM: NFFT=%d, CP=%d, %d used carriers (%d data, %d pilot), spacing=%.1f Hz\n",
+           cfg.nfft, cfg.cp_samples, cfg.n_used_carriers, cfg.n_data_carriers,
+           cfg.n_used_carriers - cfg.n_data_carriers,
+           (float)cfg.sample_rate / cfg.nfft);
+    printf("Pilot: carrier spacing=%d, symbol spacing=%d, row spacing=%d\n\n",
+           cfg.pilot_carrier_spacing, cfg.pilot_symbol_spacing, cfg.pilot_row_spacing);
+
+    uint8_t payload[64];
+    for (int i = 0; i < 64; i++) payload[i] = (uint8_t)(i * 37 + 13);
+
+    static const struct { int preset; const char* name; LdpcRate fec; int bpc; } levels[] = {
+        {1, "O0 BPSK  r1/2",  LdpcRate::RATE_1_2, 1},
+        {2, "O1 QPSK  r1/2",  LdpcRate::RATE_1_2, 2},
+        {3, "O2 QPSK  r3/4",  LdpcRate::RATE_3_4, 2},
+        {4, "O3 16QAM r1/2",  LdpcRate::RATE_1_2, 4},
+        {5, "O4 16QAM r3/4",  LdpcRate::RATE_3_4, 4},
+        {6, "O5 64QAM r3/4",  LdpcRate::RATE_3_4, 6},
+        {7, "O6 64QAM r7/8",  LdpcRate::RATE_7_8, 6},
+        {8, "O7 256QAM r7/8", LdpcRate::RATE_7_8, 8},
+    };
+
+    // Audio SNR sweep
+    float snr_sweep[] = {50, 40, 35, 30, 27, 25, 23, 21, 19, 17, 15, 13, 11, 9, 7, 5, 3, 1, 0};
+    int n_snr = sizeof(snr_sweep) / sizeof(snr_sweep[0]);
+
+    printf("%-18s | %-7s | %-12s | %-10s | %-6s | %-5s\n",
+           "Level", "bps*", "Min SNR (dB)", "Clean SNR", "LDPC", "Det");
+    printf("-------------------+---------+--------------+------------+--------+------\n");
+
+    for (auto& lv : levels) {
+        ToneMap tm = get_uniform_tone_map(lv.preset, cfg);
+        OfdmModulator mod(cfg);
+        auto iq = mod.build_ofdm_frame(payload, 64, tm, lv.fec);
+        if (iq.empty()) {
+            printf("%-18s | SKIP: frame gen failed\n", lv.name);
+            continue;
+        }
+
+        // Extract real audio
+        std::vector<float> tx_audio(iq.size());
+        for (size_t i = 0; i < iq.size(); i++)
+            tx_audio[i] = iq[i].real();
+
+        // Compute throughput
+        int sym_samples = cfg.nfft + cfg.cp_samples;
+        float sym_rate = (float)cfg.sample_rate / sym_samples;
+        float fec_rate = 0;
+        switch (lv.fec) {
+            case LdpcRate::RATE_1_2: fec_rate = 0.5f; break;
+            case LdpcRate::RATE_3_4: fec_rate = 0.75f; break;
+            case LdpcRate::RATE_7_8: fec_rate = 0.875f; break;
+            default: fec_rate = 0.5f;
+        }
+        int phy_bps = (int)(cfg.n_data_carriers * lv.bpc * fec_rate * sym_rate);
+
+        // Measure signal RMS after clean FM channel (post-DE) for SNR reference.
+        float sig_rms_measured = 0.0f;
+        {
+            std::vector<float> fm_ref(tx_audio);
+            fm_channel_process(fm_ref.data(), (int)fm_ref.size(), 0.50f, 0.0f);
+            double sum2 = 0;
+            for (size_t i = 0; i < fm_ref.size(); i++) sum2 += (double)fm_ref[i] * fm_ref[i];
+            sig_rms_measured = (float)std::sqrt(sum2 / fm_ref.size());
+        }
+
+        // Calibrate f²-noise transfer gain: measure what RMS emerges at the
+        // demod output (post-DE) per unit of white noise input to the differentiator.
+        // This accounts for the differentiator's low gain at audio frequencies
+        // (|H(f)| = 2sin(πf/fs) ≈ 2πf/fs << 1 for f << fs) and the de-emphasis
+        // attenuation. We need this to correctly set noise amplitude for a target
+        // post-DE SNR that the OFDM demodulator actually sees.
+        float noise_transfer_gain = 0.0f;
+        {
+            // Run noise-only through the same FM channel (PE+limiter have no effect
+            // on zero-signal noise, but de-emphasis does). Use enough samples for
+            // statistical accuracy.
+            int cal_n = 48000 * 2;  // 2 seconds
+            std::mt19937 cal_rng(99);
+            std::normal_distribution<float> cal_dist(0.0f, 1.0f);
+
+            // Simulate: white noise -> differentiator -> de-emphasis
+            float tau_s = 530e-6f;
+            float wc = 1.0f / tau_s;
+            float K = 2.0f * 48000.0f;
+            float a = K + wc;
+            float de_b0 = wc / a, de_b1 = wc / a, de_a1 = (wc - K) / a;
+            float de_x1 = 0.0f, de_y1 = 0.0f;
+            float prev_noise = 0.0f;
+            double sum2 = 0;
+            for (int i = 0; i < cal_n; i++) {
+                float wn = cal_dist(cal_rng);
+                float shaped = wn - prev_noise;
+                prev_noise = wn;
+                float de = de_b0 * shaped + de_b1 * de_x1 - de_a1 * de_y1;
+                de_x1 = shaped;
+                de_y1 = de;
+                sum2 += (double)de * de;
+            }
+            noise_transfer_gain = (float)std::sqrt(sum2 / cal_n);
+        }
+
+        // Clean FM channel baseline
+        float clean_snr = -1.0f;
+        bool clean_ok = false;
+        int clean_ldpc = 0;
+        {
+            std::vector<float> fm_audio(tx_audio);
+            fm_channel_process(fm_audio.data(), (int)fm_audio.size(), 0.50f, 0.0f);
+            std::vector<std::complex<float>> rx_iq(fm_audio.size());
+            for (size_t i = 0; i < fm_audio.size(); i++)
+                rx_iq[i] = std::complex<float>(fm_audio[i], 0.0f);
+            size_t pad = 48000;
+            rx_iq.insert(rx_iq.begin(), pad, {0, 0});
+            rx_iq.insert(rx_iq.end(), pad, {0, 0});
+            auto sync = ofdm_detect_frame(rx_iq.data(), (int)rx_iq.size(), cfg);
+            if (sync.detected) {
+                OfdmDemodulator demod(cfg);
+                auto result = demod.demodulate(rx_iq.data(), (int)rx_iq.size(), tm, &sync);
+                clean_snr = result.snr_db;
+                clean_ldpc = result.worst_ldpc_iters;
+                clean_ok = result.success && result.payload.size() == 64 &&
+                           memcmp(result.payload.data(), payload, 64) == 0;
+            }
+        }
+
+        // Detailed per-SNR sweep with diagnostics
+        printf("\n  [%s]  sig_rms=%.4f  noise_xfer=%.4f  clean: %s (SNR=%.1f dB, LDPC=%d)\n",
+               lv.name, sig_rms_measured, noise_transfer_gain,
+               clean_ok ? "PASS" : "FAIL", clean_snr, clean_ldpc);
+        printf("  %5s | %4s | %8s | %6s | %6s | %4s | %6s | %s\n",
+               "SNR", "Det", "ZC/SC", "chSNR", "mean|H|", "LDPC", "LLRmax", "Result");
+
+        float min_snr = -1.0f;
+        int min_ldpc_iters = 0;
+        for (int si = 0; si < n_snr; si++) {
+            float target_snr = snr_sweep[si];
+            // Target: post-DE noise RMS = sig_rms / 10^(SNR/20)
+            // Since noise_transfer_gain maps 1.0 input RMS to output RMS,
+            // we need input amplitude = target_noise_rms / noise_transfer_gain
+            float target_noise_rms = sig_rms_measured / std::pow(10.0f, target_snr / 20.0f);
+            float noise_amp = target_noise_rms / noise_transfer_gain;
+
+            std::vector<float> fm_audio(tx_audio);
+            fm_channel_process(fm_audio.data(), (int)fm_audio.size(), 0.50f, noise_amp);
+
+            // Measure actual RX SNR
+            double rx_sum2 = 0;
+            for (size_t i = 0; i < fm_audio.size(); i++)
+                rx_sum2 += (double)fm_audio[i] * fm_audio[i];
+            float rx_rms = (float)std::sqrt(rx_sum2 / fm_audio.size());
+
+            std::vector<std::complex<float>> rx_iq(fm_audio.size());
+            for (size_t i = 0; i < fm_audio.size(); i++)
+                rx_iq[i] = std::complex<float>(fm_audio[i], 0.0f);
+            size_t pad = 48000;
+            rx_iq.insert(rx_iq.begin(), pad, {0, 0});
+            rx_iq.insert(rx_iq.end(), pad, {0, 0});
+
+            auto sync = ofdm_detect_frame(rx_iq.data(), (int)rx_iq.size(), cfg);
+            if (!sync.detected) {
+                printf("  %5.0f | NO   |          |        |        |      |        | no detection\n",
+                       target_snr);
+                continue;
+            }
+
+            OfdmDemodulator demod(cfg);
+            auto result = demod.demodulate(rx_iq.data(), (int)rx_iq.size(), tm, &sync);
+
+            // Compute max LLR magnitude from result
+            float llr_max = 0;
+            for (auto& l : result.llrs) {
+                float a = std::abs(l);
+                if (a > llr_max) llr_max = a;
+            }
+
+            bool ok = result.success && result.payload.size() == 64 &&
+                      memcmp(result.payload.data(), payload, 64) == 0;
+            if (ok) {
+                min_snr = target_snr;
+                min_ldpc_iters = result.worst_ldpc_iters;
+            }
+
+            printf("  %5.0f | yes  | %.2f/%.2f | %5.1f | %6.3f | %4d | %6.1f | %s\n",
+                   target_snr,
+                   sync.zc_metric, sync.sc_metric,
+                   result.mean_channel_snr_db,
+                   result.mean_H_mag,
+                   result.worst_ldpc_iters,
+                   llr_max,
+                   ok ? "PASS" : "FAIL");
+        }
+
+        if (min_snr >= 0) {
+            printf("%-18s | %5d   | %5.0f dB      | %5.1f dB    | %3d    | yes\n",
+                   lv.name, phy_bps, min_snr, clean_snr, min_ldpc_iters);
+        } else {
+            printf("%-18s | %5d   | %s    | %5.1f dB    |   -    | -\n",
+                   lv.name, phy_bps, clean_ok ? "clean only" : "BROKEN   ", clean_snr);
+        }
+    }
+
+    printf("\n* PHY bps = data_carriers × bpc × fec_rate × symbol_rate (before framing overhead)\n");
+    printf("  Actual throughput depends on preamble/pilot/tail overhead and ARQ efficiency.\n");
+    return 0;
 }

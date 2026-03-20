@@ -69,6 +69,7 @@ using namespace iris;
 
 // Defined in tests.cc
 extern int run_tests();
+extern int run_benchmark();
 
 static std::atomic<bool> g_running{true};
 static std::atomic<bool> g_restart{false};
@@ -91,6 +92,7 @@ static void print_usage() {
     printf("Usage: iris [options]\n");
     printf("\nGeneral:\n");
     printf("  --test             Run loopback tests\n");
+    printf("  --benchmark        Run OFDM FM channel SNR benchmark\n");
     printf("  --config <file>    Load config from INI file (default: iris.ini)\n");
     printf("  --help             Show this help\n");
     printf("  --log <file>       Log to file (tee stdout + file)\n");
@@ -116,6 +118,7 @@ static void print_usage() {
     printf("  --noise <amp>      Add AWGN noise to loopback (amplitude, e.g. 0.01)\n");
     printf("  --fm-channel       Enable FM channel simulator in loopback\n");
     printf("  --fm-cfo <Hz>      FM channel frequency offset (default: 0)\n");
+    printf("  --fm-multipath <ms> <gain>  FM multipath reflection (delay ms, gain 0-1)\n");
     printf("  --list-audio       List audio devices and exit\n");
     printf("  --capture <id>     Capture device ID (-1 = default)\n");
     printf("  --playback <id>    Playback device ID (-1 = default)\n");
@@ -153,6 +156,7 @@ int main(int argc, char** argv) {
 
     std::string config_path = "iris.ini";
     bool run_test = false;
+    bool run_bench = false;
     bool use_gui = true;
     bool use_audio = true;
     bool use_loopback = false;
@@ -197,10 +201,14 @@ int main(int argc, char** argv) {
     float cli_deemph_us = 0.0f;
     bool cli_fm_channel = false;
     float cli_fm_cfo = 0.0f;
+    float cli_fm_mp_delay = 0.0f;
+    float cli_fm_mp_gain = 0.0f;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--test") == 0) {
             run_test = true;
+        } else if (strcmp(argv[i], "--benchmark") == 0) {
+            run_bench = true;
         } else if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
             config_path = argv[++i];
         } else if (strcmp(argv[i], "--nogui") == 0) {
@@ -303,6 +311,9 @@ int main(int argc, char** argv) {
             cli_fm_channel = true;
         } else if (strcmp(argv[i], "--fm-cfo") == 0 && i + 1 < argc) {
             cli_fm_cfo = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--fm-multipath") == 0 && i + 2 < argc) {
+            cli_fm_mp_delay = (float)atof(argv[++i]);
+            cli_fm_mp_gain = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage();
             return 0;
@@ -311,6 +322,8 @@ int main(int argc, char** argv) {
 
     if (run_test)
         return run_tests();
+    if (run_bench)
+        return run_benchmark();
 
     if (list_audio) {
         auto devices = enumerate_audio_devices();
@@ -458,6 +471,10 @@ int main(int argc, char** argv) {
         // Standard NBFM channel: 530µs pre/de-emphasis, 300-3000 Hz bandpass
         loopback_set_fm_channel(530.0f, 300.0f, 3000.0f, cli_fm_cfo, 0.95f);
         printf("  FM channel sim: pre-emphasis=530µs, BP=300-3000 Hz, CFO=%.1f Hz\n", cli_fm_cfo);
+        if (cli_fm_mp_delay > 0.0f) {
+            loopback_set_fm_multipath(cli_fm_mp_delay, cli_fm_mp_gain);
+            printf("  FM multipath: delay=%.2f ms, gain=%.2f\n", cli_fm_mp_delay, cli_fm_mp_gain);
+        }
     }
     if (cli_speed_level >= 0)
         modem.force_speed_level(cli_speed_level);

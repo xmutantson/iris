@@ -10,7 +10,7 @@ namespace iris {
 struct OfdmConfig {
     // Core parameters
     int nfft = 512;                    // FFT size (256/512/1024)
-    int cp_samples = 64;               // Cyclic prefix length in samples (1.33ms, safe for all radios)
+    int cp_samples = 32;               // Cyclic prefix length in samples (0.67ms, FM delay spread < 0.5ms)
     int sample_rate = 48000;           // Fixed
 
     // Derived from probe
@@ -31,8 +31,9 @@ struct OfdmConfig {
     std::vector<int> data_carrier_bins;    // Data FFT bin indices
 
     // Pilot pattern
-    int pilot_carrier_spacing = 4;     // Every Nth used carrier — comb pilots for CPE + interpolation
-    int pilot_symbol_spacing = 14;     // Every Mth OFDM symbol is all-pilot (block pilots for channel tracking)
+    int pilot_carrier_spacing = 6;     // Every Nth used carrier — comb pilots for CPE + interpolation
+    int pilot_symbol_spacing = 24;     // Every Mth OFDM symbol is all-pilot (block pilots for channel tracking)
+    int pilot_row_spacing = 5;         // Every Kth data symbol is a dense pilot row (all carriers = known ref)
 
     // FM TX de-emphasis: attenuate higher carriers on TX so that after the
     // radio's own pre-emphasis the signal is flat entering the deviation limiter.
@@ -40,6 +41,13 @@ struct OfdmConfig {
     // FM broadcast (75us): 2120 Hz. Set to 0 to disable (flat audio data port).
     float fm_preemph_corner_hz = 300.0f;
     float fm_preemph_gain_cap = 10.0f; // Max de-emphasis ratio (10 = −20 dB floor, handles 6 kHz BW)
+
+    // DFT-spread OFDM (SC-FDMA): DFT-precode data carriers before IFFT.
+    // Reduces PAPR from ~10-11 dB to ~5-7 dB (modulation-dependent).
+    // All data carriers in a symbol must use the same modulation order.
+    // Used in LTE/5G NR uplink for the same reason: FM deviation limiters
+    // behave like power amplifier saturators — low PAPR is critical.
+    bool dft_spread = true;
 
     // Header
     int n_header_symbols = 0;          // No header — config pre-negotiated (Mercury approach)
@@ -52,8 +60,8 @@ struct OfdmConfig {
 };
 
 // Create OfdmConfig from probe result
-OfdmConfig ofdm_config_from_probe(const NegotiatedPassband& passband, int nfft = 512, int cp_samples = 64,
-                                   int pilot_carrier_spacing = 4, int pilot_symbol_spacing = 14);
+OfdmConfig ofdm_config_from_probe(const NegotiatedPassband& passband, int nfft = 512, int cp_samples = 32,
+                                   int pilot_carrier_spacing = 6, int pilot_symbol_spacing = 24);
 
 // Get the FFT bin index for a given frequency
 int freq_to_bin(float freq_hz, int nfft, int sample_rate);

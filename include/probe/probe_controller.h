@@ -89,9 +89,9 @@ private:
     uint16_t local_caps_ = 0;  // Embedded in probe result for peer capability exchange
 
     // OFDM PHY config (embedded in probe result for parameter negotiation)
-    uint8_t ofdm_cp_ = 64;
-    uint8_t ofdm_pilot_carrier_ = 4;
-    uint8_t ofdm_pilot_symbol_ = 14;
+    uint8_t ofdm_cp_ = 32;
+    uint8_t ofdm_pilot_carrier_ = 6;
+    uint8_t ofdm_pilot_symbol_ = 24;
     uint8_t ofdm_nfft_code_ = 0;  // 0=512
 };
 

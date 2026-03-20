@@ -70,6 +70,7 @@ private:
     int fail_count_;       // Consecutive CRC failures
     float ldpc_boost_;     // SNR bonus from easy LDPC convergence
     int cooldown_;         // Frames to suppress upshift after failure-driven downshift
+    bool ldpc_hard_gate_ = false;  // True when worst LDPC iters > 30 — blocks upshift
     static constexpr int HOLD_FRAMES = 6;    // Hold this many frames before upshift (conservative for FM)
     static constexpr int FAIL_THRESHOLD = 2;  // Downshift after this many failures
     static constexpr int COOLDOWN_FRAMES = 8; // Suppress upshift after failure downshift

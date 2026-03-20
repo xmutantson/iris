@@ -34,6 +34,7 @@
 #include <complex>
 #include <memory>
 #include <atomic>
+#include <unordered_map>
 
 namespace iris {
 
@@ -79,6 +80,8 @@ enum class TuneState {
 struct ModemDiag {
     ModemState state;
     int speed_level;
+    int ofdm_speed_level = 0;  // O0-O7 OFDM level
+    bool ofdm_active = false;  // True when OFDM PHY is active
     float snr_db;
     float agc_gain;
     float tx_level;
@@ -269,6 +272,7 @@ private:
     std::unique_ptr<OfdmDemodulator> ofdm_demod_;       // OFDM demodulator
     ToneMap ofdm_tone_map_;                             // Current tone map (from gearshift)
     int ofdm_speed_level_ = 0;                          // Current OFDM speed level (O0-O3)
+    int ofdm_txdelay_ms_ = 0;                           // Adaptive OFDM TXDELAY (0 = use config default)
     std::vector<std::complex<float>> ofdm_rx_iq_;       // OFDM RX working buffer (complex)
     std::vector<float> ofdm_rx_audio_buf_;              // OFDM RX raw audio buffer (bypass downconverter)
     std::vector<float> ofdm_chase_llrs_;                // Stored LLRs for OFDM Chase combining
@@ -429,6 +433,19 @@ private:
     bool probe_start_pending_ = false;  // Deferred PROBE:START (can't send from state callback)
     std::string probe_peer_call_;       // Peer callsign for standalone probe result addressing
     XidCapability local_cap_;
+
+    // Probe result cache: skip re-probing peers within 24h.
+    // Stores the NegotiatedPassband + peer caps + probe results per callsign.
+    struct ProbeCacheEntry {
+        NegotiatedPassband negotiated;
+        ProbeResult my_tx;       // peer's analysis of our probe (contains their caps)
+        ProbeResult their_tx;    // our analysis of their probe
+        std::chrono::steady_clock::time_point timestamp;
+    };
+    std::unordered_map<std::string, ProbeCacheEntry> probe_cache_;
+    static constexpr int PROBE_CACHE_EXPIRY_S = 86400;  // 24 hours
+    bool try_use_cached_probe(const std::string& callsign);
+    void cache_probe_result(const std::string& callsign);
 
     // Probe-before-connect: AX.25 SABM deferred until probe completes
     std::string pending_connect_call_;   // Remote callsign waiting for probe to finish
