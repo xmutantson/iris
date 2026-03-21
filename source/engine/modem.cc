@@ -2610,6 +2610,129 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                              tx_buffer_.size(), ofdm_rms, OFDM_TARGET_RMS, ofdm_scale,
                              data_start, preamble_peak,
                              tx_channel_eq_.is_configured() ? "on" : "off");
+
+                    // ---- OFDM multi-frame burst: append additional frames ----
+                    // First frame is built above.  If queue still has data and
+                    // the batch airtime budget allows, build more OFDM frames
+                    // (each with own preamble → independent sync + channel est)
+                    // and concatenate audio in the same PTT cycle.
+                    {
+                        int burst_frames = 1;
+                        constexpr int MAX_BURST = 8;
+                        size_t burst_max_payload = (size_t)std::max(20,
+                            LdpcCodec::block_size(ofdm_tone_map_.fec_rate) / 8 - 6);
+
+                        while (!tx_queue_.empty() &&
+                               frame_airtime_s < batch_airtime_s_ &&
+                               burst_frames < MAX_BURST) {
+                            // Batch assembly (one LDPC block)
+                            std::vector<std::vector<uint8_t>> xbatch;
+                            size_t xtotal = 0;
+                            while (!tx_queue_.empty()) {
+                                auto& front = tx_queue_.front();
+                                size_t overhead = xbatch.empty() ? 3 : 2;
+                                if (!xbatch.empty() && xtotal + overhead + front.size() > burst_max_payload)
+                                    break;
+                                xtotal += overhead + front.size();
+                                xbatch.push_back(std::move(front));
+                                tx_queue_.pop();
+                            }
+                            if (xbatch.empty()) break;
+
+                            // Logging
+                            if (ofdm_kiss_ && packet_log_) {
+                                for (auto& sub : xbatch) {
+                                    if (sub.size() >= 14)
+                                        packet_log_(true, "OFDM-KISS", describe_ax25(sub.data(), sub.size()));
+                                }
+                            }
+
+                            // Frame wrapping
+                            std::vector<uint8_t> xframe;
+                            if (xbatch.size() == 1 && xbatch[0].size() > 0 &&
+                                xbatch[0][0] != MULTI_PAYLOAD_MAGIC) {
+                                xframe = std::move(xbatch[0]);
+                            } else {
+                                xframe.reserve(xtotal);
+                                xframe.push_back(MULTI_PAYLOAD_MAGIC);
+                                for (auto& sub : xbatch) {
+                                    uint16_t len = (uint16_t)sub.size();
+                                    xframe.push_back(len & 0xFF);
+                                    xframe.push_back((len >> 8) & 0xFF);
+                                    xframe.insert(xframe.end(), sub.begin(), sub.end());
+                                }
+                            }
+
+                            // Compression
+                            if (ofdm_kiss_tx_ && (ofdm_kiss_peer_caps_ & CAP_COMPRESSION) &&
+                                xframe.size() > 20 && xframe[0] != B2F_DATA_MAGIC) {
+                                std::vector<uint8_t> cbuf(xframe.size() + COMPRESS_HEADER_SIZE + 256);
+                                int clen = ofdm_kiss_tx_compressor_.compress_block(
+                                    xframe.data(), (int)xframe.size(),
+                                    cbuf.data(), (int)cbuf.size());
+                                if (clen > 0 && clen + 1 < (int)xframe.size()) {
+                                    xframe.clear();
+                                    xframe.reserve(1 + clen);
+                                    xframe.push_back(COMPRESSED_PAYLOAD_MAGIC);
+                                    xframe.insert(xframe.end(), cbuf.begin(), cbuf.begin() + clen);
+                                }
+                            }
+
+                            IRIS_LOG("[TX-OFDM] burst frame %d: %zu bytes (%zu sub-frames)",
+                                     burst_frames + 1, xframe.size(), xbatch.size());
+
+                            // Build OFDM frame
+                            auto xiq = ofdm_mod_->build_ofdm_frame(
+                                xframe.data(), xframe.size(),
+                                ofdm_tone_map_, ofdm_tone_map_.fec_rate);
+                            if (xiq.empty()) {
+                                IRIS_LOG("[TX-OFDM] burst frame %d rejected — stopping burst",
+                                         burst_frames + 1);
+                                break;
+                            }
+
+                            // Convert to audio + per-frame normalize + append
+                            size_t bstart = tx_buffer_.size();
+                            tx_buffer_.resize(bstart + xiq.size());
+                            for (size_t i = 0; i < xiq.size(); i++)
+                                tx_buffer_[bstart + i] = xiq[i].real();
+
+                            int xpreamble = 2 * (ofdm_config_.nfft + ofdm_config_.cp_samples);
+                            int xdata_start = (int)bstart + std::min(xpreamble, (int)xiq.size());
+
+                            float xsq = 0.0f;
+                            for (int i = xdata_start; i < (int)tx_buffer_.size(); i++)
+                                xsq += tx_buffer_[i] * tx_buffer_[i];
+                            int xdlen = (int)tx_buffer_.size() - xdata_start;
+                            float xrms = (xdlen > 0) ? std::sqrt(xsq / (float)xdlen) : 0.0f;
+                            float xscale = (xrms > 1e-6f) ? (OFDM_TARGET_RMS / xrms) : 0.1f;
+                            for (int i = xdata_start; i < (int)tx_buffer_.size(); i++)
+                                tx_buffer_[i] *= xscale;
+
+                            float xpeak = 0.0f;
+                            for (int i = (int)bstart; i < xdata_start; i++)
+                                xpeak = std::max(xpeak, std::abs(tx_buffer_[i]));
+                            if (xpeak > PREAMBLE_PEAK_LIMIT) {
+                                float xps = PREAMBLE_PEAK_LIMIT / xpeak;
+                                for (int i = (int)bstart; i < xdata_start; i++)
+                                    tx_buffer_[i] *= xps;
+                            }
+
+                            for (size_t i = bstart; i < tx_buffer_.size(); i++) {
+                                if (tx_buffer_[i] > 0.95f) tx_buffer_[i] = 0.95f;
+                                else if (tx_buffer_[i] < -0.95f) tx_buffer_[i] = -0.95f;
+                            }
+
+                            float xtime = (float)xiq.size() / (float)config_.sample_rate;
+                            frame_airtime_s += xtime;
+                            burst_frames++;
+                        }
+
+                        if (burst_frames > 1) {
+                            IRIS_LOG("[TX-OFDM] burst complete: %d frames, %.1fs, %zu samples",
+                                     burst_frames, frame_airtime_s, tx_buffer_.size());
+                        }
+                    }
                 } else {
                     // Native single-carrier PHY: IQ through upconverter as before
                     frame_airtime_s = (float)(iq.size() / 2) / (float)config_.sample_rate;
@@ -3676,6 +3799,12 @@ void Modem::tick() {
             // single-carrier when the peer doesn't support OFDM.
             if (config_.ofdm_enable && ofdm_mod_ && (ofdm_kiss_peer_caps_ & CAP_OFDM)) {
                 ofdm_phy_active_ = true;
+                // Limit AX.25 I-frame info to fit worst-case OFDM LDPC block.
+                // rate_1_2 (O0) has smallest capacity: k=100 bytes - 6 overhead
+                // - 16 AX.25 header = 78 bytes max info.  Multi-frame bursts
+                // send multiple OFDM frames per PTT cycle to compensate.
+                int ofdm_max_info = LdpcCodec::block_size(LdpcRate::RATE_1_2) / 8 - 6 - 16;
+                ax25_session_.set_max_info(ofdm_max_info);
                 IRIS_LOG("OFDM PHY: ACTIVE (CAP_OFDM negotiated, %d data carriers, BW=%.0f Hz)",
                          ofdm_config_.n_data_carriers, ofdm_config_.bandwidth_hz);
                 if (gui_log_) {
@@ -5080,6 +5209,8 @@ bool Modem::try_use_cached_probe(const std::string& callsign) {
 
         if (config_.ofdm_enable && ofdm_mod_ && (ofdm_kiss_peer_caps_ & CAP_OFDM)) {
             ofdm_phy_active_ = true;
+            int ofdm_max_info = LdpcCodec::block_size(LdpcRate::RATE_1_2) / 8 - 6 - 16;
+            ax25_session_.set_max_info(ofdm_max_info);
             IRIS_LOG("[PROBE-CACHE] OFDM PHY ACTIVE: %d carriers, BW=%.0f Hz",
                      ofdm_config_.n_data_carriers, ofdm_config_.bandwidth_hz);
         }

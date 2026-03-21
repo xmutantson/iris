@@ -88,6 +88,7 @@ public:
     // the actual transport and must actively poll on timeout.
     void set_native_active(bool v) { native_active_ = v; if (v) lower_t1_for_native(); }
     void set_t1_floor_for_airtime(float airtime_s);  // Raise T1 floor for long native frames
+    void set_max_info(int n);  // Limit I-frame info field for OFDM capacity
     void set_kiss_passthrough(bool v) { kiss_passthrough_ = v; }
     bool is_kiss_passthrough() const { return kiss_passthrough_; }
     int retry_count() const { return retry_count_; }
@@ -149,6 +150,7 @@ private:
     static constexpr int T2_TICKS = 6;      // 0.3s response delay timer
     static constexpr int T3_TICKS = 6000;   // 300s idle supervision (Direwolf default: 5 min)
     static constexpr int MAX_INFO = 1024;   // Max I-frame info field bytes (N1)
+    int max_info_ = MAX_INFO;               // Dynamic limit (OFDM capacity)
 
     Ax25SessionState state_ = Ax25SessionState::DISCONNECTED;
     std::string local_call_;

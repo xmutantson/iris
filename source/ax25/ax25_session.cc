@@ -151,10 +151,10 @@ void Ax25Session::send_data(const uint8_t* data, size_t len) {
         state_ != Ax25SessionState::TIMER_RECOVERY)
         return;
 
-    // Fragment into MAX_INFO chunks
+    // Fragment into max_info_ chunks (limited by OFDM LDPC capacity)
     size_t offset = 0;
     while (offset < len) {
-        size_t chunk = std::min((size_t)MAX_INFO, len - offset);
+        size_t chunk = std::min((size_t)max_info_, len - offset);
         tx_queue_.push(std::vector<uint8_t>(data + offset, data + offset + chunk));
         offset += chunk;
     }
@@ -1304,6 +1304,11 @@ void Ax25Session::set_t1_floor_for_airtime(float airtime_s) {
     t1_floor_ = floor_ticks;
     if (t1_value_ < t1_floor_)
         t1_value_ = t1_floor_;
+}
+
+void Ax25Session::set_max_info(int n) {
+    max_info_ = std::clamp(n, 16, MAX_INFO);
+    IRIS_LOG("AX25 MAX_INFO set to %d bytes", max_info_);
 }
 
 // ---------------------------------------------------------------------------
