@@ -442,22 +442,72 @@ OfdmDemodResult OfdmDemodulator::demodulate(
     float sfo_cumulative_weight = 0.0f;   // sum of symbol indices (for weighted slope)
     int total_symbols_elapsed = 0;        // total symbols since training (incl. header)
 
-    // CPE: Per-symbol weighted-average common phase error correction.
-    // No PLL, no frequency state between symbols. This is the standard
-    // approach used by 802.11, DVB-T2, 5G NR, and FreeDV 700D/E.
-    // A 2nd-order PLL (previously alpha=0.6, beta=0.15) creates a positive
-    // feedback loop: PLL noise becomes pre-DFT phase shift that the next
-    // symbol's pilots interpret as real drift, adding ~15-20 dB phantom noise.
-    // Per-symbol averaging eliminates this feedback entirely.
-    float cpe_phase = 0.0f;   // per-symbol CPE (reset each symbol, no memory)
-    std::vector<float> cpe_history;  // per-symbol CPE values for slope estimation
+    // CPE: 2nd-order post-FFT phase tracker (PLL).
+    // Stage 1: Predict phase from running estimate, pre-correct carriers.
+    //   Removes bulk of drift so comb pilots measure only a small residual.
+    // Stage 2: Comb-pilot CPE measures residual. DD-CPE refines further.
+    // Stage 3: Update tracker with total measured phase (prediction + residuals).
+    // Operates post-FFT on frequency-domain carriers. Previous pre-DFT PLL
+    // (alpha=0.6, beta=0.15) caused +15 dB phantom noise because PLL error
+    // fed back through the FFT. Post-FFT application avoids this.
+    float cpe_phase = 0.0f;   // per-symbol residual CPE from comb pilots
+    float cpe_total = 0.0f;   // total phase correction (prediction + residual + DD)
+    std::vector<float> cpe_history;  // per-symbol TOTAL phase for slope estimation
     cpe_history.reserve(n_data_symbols);
+    // Phase tracker state (2nd-order: phase + frequency)
+    float phase_pred = 0.0f;  // predicted phase for next symbol (rad)
+    float freq_pred = 0.0f;   // phase rate estimate (rad/symbol)
+    float last_total = 0.0f;  // total phase from previous symbol
 
     // Pre-allocate reusable buffers for the hot loop (avoid per-symbol heap allocs)
     std::vector<std::complex<float>> fft_buf(nfft);          // Issue 2+3: shared FFT buffer
     std::vector<std::complex<float>> used_carriers_buf(n_used);
     std::vector<std::complex<float>> data_carriers_buf(n_data);
     std::vector<std::complex<float>> eq_carriers_buf(n_data);
+
+    // ---- 8a. Preamble-to-data phase calibration ----
+    // FM radios introduce a phase discontinuity between the ZC preamble and
+    // OFDM data symbols (different spectral content → different group delay,
+    // limiter transient, discriminator settling). The magnitude varies by radio:
+    // FT-510 data port ~10°, IC-705 mic/speaker ~130°, Baofeng unknown.
+    // Fix: FFT the first data symbol, use ALL carriers (pilots + data, BPSK
+    // hard-slice) to estimate the phase offset, and rotate H to compensate.
+    // This makes the channel estimate's phase valid for data symbols, not just
+    // for the preamble that created it. Universal — works on any radio.
+    if (pos + sym_len <= remaining) {
+        const std::complex<float>* first_sym = iq_corrected.data() + pos + cp;
+        std::copy(first_sym, first_sym + nfft, fft_buf.data());
+        fft_complex(fft_buf.data(), nfft);
+
+        // Extract used carriers and equalize with current H
+        for (int i = 0; i < n_used; i++)
+            used_carriers_buf[i] = fft_buf[config_.used_carrier_bins[i]];
+
+        // Weighted phase estimate using ALL used carriers as BPSK references.
+        // After MMSE equalization, each carrier should be near ±1. The phase
+        // error is: angle(eq * conj(nearest_BPSK)). For BPSK, nearest is
+        // sign(real(eq)), so ref = sign(real(eq/H)) * |H|.
+        float cal_num = 0.0f, cal_den = 0.0f;
+        for (int i = 0; i < n_used; i++) {
+            std::complex<float> H = channel_est_.H[i];
+            float H_mag2 = std::norm(H);
+            if (H_mag2 < 1e-12f) continue;
+            // Phase difference between received and expected (via H)
+            float phase = std::arg(used_carriers_buf[i] * std::conj(H));
+            cal_num += H_mag2 * phase;
+            cal_den += H_mag2;
+        }
+        if (cal_den > 0.0f) {
+            float cal_phase = cal_num / cal_den;
+            // Rotate channel estimate to align with data symbols
+            std::complex<float> cal_rot(std::cos(cal_phase), std::sin(cal_phase));
+            for (auto& h : channel_est_.H)
+                h *= cal_rot;
+            IRIS_LOG("[OFDM-RX] preamble-data phase cal: %.1f deg (applied to H)",
+                     cal_phase * 180.0f / (float)M_PI);
+        }
+        // Don't advance pos — first data symbol will be processed normally below.
+    }
 
     for (int s = 0; s < n_data_symbols; s++) {
         // Check for block pilot: every pilot_symbol_spacing data symbols
@@ -630,10 +680,19 @@ OfdmDemodResult OfdmDemodulator::demodulate(
             }
         }
 
-        // Per-symbol CPE: weighted-average phase of comb pilots (no PLL).
-        // Standard approach: 802.11, DVB-T2, 5G NR, FreeDV 700D/E.
-        // Each symbol gets an independent CPE estimate — no frequency state
-        // carried between symbols. Eliminates PLL feedback instability.
+        // PLL phase prediction: pre-correct using running estimate before pilots
+        // measure the residual. Prediction is extrapolated from previous symbols'
+        // total corrections. Pilots see a small residual (~5° vs ~100° uncorrected).
+        float sym_prediction = 0.0f;
+        if (data_sym_count > 0) {
+            sym_prediction = phase_pred;
+            std::complex<float> pred_rot(std::cos(-sym_prediction), std::sin(-sym_prediction));
+            for (int i = 0; i < n_used; i++)
+                used_carriers_buf[i] *= pred_rot;
+        }
+
+        // Per-symbol CPE: weighted-average phase of comb pilots.
+        // Measures residual phase after PLL prediction pre-correction.
         {
             float cpe_num = 0.0f;
             float cpe_den = 0.0f;
@@ -647,17 +706,19 @@ OfdmDemodResult OfdmDemodulator::demodulate(
                 cpe_den += H_mag2;
             }
             if (cpe_den > 0.0f) {
-                cpe_phase = cpe_num / cpe_den;  // independent per-symbol estimate
-                cpe_history.push_back(cpe_phase);
+                cpe_phase = cpe_num / cpe_den;  // independent per-symbol residual
 
-                // Apply CPE correction to all used carriers
+                // Apply residual CPE correction to all used carriers
                 std::complex<float> cpe_rot(std::cos(-cpe_phase), std::sin(-cpe_phase));
                 for (int i = 0; i < n_used; i++) {
                     used_carriers_buf[i] *= cpe_rot;
                 }
                 if (data_sym_count % 20 == 0 || std::abs(cpe_phase) > 0.1f) {
-                    IRIS_LOG("[OFDM-RX] CPE sym %d: %.2f deg",
-                             data_sym_count, cpe_phase * 180.0f / (float)M_PI);
+                    IRIS_LOG("[OFDM-RX] CPE sym %d: pred=%.1f resid=%.1f total=%.1f deg",
+                             data_sym_count,
+                             sym_prediction * 180.0f / (float)M_PI,
+                             cpe_phase * 180.0f / (float)M_PI,
+                             (sym_prediction + cpe_phase) * 180.0f / (float)M_PI);
                 }
             }
         }
@@ -688,12 +749,16 @@ OfdmDemodResult OfdmDemodulator::demodulate(
         // that bias the phase estimate. At 64QAM's 13.3° decision boundary,
         // even 2-3° systematic error is destructive. 5 comb pilots provide
         // adequate CPE for 64QAM via the per-symbol correction above.
+        float dd_correction_applied = 0.0f;
         {
             int max_bpc = 1;
             for (int k = 0; k < active_tone_map.n_data_carriers; k++)
                 if (active_tone_map.bits_per_carrier[k] > max_bpc)
                     max_bpc = active_tone_map.bits_per_carrier[k];
-            bool dd_cpe_enabled = (max_bpc < 6) && !config_.dft_spread;  // disable for 64QAM+ and DFT-spread
+            // DD-CPE after DFT-despread: IDFT recovers time-domain symbols in
+            // original constellation domain. BPSK/QPSK hard-slicing is trivially
+            // correct post-IDFT. Only disable for 64QAM+ (FM limiter compression).
+            bool dd_cpe_enabled = (max_bpc < 6);
           if (dd_cpe_enabled) {
             // FEC rate for NUC table lookup
             auto fec_r16 = [&]() -> int {
@@ -775,6 +840,7 @@ OfdmDemodResult OfdmDemodulator::demodulate(
                 std::complex<float> dd_rot(std::cos(-dd_correction), std::sin(-dd_correction));
                 for (int i = 0; i < n_data_actual; i++)
                     eq_carriers_buf[i] *= dd_rot;
+                dd_correction_applied = dd_correction;
 
                 if (data_sym_count % 20 == 0 || std::abs(dd_correction) > 0.03f) {
                     IRIS_LOG("[OFDM-RX] DD-CPE sym %d: %.2f deg (%d carriers)",
@@ -782,6 +848,27 @@ OfdmDemodResult OfdmDemodulator::demodulate(
                 }
             }
           } // dd_cpe_enabled
+        }
+
+        // Phase tracker update: accumulate total phase and update frequency estimate.
+        // Total phase = prediction + pilot residual + DD refinement.
+        {
+            cpe_total = sym_prediction + cpe_phase + dd_correction_applied;
+            cpe_history.push_back(cpe_total);
+
+            if (data_sym_count > 0) {
+                // Update frequency estimate: IIR blend of current slope measurement
+                // with running estimate. Low beta (0.1) prevents noise amplification
+                // while still tracking ~1 Hz CFO drift over ~80 symbols.
+                float measured_slope = cpe_total - last_total;
+                // Unwrap: if slope jumps >pi, it wrapped around
+                while (measured_slope > (float)M_PI) measured_slope -= 2.0f * (float)M_PI;
+                while (measured_slope < -(float)M_PI) measured_slope += 2.0f * (float)M_PI;
+                freq_pred = 0.9f * freq_pred + 0.1f * measured_slope;
+            }
+            last_total = cpe_total;
+            // Predict next symbol's phase
+            phase_pred = cpe_total + freq_pred;
         }
 
         // Store equalized constellation for GUI scatter plot

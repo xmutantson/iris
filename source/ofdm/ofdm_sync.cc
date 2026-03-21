@@ -241,8 +241,8 @@ OfdmSyncResult ofdm_detect_frame(const std::complex<float>* iq, int n_samples,
     // -----------------------------------------------------------------------
     // SC has a plateau of width cp (due to cyclic prefix periodicity).
     // ZC xcorr has a sharp peak at the exact body start.
-    // We use ZC to refine timing but NOT for detection thresholding.
-    float best_zc_metric = 0.0f;
+    // Time-domain ZC is used ONLY for timing refinement, not detection gating.
+    float best_zc_td = 0.0f;
     {
         int best_zc_d = peak_d;
 
@@ -259,53 +259,48 @@ OfdmSyncResult ofdm_detect_frame(const std::complex<float>* iq, int n_samples,
             }
             float denom = se * zc_energy;
             float m = (denom > 1e-20f) ? std::sqrt(std::norm(xc) / denom) : 0.0f;
-            if (m > best_zc_metric) {
-                best_zc_metric = m;
+            if (m > best_zc_td) {
+                best_zc_td = m;
                 best_zc_d = d;
             }
         }
 
         // Use ZC-refined timing if it found a reasonable peak
-        if (best_zc_metric > 0.1f) {
+        if (best_zc_td > 0.1f) {
             peak_d = best_zc_d;
-            IRIS_LOG("[OFDM-SYNC] ZC timing refine: d=%d (ZC=%.3f, SC=%.3f)",
-                     peak_d, best_zc_metric, peak_metric);
-        }
-
-        // ZC quality gate: SC can false-trigger on repetitive non-OFDM structure.
-        // ZC metric degrades with carrier count (channel distortion across wider BW)
-        // AND with FM channel impairments (pre-emphasis, deviation limiting).
-        // OTA observations (30 carriers, 2.8 kHz):
-        //   Legitimate frames: ZC 0.35-0.79, noise/false: ZC < 0.15
-        //   Loopback: ZC ≥ 0.47, but FM channel degrades by ~10 dB
-        // Reduced from 0.55 - 0.005*N to 0.45 - 0.005*N for OTA margin.
-        // Threshold at 30 carriers: 0.375 (was 0.475).
-        const int n_used = config.n_used_carriers;
-        const float zc_threshold = std::max(0.20f, 0.45f - 0.005f * std::max(0, n_used - 15));
-        if (best_zc_metric < zc_threshold) {
-            IRIS_LOG("[OFDM-SYNC] SC passed (%.3f) but ZC too low (%.3f < %.2f, n_used=%d) — false positive rejected",
-                     peak_metric, best_zc_metric, zc_threshold, n_used);
-            return result;
+            IRIS_LOG("[OFDM-SYNC] ZC timing refine: d=%d (ZC_td=%.3f, SC=%.3f)",
+                     peak_d, best_zc_td, peak_metric);
         }
     }
 
-    // Tentatively detected — compute CFO before final validation
+    // -----------------------------------------------------------------------
+    // Phase 4: Frequency-domain ZC verification + CFO estimation
+    // -----------------------------------------------------------------------
+    // Time-domain ZC cross-correlation has a fundamental flaw on FM channels:
+    // the reference zc_td[] has TX de-emphasis gains baked in (g drops from
+    // 0.62 at 375 Hz to 0.10 at 3000 Hz).  On flat 9600-baud ports (no RX
+    // de-emphasis), the received ZC is ~flat → spectral mismatch gives a
+    // theoretical Pearson ceiling of only ~0.86.  FM deviation limiter
+    // nonlinearity degrades it further to 0.13-0.35 OTA.
+    //
+    // Frequency-domain ZC correlation fixes this:
+    //   1. Uses the RAW ZC sequence (no de-emphasis) — |ZC[k]|=1 for all k
+    //   2. Correlates only at carrier bins — FM intermod on other bins ignored
+    //   3. Cauchy-Schwarz normalization handles any spectral tilt
+    //   4. Phase relationships survive FM better than time-domain waveform shape
+    //
+    // This metric is independent of whether the RX port has de-emphasis or not.
+    float best_zc_metric = 0.0f;
+
     result.frame_start = peak_d;
     result.schmidl_metric = peak_metric;
 
-    // -----------------------------------------------------------------------
-    // CFO estimation: frequency-domain correlation between train1 and train2.
-    // Time-domain correlation CANNOT estimate CFO for real-valued signals:
-    //   sum(real1[n] * real2[n]) is always real → arg() is always 0.
-    // Frequency-domain: Y2[k]*conj(Y1[k]) = |H[k]|²*|ZC[k]|² * exp(j*φ_cfo)
-    //   → arg gives the CFO phase rotation over one symbol period.
-    // -----------------------------------------------------------------------
     {
         int train1_body = peak_d + cp;
         int train2_body = peak_d + symbol_len + cp;
 
         if (train2_body + nfft <= n_samples) {
-            // FFT both training symbols
+            // FFT both training symbols (reused for CFO estimation below)
             static std::vector<std::complex<float>> Y1_buf, Y2_buf;
             if ((int)Y1_buf.size() != nfft) {
                 Y1_buf.resize(nfft);
@@ -316,19 +311,58 @@ OfdmSyncResult ofdm_detect_frame(const std::complex<float>* iq, int n_samples,
             fft_complex(Y1_buf.data(), nfft);
             fft_complex(Y2_buf.data(), nfft);
 
-            // Correlate at used carrier bins (where signal energy exists)
+            // --- Frequency-domain ZC quality metric ---
+            // Correlate received spectrum with RAW ZC sequence (no de-emphasis).
+            // Average Y1 and Y2 for better SNR (both are the same ZC, just
+            // phase-rotated by CFO — averaging their magnitudes is safe for
+            // a quality metric since we only need |correlation|).
+            static std::vector<std::complex<float>> zc_freq_cache;
+            static int cached_zc_n_used = 0;
+            const int n_used = config.n_used_carriers;
+            if (cached_zc_n_used != n_used) {
+                zc_freq_cache = generate_zc_sequence(7, n_used);
+                cached_zc_n_used = n_used;
+            }
+
+            std::complex<float> fd_corr(0.0f, 0.0f);
+            float y_energy = 0.0f;
+            for (int i = 0; i < n_used; ++i) {
+                int bin = config.used_carrier_bins[i];
+                // Use Y1 for the FD-ZC metric (Y2 has CFO phase rotation)
+                fd_corr += Y1_buf[bin] * std::conj(zc_freq_cache[i]);
+                y_energy += std::norm(Y1_buf[bin]);
+            }
+            float zc_ref_energy = (float)n_used;  // |ZC[k]|=1 for all k
+            float fd_denom = y_energy * zc_ref_energy;
+            best_zc_metric = (fd_denom > 1e-20f)
+                ? std::sqrt(std::norm(fd_corr) / fd_denom) : 0.0f;
+
+            // --- ZC quality gate ---
+            // FD-ZC metric is robust to spectral tilt and FM nonlinearity.
+            // OTA measurements (IC-705/FT-510): genuine frames FD-ZC ≥ 0.45,
+            // FM noise false triggers FD-ZC 0.20-0.37.  Threshold 0.40 eliminates
+            // all observed false triggers while preserving all genuine frames.
+            const float fd_zc_threshold = 0.40f;
+            if (best_zc_metric < fd_zc_threshold) {
+                IRIS_LOG("[OFDM-SYNC] SC passed (%.3f) but FD-ZC too low (%.3f < %.2f, td=%.3f, n_used=%d) — rejected",
+                         peak_metric, best_zc_metric, fd_zc_threshold, best_zc_td, n_used);
+                return result;
+            }
+
+            // --- CFO estimation ---
+            // Y2[k]*conj(Y1[k]) = |H[k]|²*|ZC[k]|² * exp(j*φ_cfo)
+            // arg gives the CFO phase rotation over one symbol period.
             std::complex<float> cfo_corr(0.0f, 0.0f);
             for (int i = 0; i < (int)config.used_carrier_bins.size(); ++i) {
                 int bin = config.used_carrier_bins[i];
                 cfo_corr += Y2_buf[bin] * std::conj(Y1_buf[bin]);
             }
             float cfo_phase = std::arg(cfo_corr);
-            // Phase accumulates over one symbol period (nfft + cp samples)
             result.cfo_hz = cfo_phase / (2.0f * (float)M_PI)
                           * ((float)config.sample_rate / symbol_len);
 
-            IRIS_LOG("[OFDM-SYNC] freq-domain CFO: phase=%.4f rad -> %.2f Hz (|corr|=%.1f)",
-                     cfo_phase, result.cfo_hz, std::abs(cfo_corr));
+            IRIS_LOG("[OFDM-SYNC] FD-ZC=%.3f (td=%.3f) CFO: phase=%.4f rad -> %.2f Hz (|corr|=%.1f)",
+                     best_zc_metric, best_zc_td, cfo_phase, result.cfo_hz, std::abs(cfo_corr));
         } else {
             IRIS_LOG("[OFDM-SYNC] cannot estimate CFO: train2 out of bounds");
             result.cfo_hz = 0.0f;
@@ -346,11 +380,11 @@ OfdmSyncResult ofdm_detect_frame(const std::complex<float>* iq, int n_samples,
         result.snr_est = 10.0f * std::log10(std::max(snr_linear, 1e-10f));
     }
 
-    IRIS_LOG("[OFDM-SYNC] ZC detect: metric=%.4f at sample %d, CFO=%.1f Hz, SNR~%.1f dB",
-             peak_metric, peak_d, result.cfo_hz, result.snr_est);
+    IRIS_LOG("[OFDM-SYNC] detect: SC=%.3f FD-ZC=%.3f at sample %d, CFO=%.1f Hz, SNR~%.1f dB",
+             peak_metric, best_zc_metric, peak_d, result.cfo_hz, result.snr_est);
 
     // CFO sanity check: real FM signals have < 2 Hz CFO (crystal offsets are small).
-    // False ZC triggers produce wildly wrong CFO (10-50 Hz) because the
+    // False triggers produce wildly wrong CFO (10-50 Hz) because the
     // "training symbols" are noise — their cross-correlation phase is random.
     // Reject these to avoid wasting demod time and corrupting Chase combining.
     constexpr float CFO_MAX_HZ = 10.0f;

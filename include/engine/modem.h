@@ -275,6 +275,23 @@ private:
     int ofdm_txdelay_ms_ = 0;                           // Adaptive OFDM TXDELAY (0 = use config default)
     std::vector<std::complex<float>> ofdm_rx_iq_;       // OFDM RX working buffer (complex)
     std::vector<float> ofdm_rx_audio_buf_;              // OFDM RX raw audio buffer (bypass downconverter)
+
+    // 2nd-order Butterworth LPF on OFDM RX path — removes f² discriminator noise
+    // from flat 9600-baud radio ports (raw discriminator output, no de-emphasis).
+    // LPF only (no HPF): HPF group delay at lowest carriers exceeds CP.
+    struct BiquadDF2 {
+        float b0=1,b1=0,b2=0,a1=0,a2=0,z1=0,z2=0;
+        float process(float x) {
+            float w = x - a1*z1 - a2*z2;
+            float y = b0*w + b1*z1 + b2*z2;
+            z2 = z1; z1 = w;
+            return y;
+        }
+        void reset() { z1 = z2 = 0; }
+    };
+    BiquadDF2 ofdm_rx_lpf_;
+    bool ofdm_rx_lpf_active_ = false;                  // Set after probe configures cutoff
+
     std::vector<float> ofdm_chase_llrs_;                // Stored LLRs for OFDM Chase combining
     int ofdm_chase_combines_ = 0;                       // Chase combine counter
     OfdmSyncResult ofdm_pending_sync_;                   // Cached sync for "frame incomplete" retry
@@ -465,26 +482,39 @@ private:
     int tune_test_frames_target_ = 3;    // Send 3 test frames for averaging
     int tune_frames_measured_ = 0;       // Peer test frames we've measured gain from
     int tune_wait_peer_ticks_ = 0;       // Ticks spent in WAIT_PEER (for timeout transition)
-    int tune_report_resend_cd_ = 0;      // Countdown to resend TUNE:GAIN in WAIT_REPORT
+    int tune_last_measured_count_ = 0;   // For silence detection: last known frames_measured_
+    int tune_silence_ticks_ = 0;         // Ticks since last new measurement
+    int tune_report_resend_cd_ = 0;      // Countdown to resend TUNE report in WAIT_REPORT
+    int tune_report_resends_ = 0;        // Number of report retransmissions (max 2)
 
-    // OFDM power-ramp TUNE: send 3 frames at geometrically-spaced TX levels,
-    // peer measures LDPC quality for each, reports all 3 data points.
+    // OFDM power-ramp TUNE: send 10 frames at geometrically-spaced TX levels.
+    // Peer measures channel estimate H from preamble (even on LDPC failure)
+    // and LDPC iters when decode succeeds. Reports all data points.
     // Sender fits a parabola in dB space to find the optimal drive level.
     //
-    // Ramp scales: [4.0, 1.0, 0.125] → 30 dB range, covers full [0.05, 1.0].
-    // Quality vs tx_dB is U-shaped (parabolic): too quiet = poor SNR,
-    // too loud = FM deviation limiter clipping. Minimum = optimal.
-    static constexpr int TUNE_RAMP_LEVELS = 3;
-    static constexpr float TUNE_RAMP_SCALES[TUNE_RAMP_LEVELS] = {4.0f, 1.0f, 0.125f};
-    float tune_ramp_tx_levels_[TUNE_RAMP_LEVELS] = {};  // actual tx_level per ramp frame
+    // 10 levels spanning the usable range from max to min hardware output.
+    // Scales computed dynamically at TUNE start based on current tx_base to
+    // guarantee all 10 frames use distinct power levels (no clamping waste).
+    // Quality vs tx_dB is U-shaped: too quiet = noise, too loud = FM clipping.
+    static constexpr int TUNE_RAMP_COUNT = 10;
+    static constexpr float TUNE_SCALE_MIN = 0.05f;  // minimum absolute tx_level
+    static constexpr float TUNE_SCALE_MAX = 1.0f;   // maximum absolute tx_level
+    float tune_computed_scales_[TUNE_RAMP_COUNT] = {};  // computed per-session
+    void tune_compute_scales(float base);  // populate tune_computed_scales_
+    float tune_ramp_tx_levels_[TUNE_RAMP_COUNT] = {};  // actual tx_level per ramp frame
     // Peer's report: iters and H for each of our ramp frames
-    int tune_peer_iters_[TUNE_RAMP_LEVELS] = {-1, -1, -1};
-    float tune_peer_H_[TUNE_RAMP_LEVELS] = {};
+    int tune_peer_iters_[TUNE_RAMP_COUNT] = {};
+    float tune_peer_H_[TUNE_RAMP_COUNT] = {};
+    float tune_peer_snr_[TUNE_RAMP_COUNT] = {};   // peer's reported SNR (dB)
     // RX side: track quality of each received ramp frame from peer
-    int tune_rx_frame_iters_[TUNE_RAMP_LEVELS] = {-1, -1, -1};
-    float tune_rx_frame_H_[TUNE_RAMP_LEVELS] = {};
+    // H is recorded from preamble on every detection (even LDPC failure).
+    // iters = -1 means not decoded, -2 means preamble-only (H valid, no LDPC).
+    int tune_rx_frame_iters_[TUNE_RAMP_COUNT] = {};
+    float tune_rx_frame_H_[TUNE_RAMP_COUNT] = {};
+    float tune_rx_frame_snr_[TUNE_RAMP_COUNT] = {};  // SC-metric SNR (dB) per frame
     // Compute optimal tx_level from parabolic fit of (tx_dB, iters) data
     float tune_parabolic_fit() const;
+    std::string tune_build_ramp_report() const;  // builds RAMP3 or RAMP7 payload
 
     // Per-O-level TX drive offset (dB below O0 baseline).
     // Higher modulations have tighter constellations → more sensitive to FM

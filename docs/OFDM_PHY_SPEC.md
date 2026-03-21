@@ -1,7 +1,6 @@
 # IRIS OFDM PHY Specification
 
-**Status:** Implementation spec — agents update this document as they build.
-**Last updated by:** (initial spec)
+**Revision 2** -- updated to match implementation as of 2026-03-20.
 
 ---
 
@@ -16,13 +15,12 @@ per-subcarrier adaptive bit loading (waterfilling) and near-Shannon LDPC FEC.
 1. **Probe-adaptive:** Bandwidth, carrier count, and per-carrier modulation all derive
    from the passband probe. Works on any radio from 2 kHz mic/speaker to 6+ kHz data port.
 2. **Waterfilling:** Per-subcarrier bit loading based on measured channel SNR.
-   Not fixed constellation per speed level — continuous adaptation.
 3. **Reuse existing infrastructure:** LDPC codec, ARQ/HARQ, probe system, audio I/O,
    upconverter/downconverter, AGW/KISS interfaces.
-4. **Coexist with single-carrier:** CAP_OFDM capability flag. Either side can disable OFDM
-   and fall back to A-levels. Configurable via INI/GUI toggle `OfdmEnable`.
-5. **Extensive logging:** Every stage logs tagged `[OFDM-xxx]` for debug. Can be compiled
-   out later with `IRIS_LOG` macro.
+4. **Coexist with single-carrier:** `CAP_OFDM` capability flag. Either side can disable
+   OFDM and fall back to A-levels. Configurable via INI/GUI toggle `OfdmEnable`.
+5. **DFT-spread OFDM (SC-FDMA):** Low PAPR critical for FM deviation limiters.
+6. **Headerless frames:** Config pre-negotiated via tone map exchange (Mercury approach).
 
 ---
 
@@ -30,28 +28,25 @@ per-subcarrier adaptive bit loading (waterfilling) and near-Shannon LDPC FEC.
 
 ### 2.1 FFT Size and Subcarrier Spacing
 
-Sample rate: 48000 Hz (fixed, `SAMPLE_RATE` in types.h).
+Sample rate: 48000 Hz (fixed, `SAMPLE_RATE` in `types.h`).
 
 | NFFT | Subcarrier Spacing | Symbol Duration | Use Case |
 |------|-------------------|-----------------|----------|
 | 256  | 187.50 Hz | 5.33 ms | Noisy/drifty radios, fallback |
-| 512  | 93.75 Hz  | 10.67 ms | **Default** — good balance |
+| 512  | 93.75 Hz  | 10.67 ms | **Default** -- good balance |
 | 1024 | 46.875 Hz | 21.33 ms | Wide BW (>4 kHz), more carriers |
 
 **Default: NFFT=512, spacing=93.75 Hz.**
 
-Rationale: 93.75 Hz is wide enough for FM phase noise tolerance (ICI floor ~-45 dB,
-supports up to 64QAM reliably), narrow enough for meaningful waterfilling (21+ carriers
-in 2 kHz, 64+ in 6 kHz). Power-of-2 FFT for efficiency.
-
 ### 2.2 Cyclic Prefix
 
-Default: `CP_SAMPLES = 64` at 48 kHz = **1.33 ms**.
+```
+cp_samples = 32    (at 48 kHz = 0.67 ms)
+```
 
-This exceeds FM audio channel impulse response (<1 ms group delay variation from
-ceramic IF filters). Overhead: 64/512 = 12.5%.
+FM audio channel delay spread < 0.5 ms. Overhead: 32/512 = 6.25%.
 
-Total OFDM symbol: 512 + 64 = 576 samples = 12.0 ms.
+Total OFDM symbol: 512 + 32 = 544 samples = 11.33 ms.
 
 ### 2.3 Carrier Allocation
 
@@ -60,45 +55,36 @@ Given probed bandwidth `BW_hz` and center frequency `center_hz`:
 ```
 n_total = floor(BW_hz / subcarrier_spacing)
 n_guard = 2                    // 1 guard each edge
-n_dc = 0                      // no DC carrier (we're at audio passband, not baseband)
+n_dc = 0                      // no DC carrier (audio passband, not baseband)
 n_used = n_total - n_guard
-n_pilot = ceil(n_used / 4)    // every 4th used carrier is a pilot
+n_pilot = ceil(n_used / pilot_carrier_spacing)
 n_data = n_used - n_pilot
 ```
 
-At NFFT=512, 2 kHz BW: `n_used=19, n_pilot=5, n_data=14`.
-At NFFT=512, 3 kHz BW: `n_used=30, n_pilot=8, n_data=22`.
-At NFFT=512, 6 kHz BW: `n_used=62, n_pilot=16, n_data=46`.
+At NFFT=512, 2 kHz BW: `n_used=19, n_pilot=4, n_data=15`.
 
 Carrier index mapping: carriers placed symmetrically around `center_hz / spacing`
-in the FFT bin array. Unused bins set to zero.
+in the FFT bin array. Unused bins set to zero. Hermitian symmetry enforced for
+real-valued IFFT output (audio is real).
 
 ### 2.4 Pilot Pattern
 
-**Frequency domain:** Every 4th used subcarrier is a pilot (comb pattern).
-Pilot values: +1 (BPSK, known).
+Three-dimensional pilot grid:
 
-**Time domain:** Every 8th OFDM data symbol is an all-pilot symbol (block pilot).
-This gives a 2D pilot grid for channel interpolation:
-- Frequency: pilot every 4 carriers × 93.75 Hz = 375 Hz resolution
-- Time: pilot every 8 symbols × 12 ms = 96 ms resolution
+| Dimension | Parameter | Value | Description |
+|-----------|-----------|-------|-------------|
+| Frequency | `pilot_carrier_spacing` | 6 | Every 6th used carrier is a comb pilot |
+| Time (block) | `pilot_symbol_spacing` | 24 | Every 24th OFDM symbol is all-pilot |
+| Time (dense) | `pilot_row_spacing` | 5 | Every 5th data symbol is a dense pilot row |
 
-**Pilot overhead:** ~25% frequency + ~12.5% time ≈ 34% total. This is high; can be
-optimized later by reducing to every-6th or every-8th carrier once channel estimation
-is validated.
+**Comb pilots:** Every 6th used subcarrier carries a known +1 reference (scaled by
+de-emphasis gain). Used for per-symbol CPE correction and frequency interpolation.
 
-### 2.5 Subcarrier Spacing Auto-Training (Optional)
+**Block pilot symbols:** All carriers = known reference. Channel tracking IIR update
+(alpha=0.3).
 
-After tone probe, if `AutoTrainSpacing` config is enabled:
-1. TX sends 4 OFDM training symbols at NFFT=256
-2. TX sends 4 OFDM training symbols at NFFT=512
-3. TX sends 4 OFDM training symbols at NFFT=1024
-4. RX measures per-subcarrier SNR for each NFFT, computes:
-   `capacity_nfft = sum_k[ log2(1 + SNR_k) ]` for each NFFT
-5. Both sides select NFFT that maximizes capacity
-6. If capacities within 5%, prefer smaller NFFT (more robust)
-
-Default: disabled. Fixed NFFT=512. Can be enabled in INI/GUI.
+**Dense pilot rows:** Every 5th data symbol, all carriers carry known reference values.
+Third pilot dimension beyond comb and block pilots.
 
 ---
 
@@ -107,57 +93,45 @@ Default: disabled. Fixed NFFT=512. Can be enabled in INI/GUI.
 ### 3.1 OFDM Frame Layout
 
 ```
-[Training: 2 OFDM symbols] [Header: 1 OFDM symbol] [Data: N OFDM symbols] [Tail: 1]
+[Preamble: 2 ZC symbols] [Data: N OFDM symbols] [Tail: 1]
 ```
 
-**Training Symbol 1 (Schmidl-Cox):**
-- First half and second half are identical in time domain.
-- Only even-indexed subcarriers carry known BPSK; odd subcarriers are zero.
-- Used for: coarse timing sync (correlation of first half with second half),
-  coarse frequency offset estimation (phase diff between halves).
+No per-frame header. Config (tone map, FEC rate, modulation) is pre-negotiated via
+tone map exchange before data transfer begins (Mercury approach).
 
-**Training Symbol 2 (Channel Estimation):**
-- All used subcarriers carry known BPSK (+1).
-- Used for: fine timing, fine frequency offset, full channel estimate H[k] at every subcarrier.
-- Per-subcarrier SNR estimated from deviation of received pilot from expected.
-
-**Header Symbol:**
-- All data subcarriers carry BPSK (robust).
-- Content (bit-packed, MSB first):
-  - [4 bits] tone_map_id (0=uniform, 1-15=waterfill table index)
-  - [4 bits] FEC rate (same encoding as native header)
-  - [12 bits] payload_len (bytes, max 4095)
-  - [4 bits] NFFT mode (0=512, 1=256, 2=1024)
-  - [1 bit] HARQ flag
-  - [3 bits] reserved
-  - [8 bits] CRC-8
-  Total: 36 bits. With 14 data carriers at BPSK = 14 bits/symbol → 3 OFDM symbols for header.
-  **Revised: header = 3 OFDM symbols, all BPSK.**
+**Training Symbols 1 & 2 (Zadoff-Chu):**
+- Two identical ZC sequences (root=7, length = n_used_carriers).
+- ZC placed into used carrier FFT bins with Hermitian symmetry for real-valued output.
+- Scaled by NFFT to match data symbol amplitude, plus PREAMBLE_BOOST for detection margin.
+- Detection: hybrid Schmidl-Cox autocorrelation (between identical ZC symbols) for
+  coarse detection, then ZC cross-correlation for fine timing refinement.
+- Channel estimation: divide received ZC by known ZC frequency-domain sequence.
+- CFO: phase rotation between the two identical training symbols.
 
 **Data Symbols:**
 - Per-subcarrier modulation defined by tone map.
-- Every 8th data symbol is all-pilot (refresh channel estimate).
-- Data interleaved across subcarriers and OFDM symbols (frequency-time interleaver).
+- Dense pilot rows every `pilot_row_spacing` data symbols.
+- Block pilot symbols every `pilot_symbol_spacing` OFDM symbols.
+- Multi-codeword: `n_codewords > 1` per frame reduces preamble overhead.
 
 **Tail Symbol:**
-- All subcarriers carry known +1 BPSK.
-- Anchors backward channel estimation interpolation.
-- Also serves as frame-end marker.
+- All subcarriers carry known +1 reference.
+- Anchors backward channel interpolation and frame-end marker.
 
 ### 3.2 Frame Timing
 
-At NFFT=512, CP=64, 2 kHz BW (14 data carriers):
+At NFFT=512, CP=32, 2 kHz BW (15 data carriers), 1 codeword:
 
 | Component | OFDM Symbols | Duration |
 |-----------|-------------|----------|
-| Training  | 2 | 24.0 ms |
-| Header    | 3 | 36.0 ms |
-| Data (1 LDPC block, QPSK r1/2) | ~58 | 696 ms |
-| Block pilots (every 8th) | ~7 | 84 ms |
-| Tail      | 1 | 12.0 ms |
-| **Total** | **~71** | **~852 ms** |
+| Preamble (2x ZC) | 2 | 22.7 ms |
+| Data (1 LDPC block, QPSK r1/2) | ~54 | 612 ms |
+| Dense pilot rows (every 5th) | ~10 | 113 ms |
+| Tail | 1 | 11.3 ms |
+| **Total** | **~67** | **~759 ms** |
 
-One LDPC block at QPSK rate 1/2: 1600 coded bits / (14 carriers × 2 bps) = 57.1 symbols.
+Multi-codeword frames (n_codewords=8 typical): single preamble + tail amortized over
+8 LDPC blocks.
 
 ---
 
@@ -167,38 +141,101 @@ One LDPC block at QPSK rate 1/2: 1600 coded bits / (14 carriers × 2 bps) = 57.1
 
 ```
 Payload bytes
-  → CRC-32 append
-  → LDPC encode (rate from tone map)
-  → Bit interleave (stride-41 congruential per 1600-bit block)
-  → BICM interleave (for QAM16+, column-row per block)
-  → Scramble (LFSR x^15+x^14+1, same as native)
-  → Per-subcarrier symbol mapping (constellation from tone map)
-  → Frequency-time interleave (spread across subcarriers and symbols)
-  → Insert pilot subcarriers (every 4th, known +1)
-  → Insert block pilot symbols (every 8th OFDM symbol, all +1)
-  → Prepend training symbols (Schmidl-Cox + full channel est)
-  → Prepend header symbols (3× BPSK)
-  → Append tail symbol
-  → IFFT per OFDM symbol (NFFT-point)
-  → Prepend cyclic prefix (CP_SAMPLES)
-  → Concatenate all symbols into time-domain baseband IQ
-  → Soft clip at 3.0× RMS
-  → Upconvert to center_hz (reuse existing Upconverter)
-  → Output audio samples
+  -> CRC-32 append
+  -> LDPC encode (rate from tone map)
+  -> Bit interleave (stride-41 congruential per 1600-bit block)
+  -> BICM interleave (for QAM16+, column-row per block)
+  -> Scramble (LFSR x^15+x^14+1, seed=0x6959)
+  -> Frequency-time interleave (global stride-173 across all coded bits)
+  -> Per-subcarrier symbol mapping (constellation from tone map, NUC optional)
+  -> DFT-spread (N-point DFT across data carriers per OFDM symbol)
+  -> FM TX de-emphasis (per-subcarrier amplitude shaping)
+  -> Insert comb pilot subcarriers (every 6th, +1 * de-emphasis gain)
+  -> Insert dense pilot rows (every 5th data symbol)
+  -> Insert block pilot symbols (every 24th OFDM symbol)
+  -> Prepend 2x ZC training symbols (root=7)
+  -> Append tail symbol
+  -> IFFT per OFDM symbol (NFFT-point, Hermitian symmetry)
+  -> Prepend cyclic prefix (cp_samples=32)
+  -> Concatenate all symbols into time-domain baseband
+  -> Hilbert PAPR clipper (iterative clip-filter-restore, target ~7 dB PAPR)
+  -> Upconvert to center_hz
+  -> Output audio samples
 ```
 
-### 4.2 Soft Clipping
+### 4.2 DFT-Spread OFDM (SC-FDMA)
 
-After IFFT + CP concatenation, compute RMS of entire frame.
-Clip: `if |sample| > 3.0 * rms: sample = 3.0 * rms * sign(sample)`
-Then apply a short lowpass to smooth clipping edges (FIR, 15-tap Hamming, cutoff = BW).
+DFT pre-coding of data carriers before IFFT. Each OFDM symbol's data carriers are
+passed through an N-point DFT before insertion into the OFDM frequency grid. This
+spreads each QAM symbol across all data subcarriers, producing a single-carrier-like
+time-domain signal.
 
-Log: `[OFDM-TX] soft clip: %d/%d samples clipped (%.1f%%), PAPR=%.1f dB`
+```
+PAPR reduction: ~10-11 dB (plain OFDM) -> ~5-7 dB (DFT-spread)
+```
 
-### 4.3 Upconversion
+Critical for FM deviation limiters, which behave like power amplifier saturators.
+Enabled by default (`dft_spread=true` in `OfdmConfig`).
 
-Reuse existing `Upconverter::iq_to_audio()` from `include/native/upconvert.h`.
-Center frequency = `center_hz` from probe negotiation (e.g. 1700 Hz for 1200-2200 band).
+Constraints:
+- All data carriers in a symbol must use the same modulation order.
+- Disabled for DD-CPE when `max_bpc < 6`.
+- DFT-spread must happen BEFORE de-emphasis (de-emphasis is per-carrier and
+  undone by the equalizer via H[k]; applying it before DFT would bake scaling
+  into the spread signal).
+
+RX applies IDFT after MMSE equalization to recover QAM symbols.
+
+**EVM-based noise variance:** With DFT-spread enabled, the standard ZC-based noise
+variance estimate may be inaccurate (DFT-spread changes the per-carrier statistics).
+The demodulator computes EVM (Error Vector Magnitude) from hard-sliced DFT-despread
+symbols and uses this as noise variance for soft demapping when DFT-spread is active.
+
+### 4.3 FM TX De-Emphasis Compensation
+
+Per-subcarrier amplitude shaping to compensate radio pre-emphasis. Attenuates higher
+carriers on TX so that after the radio's pre-emphasis the signal is flat entering the
+deviation limiter.
+
+```
+fm_preemph_corner_hz = 300 Hz     (NBFM mic/speaker, TIA/EIA-603 530us)
+fm_preemph_gain_cap  = 10.0       (max de-emphasis ratio, -20 dB floor)
+```
+
+Gain per carrier:
+```
+g[k] = 1 / sqrt(1 + (f[k] / corner_hz)^2)
+g[k] = max(g[k], 1 / gain_cap)
+```
+
+Set `fm_preemph_corner_hz = 0` to disable (flat audio data port connection).
+Applied to training symbols, comb pilots, and data carriers consistently so that
+H[k] from channel estimation accounts for the shaping.
+
+### 4.4 PAPR Reduction (Hilbert Clipper)
+
+Iterative clip-and-filter PAPR reduction targeting ~7 dB PAPR:
+
+1. Measure PAPR of time-domain frame.
+2. Hard clip samples exceeding target amplitude.
+3. Bandpass filter (passband only) to remove out-of-band spectral regrowth.
+4. Restore pilot subcarriers to known values (clipping corrupts them).
+5. Repeat steps 1-4 for 4 iterations until convergence.
+
+This replaces simple `3.0x RMS` soft clipping. The iterative approach achieves
+lower PAPR while keeping spectral regrowth within the passband. Pilot restoration
+ensures channel estimation accuracy is not degraded by clipping.
+
+Implementation: `ofdm_papr.h` (Hilbert clipper class), called from `ofdm_mod.cc`.
+
+### 4.5 Preamble Boost
+
+Training symbols scaled by `PREAMBLE_BOOST = sqrt(2) ≈ 1.414` (+3 dB) relative
+to data symbols. Improves detection reliability at low SNR without affecting data
+symbol power budget.
+
+RX compensates by dividing received training symbol by `PREAMBLE_BOOST` before
+channel estimation, so H[k] reflects the data-symbol-level channel gain.
 
 ---
 
@@ -208,109 +245,153 @@ Center frequency = `center_hz` from probe negotiation (e.g. 1700 Hz for 1200-220
 
 ```
 Audio samples
-  → Downconvert from center_hz (reuse existing Downconverter)
-  → Baseband IQ stream
-  → Frame detection (Schmidl-Cox correlation on training symbol)
-  → Coarse CFO estimation (phase between training symbol halves)
-  → CFO correction (rotate entire frame)
-  → Strip CP, FFT each OFDM symbol
-  → Channel estimation from training symbol 2: H[k] = Y[k] / X[k]
-  → Noise variance estimation: σ²[k] from training symbol residuals
-  → For each data OFDM symbol:
-      → Extract pilot subcarriers, update channel estimate (linear interpolation)
-      → MMSE equalize data subcarriers: d[k] = Y[k] * conj(H[k]) / (|H[k]|² + σ²[k])
-      → Compute per-subcarrier reliability (|H[k]|² / (|H[k]|² + σ²[k]))
-  → Collect equalized data symbols across all OFDM symbols
-  → Frequency-time de-interleave
-  → Soft demap per subcarrier (using per-subcarrier σ² for LLR scaling)
-  → Per-symbol reliability weighting (same as native: magnitude + CSI)
-  → Soft descramble
-  → BICM de-interleave (QAM16+)
-  → LDPC block de-interleave (stride-41)
-  → LLR clamp ±20
-  → Tail bit hardening
-  → Chase combining (if stored LLRs available)
-  → LDPC decode (min-sum)
-  → CRC-32 check
-  → Payload bytes
+  -> Downconvert from center_hz
+  -> Baseband IQ stream
+  -> Frame detection (hybrid Schmidl-Cox + ZC correlation)
+  -> Coarse CFO estimation (phase between two ZC training symbols)
+  -> CFO correction (rotate entire frame)
+  -> Strip CP, FFT each OFDM symbol
+  -> ZC-based channel estimation: H[k] = Y_zc[k] / X_zc[k]
+  -> Noise variance estimation (ZC residuals)
+  -> Mean |H| quality gate (skip decode if mean|H| < 0.05)
+  -> For each data OFDM symbol:
+      -> Per-symbol CPE correction from comb pilots
+      -> Extract data carriers (skip pilot positions)
+      -> MMSE equalize: d[k] = Y[k] * conj(H[k]) / (|H[k]|^2 + nv[k])
+      -> DFT-despread (IDFT if dft_spread enabled)
+      -> DD-CPE refinement (BPSK/QPSK/16QAM only)
+  -> Collect equalized data symbols
+  -> Soft demap per subcarrier (LLR computation with per-carrier sigma^2)
+  -> LLR clamp +/-8
+  -> Soft descramble (LFSR sign-flip)
+  -> Frequency-time de-interleave (reverse stride-173)
+  -> BICM de-interleave (QAM16+)
+  -> LDPC block de-interleave (reverse stride-41)
+  -> Tail bit hardening
+  -> Chase combining (if stored LLRs available from HARQ)
+  -> LDPC decode (min-sum, 50 iterations)
+  -> CRC-32 check
+  -> Payload bytes
 ```
 
-### 5.2 Frame Detection (Schmidl-Cox)
+### 5.2 Frame Detection (Hybrid Schmidl-Cox + ZC)
 
-Training symbol 1 has identical first/second halves (each NFFT/2 = 256 samples).
+Two identical Zadoff-Chu training symbols replace the original Schmidl-Cox scheme.
+Detection uses a two-phase approach:
 
-Correlation metric:
+**Phase 1 -- Schmidl-Cox Autocorrelation (coarse detection):**
+
+Correlates body of train1 with body of train2 (identical ZC sequences). Both pass
+through the same channel, so distortion cancels. Channel-invariant.
+
 ```
-P(d) = Σ_{m=0}^{L-1} r(d+m) * conj(r(d+m+L))   where L = NFFT/2
-R(d) = Σ_{m=0}^{L-1} |r(d+m+L)|²
-M(d) = |P(d)|² / R(d)²
-```
+P(d) = sum_{m=0}^{N-1} conj(r(d+cp+m)) * r(d+cp+sym_len+m)
+A(d) = sum_{m=0}^{N-1} |r(d+cp+m)|^2
+R(d) = sum_{m=0}^{N-1} |r(d+cp+sym_len+m)|^2
 
-Peak of M(d) gives frame timing. Phase of P(d) at peak gives coarse CFO:
-```
-cfo_hz = angle(P(d_peak)) / (2π * L / sample_rate)
-```
-
-Log: `[OFDM-RX] Schmidl-Cox peak: M=%.4f at sample %d, CFO=%.1f Hz`
-
-### 5.3 CFO Correction
-
-Rotate all subsequent samples: `r_corrected(n) = r(n) * exp(-j*2π*cfo*n/Fs)`
-
-Fine CFO refinement from training symbol 2: compare received pilot phases against
-expected. Residual CFO = mean phase slope across subcarriers.
-
-Log: `[OFDM-RX] CFO coarse=%.1f Hz, fine=%.2f Hz, total=%.2f Hz`
-
-### 5.4 Channel Estimation
-
-From training symbol 2 (all subcarriers known +1):
-```
-H[k] = Y_train2[k] / X_train2[k] = Y_train2[k]   (since X=+1)
+M(d) = |P(d)|^2 / (A(d) * R(d))     [Cauchy-Schwarz normalized, bounded 0..1]
+W(d) = M(d) * (A(d) + R(d))          [energy-weighted, rejects silence]
 ```
 
-Noise variance per subcarrier (from training symbol residuals):
+Coarse search at stride=cp, fine search at stride=1 around peak.
+Detection threshold: M >= 0.40.
+
+CFO from SC: `cfo_hz = angle(P(d_peak)) * Fs / (2*pi*N)`
+
+**Phase 2 -- ZC Cross-Correlation (fine timing):**
+
+After SC detection, ZC cross-correlation with known time-domain ZC sequence
+pinpoints exact frame start within +/-cp. Frequency-domain cross-correlation
+provides ZC quality gate (reject false positives where FD-ZC < 0.30).
+
+### 5.3 Channel Estimation (ZC-Based)
+
+From training symbol (ZC known sequence in frequency domain):
+
 ```
-σ²[k] = E[|Y - H·X|²]   (averaged over training + block pilot symbols)
+H[k] = Y_zc[k] / X_zc[k]
 ```
 
-Channel estimate updated at each block-pilot symbol (every 8th data symbol):
-linear interpolation between block pilots in time, linear interpolation between
-comb pilots in frequency.
+where `X_zc[k]` is the known ZC frequency-domain sequence at each used carrier.
 
-Log: `[OFDM-RX] channel est: mean |H|=%.3f, SNR range %.1f-%.1f dB across %d carriers`
+Noise variance per subcarrier from ZC residuals (3-tap smoothed H deviation).
 
-### 5.5 MMSE Equalization
+Channel estimate updated at block-pilot symbols via IIR (alpha=0.3):
+```
+H[k] = alpha * H_new[k] + (1-alpha) * H_old[k]
+```
+
+Comb pilots provide frequency interpolation with linear interp of H and noise_var.
+
+### 5.4 Per-Symbol CPE Correction (DD-CPE)
+
+Decision-directed common phase error correction per OFDM symbol.
+
+**Pilot-based CPE:** Weighted average of comb pilot phase errors per symbol.
+Applied as a common rotation to all carriers:
+```
+cpe = sum(conj(H_pilot) * Y_pilot) / sum(|H_pilot|^2)
+correction: Y[k] *= exp(-j * angle(cpe))
+```
+
+**DD refinement:** After equalization and DFT-despread, hard-slice each data carrier
+and compute phase error vs nearest constellation point. Weighted average across all
+carriers refines the pilot-only CPE estimate.
+
+**Disabled for:**
+- 64QAM+ (`max_bpc >= 6`): FM deviation limiter compresses outer constellation points,
+  causing systematic hard-decision errors that bias the estimate.
+- DFT-spread mode: DFT-spread carriers are in frequency domain before IDFT, DD-CPE
+  operates on time-domain symbols.
+
+**CPE slope feedback:** History of per-symbol CPE values estimates residual CFO
+(reported as `cpe_drift_hz` in diagnostics).
+
+### 5.5 SFO Tracking
+
+Sampling Frequency Offset (SFO) causes progressive timing drift across the frame.
+Block pilot symbols track this drift:
+
+1. At each block pilot, compute mean phase difference from initial channel estimate.
+2. Fit linear slope to (symbol_index, phase_drift) across all block pilots seen so far.
+3. Apply per-symbol phase correction: `correction[k] = exp(-j * slope * symbol_index * k/N)`.
+
+Dense pilot rows (every 5th data symbol) provide additional phase snapshots for
+SFO estimation, improving accuracy for long frames.
+
+### 5.6 MMSE Equalization
 
 Per subcarrier, per OFDM symbol:
 ```
-d[k] = Y[k] * conj(H_interp[k]) / (|H_interp[k]|² + σ²[k])
+d[k] = Y[k] * conj(H[k]) / (|H[k]|^2 + nv[k])
 ```
 
-This is MMSE (regularized ZF). When |H|² >> σ², it's ZF. When |H|² ≈ σ²,
-it attenuates rather than amplifying noise. Same principle as Mercury's MMSE.
+**Noise variance floors** prevent infinite gain:
+```
+NV_ABS_FLOOR = 0.001       (-30 dB absolute)
+NV_REL_FLOOR = 0.002       (max 27 dB effective SNR per carrier)
+nv[k] = max(nv[k], max(NV_ABS_FLOOR, NV_REL_FLOOR * |H[k]|^2))
+```
 
-Reliability per subcarrier: `reliability[k] = |H[k]|² / (|H[k]|² + σ²[k])`
+### 5.7 Quality Gates
 
-### 5.6 Interface to Existing LDPC/HARQ Pipeline
+**Mean |H| gate:** If `mean|H| < 0.05` across all used carriers, skip LDPC decode.
+Avoids wasting cycles on noise-only detections.
 
-The OFDM demodulator produces the same outputs as the native single-carrier demodulator
-(step 15 in the decode chain). Specifically:
+**ZC quality gate:** In sync, frequency-domain ZC correlation metric must exceed 0.30
+to confirm a legitimate frame (vs data-symbol false positive).
 
-1. `std::vector<std::complex<float>> symbols` — equalized data symbols, pilots stripped,
-   de-interleaved to match TX symbol order
-2. `std::vector<float> sym_reliability` — per-symbol magnitude (for soft erasure)
-3. `std::vector<float> sym_phase_var` — per-symbol noise variance (for CSI weighting).
-   For OFDM: `1.0 / (SNR_subcarrier * reliability[k])` mapped to each symbol
-4. `float snr_db` — overall SNR estimate (average across subcarriers)
-5. `float channel_gain` — mean |H| across used subcarriers
+### 5.8 LLR Clamp
 
-These feed directly into: `demap_soft()`, per-symbol weighting, scramble_soft, BICM
-de-interleave, LDPC block de-interleave, tail hardening, Chase combining, LDPC decode.
+LLRs clamped to +/-8 (not +/-20). DVB-T2 research shows +/-6 to +/-10 is optimal
+for LDPC at low SNR. Previous +/-20 provided no protection against over-confident
+LLRs from underestimated noise variance.
 
-**The OFDM demod reuses the ENTIRE post-equalization pipeline from frame.cc.**
-We extract the LLR computation, weighting, de-interleaving, and LDPC decode into
-shared functions callable by both native and OFDM demodulators.
+### 5.9 CSI Handling
+
+CSI (Channel State Information) reliability weighting is **removed** in the OFDM path.
+CSI is an anti-pattern with MMSE equalization -- MMSE already incorporates per-carrier
+SNR into the equalizer gain. Native single-carrier path still uses CSI.
 
 ---
 
@@ -320,69 +401,56 @@ shared functions callable by both native and OFDM demodulators.
 
 Chow-Cioffi-Bingham (CCB) bit loading:
 
-Input: per-subcarrier SNR `snr[k]` (from probe tone power + noise floor estimate,
-refined by training symbol channel estimate).
-
-For each data subcarrier k:
 ```
-bits[k] = floor(log2(1 + snr[k] / Γ))
+bits[k] = floor(log2(1 + snr[k] / Gamma))
 ```
-where `Γ` is the SNR gap. With LDPC at rate R and BER target 10^-5:
-- Rate 1/2: Γ ≈ 2.0 dB (1.58 linear)
-- Rate 3/4: Γ ≈ 3.5 dB (2.24 linear)
-- Rate 7/8: Γ ≈ 5.0 dB (3.16 linear)
 
-Clamp: `bits[k] = min(bits[k], 8)` (max 256QAM).
-If `bits[k] < 1`, null the carrier (don't transmit on it).
+SNR gap `Gamma` per FEC rate:
+- Rate 1/2: 2.0 dB (1.58 linear)
+- Rate 5/8: 2.5 dB (1.78 linear)
+- Rate 3/4: 3.5 dB (2.24 linear)
+- Rate 7/8: 5.0 dB (3.16 linear)
 
-Total bits per OFDM data symbol: `B = Σ bits[k]` over data carriers.
-Net throughput: `B × baud × fec_rate` where `baud = 1 / T_symbol_total`.
+Clamp to valid set: `{0, 1, 2, 4, 6, 8}`. If `bits[k] < 1`, null the carrier.
 
 ### 6.2 Tone Map Structure
 
 ```cpp
 struct ToneMap {
-    uint8_t bits_per_carrier[MAX_OFDM_CARRIERS];  // 0,1,2,4,6,8
+    std::vector<uint8_t> bits_per_carrier;  // one per data carrier: 0,1,2,4,6,8
     int n_data_carriers;
-    int total_bits_per_symbol;  // sum of bits_per_carrier
+    int total_bits_per_symbol;              // sum of bits_per_carrier
     LdpcRate fec_rate;
     int nfft;
+    uint8_t tone_map_id;                    // 0=waterfill, 1-8=uniform presets
+    bool use_nuc;                           // Non-Uniform Constellations
+    int n_codewords;                        // LDPC blocks per frame (multi-codeword)
 };
 ```
 
 ### 6.3 Tone Map Negotiation
 
-Both sides compute tone maps from exchanged probe data (deterministic: same inputs →
-same output). No additional exchange needed.
+Both sides compute tone maps from exchanged probe data (deterministic: same inputs
+produce same output). Tone map serialization for peer exchange:
 
-Steps:
-1. After probe exchange, both sides have `tone_power_db[64]` for both directions.
-2. Intersect detected tone ranges (existing `probe_negotiate()`).
-3. Estimate per-subcarrier SNR: `snr[k] = tone_power[k] - noise_floor[k]`.
-   Noise floor from probe null analysis (midpoints between tones).
-4. Run CCB bit loading.
-5. Both sides arrive at identical tone map.
+```
+Header (1 byte): [4-bit tone_map_id][4-bit fec_rate_field]
+For waterfill (id=0): one nibble per carrier (bits/2), two per byte.
+Total: 1 + ceil(n_data_carriers/2) bytes.
+```
 
-**If the tone map needs refinement** after the training symbols (actual channel
-may differ slightly from probe prediction), the TX side includes `tone_map_id`
-in the header. ID 0 = computed-from-probe. IDs 1-15 = predefined uniform maps
-(all BPSK, all QPSK, etc.) as fallback.
+### 6.4 Uniform Tone Map Presets
 
-### 6.4 Predefined Uniform Tone Maps (Fallback)
-
-For robustness, define uniform maps that don't require waterfilling:
-
-| ID | Modulation | FEC Rate | Description |
-|----|-----------|----------|-------------|
-| 0  | (waterfill) | (from map) | Computed from probe |
-| 1  | BPSK | 1/2 | Most robust |
-| 2  | QPSK | 1/2 | Safe default |
-| 3  | QPSK | 3/4 | Good balance |
-| 4  | 16QAM | 1/2 | Medium |
-| 5  | 16QAM | 3/4 | Medium-high |
-| 6  | 64QAM | 3/4 | High SNR |
-| 7  | 64QAM | 7/8 | Very high SNR |
-| 8  | 256QAM | 7/8 | Maximum rate |
+| Preset ID | Modulation | FEC Rate | O-Level |
+|-----------|-----------|----------|---------|
+| 1 | BPSK | 1/2 | O0 |
+| 2 | QPSK | 1/2 | O1 |
+| 3 | QPSK | 3/4 | O2 |
+| 4 | 16QAM | 1/2 | O3 |
+| 5 | 16QAM | 3/4 | O4 |
+| 6 | 64QAM | 3/4 | O5 |
+| 7 | 64QAM | 7/8 | O6 |
+| 8 | 256QAM | 7/8 | O7 |
 
 ---
 
@@ -390,386 +458,246 @@ For robustness, define uniform maps that don't require waterfilling:
 
 ### 7.1 Mother Code
 
-Use Mercury's rate 4/16 (K=400, P=1200, N=1600) as the mother code. This provides
-maximum redundancy for incremental retransmission.
+Rate 4/16 (K=400, P=1200, N=1600) as the mother code. Six LDPC rate matrices available:
 
-Copy from Mercury to Iris:
-- `mercury_normal_4_16.h` / `mercury_normal_4_16.cc`
-- `mercury_normal_6_16.h` / `mercury_normal_6_16.cc`
-- `mercury_normal_10_16.h` / `mercury_normal_10_16.cc`
+| Rate | K | P | N | Matrix |
+|------|---|------|------|--------|
+| 4/16 | 400 | 1200 | 1600 | `mercury_normal_4_16` |
+| 6/16 | 600 | 1000 | 1600 | `mercury_normal_6_16` |
+| 8/16 (1/2) | 800 | 800 | 1600 | `mercury_normal_8_16` |
+| 10/16 (5/8) | 1000 | 600 | 1600 | `mercury_normal_10_16` |
+| 12/16 (3/4) | 1200 | 400 | 1600 | `mercury_normal_12_16` |
+| 14/16 (7/8) | 1400 | 200 | 1600 | `mercury_normal_14_16` |
 
-### 7.2 Puncturing Scheme
+### 7.2 Chase Combining
 
-First TX: encoder produces all 1200 parity bits (rate 4/16 mother code).
-Transmit subset based on target rate:
+Current implementation uses rate 1/2 Chase combining (existing HARQ infrastructure).
+On NACK, retransmit same codeword; receiver LLR-combines with previous attempt.
+True incremental redundancy (4/16 mother code puncturing) available as future enhancement.
 
-| Target Rate | Data bits | Parity bits sent | Effective rate |
-|------------|-----------|-----------------|----------------|
-| 7/8 (14/16) | 1400 | 200 | 0.875 |
-| 3/4 (12/16) | 1200 | 400 | 0.75 |
-| 5/8 (10/16) | 1000 | 600 | 0.625 |
-| 1/2 (8/16)  | 800  | 800 | 0.50 |
-| 3/8 (6/16)  | 600  | 1000 | 0.375 |
-| 1/4 (4/16)  | 400  | 1200 | 0.25 |
+### 7.3 Integration
 
-**Important:** The data portion length varies per rate! For HARQ-IR, the mother code
-(4/16, K=400) is always used for encoding. First TX sends K=400 data + first 400
-parity = rate 1/2 effective. On NACK, send next 400 parity → rate 1/3. On NACK again,
-send last 400 parity → rate 1/4.
+The OFDM demodulator produces the same outputs as the native demodulator:
+equalized symbols, per-symbol reliability, LLRs, SNR estimate. These feed into
+the shared post-equalization pipeline: demap, weighting, de-interleave, LDPC decode.
 
-Alternative: use existing rate-1/2 code (K=800) as base, encode with all 800 parity.
-First TX: send all 800 parity (rate 1/2). On NACK, retransmit same (Chase combining).
-This is simpler and doesn't require new matrix tables.
-
-**Decision: Start with existing rate 1/2 Chase combining (already implemented in HARQ).
-Add true IR with 4/16 mother code as Phase 5 improvement.**
-
-### 7.3 Integration with Existing HARQ
-
-The existing HARQ system (`on_decode_failed_harq`, per-block decode, selective NACK
-with region info, piggybacked retransmit) works with OFDM unchanged. The LLR storage
-and Chase combining operate at the FEC layer.
-
-For OFDM, `sym_phase_var` maps to per-subcarrier reliability instead of Kalman P00,
-but the region selection logic (`select_bad_regions`) works identically — it finds
-contiguous regions of low-reliability symbols and requests retransmission.
+OFDM `sym_phase_var` maps to per-subcarrier reliability instead of Kalman P00,
+but the HARQ region selection logic works identically.
 
 ---
 
 ## 8. Non-Uniform Constellations (NUC)
 
-### 8.1 Implementation
+ATSC 3.0 optimized constellation points. One lookup table per (order, fec_rate) pair:
 
-Replace standard QAM constellation points with optimized NUC points from ATSC 3.0
-(published in ATSC A/322 standard, Table 7.4 through 7.13).
+- 16-NUC: 2D coordinates, per FEC rate
+- 64-NUC: 2D coordinates, per FEC rate
+- 256-NUC: 1D (separable I/Q) coordinates, per FEC rate
 
-One lookup table per (constellation_order, fec_rate) pair:
-- 16-NUC: 2D coordinates for 16 points, per FEC rate
-- 64-NUC: 2D coordinates for 64 points, per FEC rate
-- 256-NUC: 1D (separable I/Q) coordinates for 256 points, per FEC rate
+Gains: 0.2-0.5 dB at 16QAM, 0.5-0.8 dB at 64QAM, 0.8-1.0 dB at 256QAM.
 
-**Gains:** 0.2-0.5 dB at 16QAM, 0.5-0.8 dB at 64QAM, 0.8-1.0 dB at 256QAM.
-
-### 8.2 Changes
-
-- New file: `include/native/nuc_tables.h` — NUC coordinate tables
-- Modify `constellation.cc`: `qam_map()` and `demap_soft()` accept optional NUC table pointer
-- When NUC table provided, use NUC coordinates instead of standard QAM grid
-- LLR computation: for 1D-NUC (256QAM), decompose into I/Q axes (same complexity as uniform).
-  For 2D-NUC (16/64QAM), full 2D search over all constellation points.
+Mapping: `map_symbol_nuc()` and `demap_soft_nuc()` in `constellation.cc`.
+For 2D-NUC (16/64QAM): full 2D search over all constellation points.
+For 1D-NUC (256QAM): decompose into I/Q axes (same complexity as uniform).
 
 ---
 
-## 9. FFT Utility
+## 9. Speed Levels (O-Levels)
 
-### 9.1 Shared FFT
+Eight O-levels, each a specific modulation + FEC rate pair. Maps 1:1 to uniform
+tone map presets (preset_id = level + 1).
 
-Extract the existing Cooley-Tukey radix-2 FFT from `passband_probe.cc` into a
-shared module:
+| Level | Modulation | FEC Rate | Min SNR | Description |
+|-------|-----------|----------|---------|-------------|
+| O0 | BPSK | 1/2 | 0 dB | Most robust |
+| O1 | QPSK | 1/2 | 6 dB | |
+| O2 | QPSK | 3/4 | 8 dB | |
+| O3 | 16QAM | 1/2 | 12 dB | |
+| O4 | 16QAM | 3/4 | 16 dB | |
+| O5 | 64QAM | 3/4 | 20 dB | |
+| O6 | 64QAM | 7/8 | 24 dB | |
+| O7 | 256QAM | 7/8 | 28 dB | Data port only |
 
-- `include/common/fft.h`
-- `source/common/fft.cc`
+SNR thresholds raised for FM (deviation limiter distortion is not AWGN).
+Gearshift adds 1 dB margin on top of these values (picks highest O-level where
+SNR exceeds threshold + 1 dB).
 
-Functions:
+O0-O4 validated near theoretical limits (0-13 dB SNR). O5-O7 (64QAM+) broken
+on FM mic/speaker path (fundamental limitation of FM deviation limiting on dense
+constellations). Data port only.
+
+---
+
+## 10. OFDM-KISS Transport
+
+AX.25 frames tunneled over native OFDM PHY. The AX.25 session layer stays up
+during the upgrade from AFSK to native OFDM.
+
+### 10.1 Activation
+
+1. AX.25 connected-mode session established over AFSK 1200.
+2. After probe completes and both sides have `CAP_OFDM`, OFDM-KISS RX activates.
+3. Split RX/TX activation: RX enables immediately; TX enables after hearing a
+   native frame from peer (bidirectional confirmation).
+4. Probe coordination: cooldown before initiator starts probe to avoid collision.
+
+### 10.2 Transport Features
+
+- **Compression:** PPMd/zstd batch compression of OFDM-KISS payloads. Marker byte
+  `0xCC` (`COMPRESSED_PAYLOAD_MAGIC`).
+- **B2F proxy:** Winlink LZHUF unroll/reroll proxied through OFDM transport. Marker
+  byte `0xCD` (`B2F_DATA_MAGIC`). B2F AFSK history replayed at activation for SID/FC/FS
+  context.
+- **Adaptive batch airtime:** TCP-style AIMD. Grows on successful ACKs (+1s per RR),
+  halves on REJ/loss.
+
+### 10.3 AX.25 Windowed Flow Control
+
+OFDM-KISS maintains AX.25 sequence numbers (V(R), N(R)) for generating local RR ACKs
+and I-frame construction. Cached AX.25 address header for frame assembly.
+
+---
+
+## 11. TUNE Calibration Protocol
+
+Bilateral native-frame gain calibration. Each side sends test frames; the other
+measures channel gain from the preamble and reports back. Both adjust TX level so
+the peer receives at optimal gain.
+
+### 11.1 Protocol Flow
+
+```
+Initiator: SEND_START -> TX_TEST -> WAIT_PEER -> SEND_REPORT -> WAIT_REPORT -> APPLY -> DONE
+Responder:              WAIT_PEER -> SEND_REPORT_AND_TEST -> WAIT_REPORT -> APPLY -> DONE
+```
+
+### 11.2 Power Ramp
+
+10-frame power ramp at geometrically-spaced TX levels:
+
+```
+TUNE_RAMP_COUNT = 10
+TUNE_SCALE_MIN  = 0.05   (minimum absolute tx_level)
+TUNE_SCALE_MAX  = 1.0    (maximum absolute tx_level)
+```
+
+Adaptive ramp: scales computed from current TX base level to span the useful range.
+Each ramp frame transmitted at a distinct power level (no clamping waste).
+
+### 11.3 Measurement
+
+Peer measures H magnitude and SNR per frame from ZC preamble (works even when LDPC
+decode fails). Reports via compact AFSK format. Sender fits parabola or uses
+SNR-based fit (for FM-limited channels where H is invariant across power levels).
+
+3-second responder silence guard prevents report collision.
+
+---
+
+## 12. FM Channel Simulator
+
+Software FM channel model for loopback testing. Applied in the audio loopback path.
+
+### 12.1 Channel Model
+
+```
+TX audio
+  -> Pre-emphasis (configurable time constant)
+  -> Deviation limiting (hard clip at threshold)
+  -> De-emphasis
+  -> Bandpass filter
+  -> f^2-shaped discriminator noise
+  -> CFO (carrier frequency offset)
+  -> Multipath (2-tap: direct + delayed reflection)
+  -> RX audio
+```
+
+### 12.2 CLI
+
+```
+--loopback --fm-channel              Enable FM channel simulator
+--fm-cfo <Hz>                        Add carrier frequency offset
+--fm-multipath <delay_ms> <gain>     Add 2-tap multipath (gain 0-1)
+```
+
+### 12.3 API
+
 ```cpp
-namespace iris {
-    // Forward FFT (DFT). In-place, radix-2, requires power-of-2 n.
-    void fft(float* re, float* im, int n);
-
-    // Inverse FFT (IDFT). In-place, same requirements.
-    void ifft(float* re, float* im, int n);
-
-    // Complex version (interleaved re/im pairs)
-    void fft_complex(std::complex<float>* data, int n);
-    void ifft_complex(std::complex<float>* data, int n);
-}
+void loopback_set_fm_channel(float preemph_us, float bp_low, float bp_high,
+                              float cfo_hz, float deviation_limit);
+void loopback_set_fm_multipath(float delay_ms, float gain);
 ```
-
-IFFT = conjugate inputs, FFT, conjugate outputs, divide by N.
 
 ---
 
-## 10. Integration
+## 13. Capability Flags
 
-### 10.1 Capability Flag
+Negotiated in CONNECT/CONNECT_ACK, advertised in probe result `capabilities` field.
 
 ```cpp
-constexpr uint16_t CAP_OFDM = 0x0200;  // OFDM PHY capable
+constexpr uint16_t CAP_MODE_A      = 0x0001;  // Mode A capable
+constexpr uint16_t CAP_MODE_B      = 0x0002;  // Mode B capable
+constexpr uint16_t CAP_MODE_C      = 0x0004;  // Mode C capable
+constexpr uint16_t CAP_ENCRYPTION  = 0x0008;  // X25519 + ChaCha20-Poly1305
+constexpr uint16_t CAP_COMPRESSION = 0x0010;  // PPMd/zstd compression
+constexpr uint16_t CAP_B2F_UNROLL  = 0x0020;  // Winlink B2F unroll/reroll
+constexpr uint16_t CAP_STREAMING   = 0x0040;  // Streaming compression context
+constexpr uint16_t CAP_PQ_CRYPTO   = 0x0080;  // Post-quantum ML-KEM-768 (FIPS 203)
+constexpr uint16_t CAP_HARQ        = 0x0100;  // Per-symbol soft HARQ
+constexpr uint16_t CAP_OFDM        = 0x0200;  // OFDM PHY capable
 ```
 
-Added to types.h. Advertised in probe result `capabilities` field.
-Both sides must have `CAP_OFDM` to use OFDM PHY.
-
-### 10.2 Config
-
-In `IrisConfig` (config.h):
+ML-KEM key exchange frame markers:
 ```cpp
-bool ofdm_enable = true;          // Master OFDM enable (GUI toggle)
-int ofdm_nfft = 512;              // Default NFFT (256/512/1024)
-int ofdm_cp_samples = 64;         // CP length in samples
-bool ofdm_auto_spacing = false;   // Auto-train subcarrier spacing
-bool ofdm_waterfill = true;       // Per-subcarrier adaptive bit loading
-bool ofdm_nuc = true;             // Non-uniform constellations
-```
-
-### 10.3 Mode Switching
-
-Current flow:
-```
-AFSK AX.25 → XID/connection header → probe → native single-carrier (A-levels)
-```
-
-New flow (when both sides have CAP_OFDM):
-```
-AFSK AX.25 → XID/connection header → probe → OFDM PHY (O-levels)
-```
-
-When one or both sides lack CAP_OFDM:
-```
-AFSK AX.25 → XID/connection header → probe → native single-carrier (A-levels)
-```
-
-The OFDM PHY slot-in happens in `modem.cc` where `native_mode_` is set. Instead
-of calling `process_rx_native()` and using native frame build/decode, the OFDM
-variants are called. The switching point is in `process_rx()` and `process_tx()`.
-
-### 10.4 GUI Changes
-
-In the Advanced tab of the Settings window (`gui_imgui.cc`):
-```
-[x] Enable OFDM mode (auto-upgrade from single-carrier)
-    NFFT: [256 | *512* | 1024]  (dropdown)
-    [x] Waterfilling (per-subcarrier adaptive modulation)
-    [x] Non-uniform constellations (NUC)
-    [ ] Auto-train subcarrier spacing
+constexpr uint8_t MLKEM_PK_MAGIC = 0xE1;   // ML-KEM encapsulation key (1184 bytes)
+constexpr uint8_t MLKEM_CT_MAGIC = 0xE2;   // ML-KEM ciphertext (1088 bytes)
 ```
 
 ---
 
-## 11. Speed Levels (O-levels)
+## 14. Integration
 
-Unlike A-levels (fixed modulation + FEC per level), O-levels are defined by the
-FEC rate only. The per-subcarrier modulation is determined by waterfilling.
+### 14.1 Config
 
-| Level | FEC Rate | Min SNR | Description |
-|-------|---------|---------|-------------|
-| O0 | 1/2 | 3 dB | Most robust |
-| O1 | 5/8 | 8 dB | |
-| O2 | 3/4 | 12 dB | Default |
-| O3 | 7/8 | 18 dB | High throughput |
-
-The actual throughput at each level depends on the waterfill result:
-```
-throughput = Σ_k bits[k] × (1/T_symbol_total) × fec_rate × (data_symbols / total_symbols)
+In `IrisConfig` (config.h), `[OFDM]` INI section:
+```cpp
+bool ofdm_enable = true;              // Master OFDM enable
+int ofdm_nfft = 512;                  // FFT size (256/512/1024)
+int ofdm_cp_samples = 32;            // CP length (samples)
+bool ofdm_waterfill = true;           // Per-subcarrier adaptive bit loading
+bool ofdm_nuc = true;                 // Non-uniform constellations
 ```
 
-Gearshift: varies FEC rate based on per-block LDPC convergence behavior (same
-EMA-smoothed SNR + iteration count logic as current gearshift.cc, but with
-O-level table instead of A-level table).
+### 14.2 Mode Switching
+
+```
+AFSK AX.25 -> XID/connection -> probe -> OFDM PHY (O-levels)  [both CAP_OFDM]
+AFSK AX.25 -> XID/connection -> probe -> native SC (A-levels)  [otherwise]
+```
+
+OFDM session state machine: `IDLE -> NEGOTIATED -> PROBING -> ACTIVE -> FAILED`.
+Managed by `OfdmSession` class with mutex-protected state transitions.
+
+### 14.3 GUI
+
+Advanced tab: OFDM settings section (enable toggle, NFFT dropdown, waterfilling
+checkbox, NUC checkbox). Diagnostics: O-level, mean SNR, throughput, frame counts,
+constellation scatter plot.
 
 ---
 
-## 12. File Structure
+## 15. Logging
 
-New files to create:
+All modules log with `IRIS_LOG()` macro and module-specific tags.
 
-```
-include/ofdm/
-    ofdm_config.h       — OfdmConfig struct, factory from probe
-    ofdm_mod.h          — OfdmModulator class
-    ofdm_demod.h        — OfdmDemodulator class
-    ofdm_frame.h        — OFDM frame builder/parser, tone map, waterfill
-    ofdm_sync.h         — Schmidl-Cox sync, CFO estimation
-
-source/ofdm/
-    ofdm_config.cc      — Config factory, carrier allocation
-    ofdm_mod.cc         — IFFT-based modulator, CP, soft clip
-    ofdm_demod.cc       — FFT-based demodulator, channel est, MMSE EQ
-    ofdm_frame.cc       — Frame build/decode, tone map, waterfill algorithm
-    ofdm_sync.cc        — Frame detection, CFO estimation/correction
-
-include/common/
-    fft.h               — Shared FFT/IFFT (extracted from probe)
-
-source/common/
-    fft.cc              — FFT/IFFT implementation
-
-include/native/
-    nuc_tables.h        — Non-uniform constellation tables (ATSC 3.0)
-```
-
-Files to modify:
-```
-include/common/types.h      — Add CAP_OFDM
-include/config/config.h     — Add OfdmConfig fields to IrisConfig
-source/config/config.cc     — Load/save OFDM settings
-source/engine/modem.cc      — OFDM mode switching in process_rx/process_tx
-source/engine/speed_level.cc — Add O-level definitions
-include/engine/speed_level.h — O-level enum/struct
-source/gui/gui_imgui.cc     — OFDM settings UI
-source/probe/passband_probe.cc — Extract FFT to shared module
-source/native/constellation.cc — NUC table support in map/demap
-source/native/frame.cc      — Extract shared LLR/decode pipeline functions
-include/native/frame.h      — Shared function declarations
-source/fec/ldpc.cc          — Add new rate matrices (4/16, 6/16, 10/16)
-include/fec/ldpc.h          — New rate enum entries
-```
-
-Mercury LDPC tables to copy:
-```
-mercury/include/physical_layer/mercury_normal_4_16.h  → iris/include/fec/
-mercury/source/physical_layer/mercury_normal_4_16.cc  → iris/source/fec/
-mercury/include/physical_layer/mercury_normal_6_16.h  → iris/include/fec/
-mercury/source/physical_layer/mercury_normal_6_16.cc  → iris/source/fec/
-mercury/include/physical_layer/mercury_normal_10_16.h → iris/include/fec/
-mercury/source/physical_layer/mercury_normal_10_16.cc → iris/source/fec/
-```
-
----
-
-## 13. Logging Requirements
-
-Every module must log with a module-specific tag. All logs use `IRIS_LOG()` macro.
-
-| Tag | What to log |
-|-----|------------|
-| `[OFDM-CFG]` | Config creation: NFFT, n_carriers, n_data, n_pilot, BW, center |
-| `[OFDM-TX]` | Frame build: n_symbols, total_bits, tone_map summary, PAPR, clip stats |
-| `[OFDM-SYNC]` | Detection: Schmidl-Cox metric, timing, CFO coarse/fine |
-| `[OFDM-CE]` | Channel est: mean/min/max |H|, mean/min/max SNR per carrier |
-| `[OFDM-EQ]` | Equalization: per-carrier reliability summary |
-| `[OFDM-RX]` | Frame decode: header parsed, n_data_symbols, LLR stats |
-| `[OFDM-WF]` | Waterfill: bits assigned per carrier, total bits/sym, capacity |
-| `[OFDM-NUC]` | NUC: which table loaded, which constellation |
-| `[OFDM-FAIL]` | Any failure: sync failed, header CRC fail, LDPC non-convergence |
-| `[OFDM-OK]` | Successful decode: payload size, effective throughput |
-
----
-
-## 14. Execution Plan (Parallelized Agent Tasks)
-
-### Batch 1: Independent Foundation (all parallel)
-
-**Agent A: FFT Utility**
-- Extract FFT from passband_probe.cc into include/common/fft.h + source/common/fft.cc
-- Add IFFT, complex versions
-- Update passband_probe.cc to use shared FFT
-- Test: verify FFT round-trip (IFFT(FFT(x)) == x)
-
-**Agent B: OFDM Config + Carrier Allocation**
-- Create include/ofdm/ofdm_config.h + source/ofdm/ofdm_config.cc
-- OfdmConfig struct, factory from NegotiatedPassband
-- Carrier index mapping (which FFT bins map to which carriers)
-- Pilot carrier selection
-- Logging: [OFDM-CFG]
-
-**Agent C: LDPC Table Import**
-- Copy mercury_normal_4_16, 6_16, 10_16 to iris
-- Update ldpc.cc get_ira_matrix() to use new tables for RATE_4_16, RATE_6_16, RATE_5_8
-- Update ldpc.h effective_rate() to not fall back to 1/2 for these rates
-- Test: encode/decode roundtrip at each new rate
-
-**Agent D: NUC Tables**
-- Create include/native/nuc_tables.h with ATSC 3.0 constellation coordinates
-- Modify constellation.cc to accept NUC table in qam_map() and demap_soft()
-- Tables for 16-NUC, 64-NUC at rates 1/2, 3/4, 7/8
-- Tables for 256-NUC (1D) at rates 3/4, 7/8
-- Logging: [OFDM-NUC]
-
-**Agent E: Config + GUI + Capability**
-- Add CAP_OFDM to types.h
-- Add OFDM fields to IrisConfig in config.h
-- Add load/save in config.cc
-- Add OFDM settings section in gui_imgui.cc (Advanced tab)
-- Add O-level definitions to speed_level.h/cc
-
-### Batch 2: Core OFDM (depends on Batch 1: A, B)
-
-**Agent F: OFDM Modulator**
-- Create include/ofdm/ofdm_mod.h + source/ofdm/ofdm_mod.cc
-- Training symbol generation (Schmidl-Cox + full channel est)
-- Per-subcarrier symbol mapping from tone map
-- IFFT + CP insertion
-- Soft clipping
-- Uses shared FFT (Agent A) and OfdmConfig (Agent B)
-- Logging: [OFDM-TX]
-
-**Agent G: OFDM Sync + Channel Estimation**
-- Create include/ofdm/ofdm_sync.h + source/ofdm/ofdm_sync.cc
-- Schmidl-Cox frame detection
-- Coarse + fine CFO estimation and correction
-- Channel estimation from training symbol
-- Channel interpolation (time + frequency)
-- Noise variance estimation
-- Uses shared FFT (Agent A) and OfdmConfig (Agent B)
-- Logging: [OFDM-SYNC], [OFDM-CE]
-
-**Agent H: Waterfilling + Tone Map**
-- Create waterfill functions in include/ofdm/ofdm_frame.h + source/ofdm/ofdm_frame.cc
-- CCB bit-loading algorithm
-- ToneMap struct + predefined uniform maps
-- Tone map computation from probe per-tone power
-- Tone map serialization (for header)
-- Logging: [OFDM-WF]
-
-### Batch 3: Integration (depends on Batch 2: F, G, H)
-
-**Agent I: OFDM Demodulator + Frame Decode**
-- Create include/ofdm/ofdm_demod.h + source/ofdm/ofdm_demod.cc
-- Full RX chain: sync → CFO → FFT → channel est → MMSE EQ → data extraction
-- Interface to existing LLR pipeline (extract shared functions from frame.cc)
-- Chase combining integration
-- HARQ per-block integration
-- Build + decode functions for complete OFDM frames
-- Logging: [OFDM-EQ], [OFDM-RX], [OFDM-FAIL], [OFDM-OK]
-
-**Agent J: Modem Integration**
-- Modify modem.cc: add OFDM mode switching
-- After probe + CAP_OFDM negotiation → switch to OFDM PHY
-- process_rx_ofdm() / process_tx_ofdm() methods
-- Gearshift adaptation for O-levels
-- OFDM-KISS transport integration (AX.25 frames over OFDM)
-
-### Batch 4: Validation (depends on Batch 3)
-
-**Agent K: Loopback Test**
-- Build and run loopback test: OFDM TX → internal loopback → OFDM RX
-- Test all uniform tone maps (O0 through O3)
-- Test waterfill mode
-- Test with AWGN at various SNR levels
-- Measure throughput at each operating point
-- Report results, compare to A-level throughput
-
----
-
-## 15. Agent Instructions Template
-
-Each agent MUST:
-1. Read this spec document before starting work.
-2. Follow the logging requirements (Section 13).
-3. After completing work, **update this document** with:
-   - Actual implementation details that differ from spec
-   - Any design decisions made that aren't covered by spec
-   - Actual file:line references for key functions
-   - Status of their task (DONE / PARTIAL / BLOCKED)
-4. Ensure code compiles (run `bash build.sh o3` from iris/).
-5. Do NOT modify files assigned to other agents in the same batch.
-
----
-
-## 16. Status Tracker
-
-| Agent | Task | Status | Notes |
-|-------|------|--------|-------|
-| A | FFT Utility | DONE | `include/common/fft.h` (4 functions: fft, ifft, fft_complex, ifft_complex), `source/common/fft.cc` (radix-2 Cooley-Tukey + log-once per size). `passband_probe.cc` updated to `#include "common/fft.h"` and call `iris::fft()`. No deviations from spec. |
-| B | OFDM Config | DONE | Created include/ofdm/ofdm_config.h + source/ofdm/ofdm_config.cc. OfdmConfig struct with carrier allocation from NegotiatedPassband. freq_to_bin()/bin_to_freq() helpers. Pilot every 4th used carrier, 1 guard each edge. Carrier counts match spec Sec 2.3 (e.g. NFFT=512 2kHz: 19 used, 5 pilot, 14 data). [OFDM-CFG] logging. Build passes. |
-| C | LDPC Tables | DONE | Copied mercury_normal_{4,6,10}_16 .h/.cc to iris/fec/. Fixed include paths. Added RATE_4_16 (k=400,p=1200), RATE_6_16 (k=600,p=1000), RATE_5_8/10_16 (k=1000,p=600) to get_ira_matrix() and effective_rate(). All 6 rates now have native matrices (4/16, 6/16, 8/16, 10/16, 12/16, 14/16). Build passes. |
-| D | NUC Tables | DONE | nuc_tables.h: 8 tables (16/64-NUC 2D + 256-NUC 1D), constellation.cc: map_symbol_nuc + demap_soft_nuc |
-| E | Config/GUI/Cap | DONE | CAP_OFDM=0x0200 in types.h, 6 OFDM fields in IrisConfig, [OFDM] INI section, GUI Advanced tab OFDM section, O0-O3 speed levels in OFDM_SPEED_LEVELS[] + ofdm_snr_to_speed_level() |
-| F | OFDM Modulator | DONE | Created include/ofdm/ofdm_mod.h + source/ofdm/ofdm_mod.cc. OfdmModulator class with generate_training_symbol_1 (Schmidl-Cox PN even carriers), generate_training_symbol_2 (all +1), generate_data_symbol, generate_pilot_symbol, build_ofdm_frame (full TX chain). ToneMap struct + make_uniform_tone_map() for presets 1-8. TX chain: CRC32 append, LDPC encode, stride-41 interleave, LFSR scramble, per-carrier constellation mapping, pilot insertion (comb every 4th + block every 8th), 3-symbol BPSK header (36 bits: tone_map_id/fec/payload_len/nfft_mode/harq/CRC8), tail symbol, IFFT+CP, soft clip at 3x RMS. Logs [OFDM-TX] with symbol count, payload size, PAPR, clip count. No BICM global interleave (deferred to per-carrier waterfill context). Spec deviation: skipped post-clip FIR smoothing (Section 4.2) — can add later if needed. |
-| G | OFDM Sync/CE | DONE | Created include/ofdm/ofdm_sync.h + source/ofdm/ofdm_sync.cc. Schmidl-Cox sliding-window detection (threshold 0.3), CFO from arg(P)*Fs/(2piL), SNR from |P|/(R-|P|). Channel est via NFFT-point FFT of training sym 2, noise_var from 3-tap smoothed H residuals. IIR block-pilot update (alpha=0.3). Comb-pilot interpolation with linear interp of H and noise_var. All per spec Sec 5.2-5.4. Tags: [OFDM-SYNC], [OFDM-CE]. |
-| H | Waterfill/ToneMap | DONE | Created `include/ofdm/ofdm_frame.h` + `source/ofdm/ofdm_frame.cc`. CCB waterfilling: SNR gap per FEC rate (r1/2=2.0dB, r5/8=2.5dB, r3/4=3.5dB, r7/8=5.0dB), floor(log2(1+snr/gap)), round to valid {0,1,2,4,6,8}. Probe-to-tonemap: lerp probe tones (66.7Hz) to OFDM subcarriers (93.75Hz), noise floor from median of adj-tone-min minus 20dB, min of both directions (conservative). Uniform presets 1-8 via `get_uniform_tone_map()`. Throughput: accounts for training(2)+header(3)+block pilots+tail(1) overhead. Serialization: 1-byte header [4 id | 4 fec_field] + nibble-packed bpc/2 for waterfill. ToneMap struct reused from ofdm_mod.h (Agent F). Tag: [OFDM-WF]. No spec deviations. |
-| I | OFDM Demodulator | DONE | Created `include/ofdm/ofdm_demod.h` + `source/ofdm/ofdm_demod.cc`. OfdmDemodulator class with full RX chain: Schmidl-Cox detection → CFO correction → channel est from training sym 2 → 3-symbol BPSK header decode (ZF, CRC-8 verify) → tone map resolution (uniform preset from header or waterfill from caller) → data symbol reception with block-pilot tracking (every 8th) and comb-pilot interpolation → MMSE equalization per data carrier (zero deep-fade carriers where |H|²<σ²) → per-carrier soft demapping to LLRs (sigma_sq from MMSE noise model) → LLR-level descrambling (sign flip) → stride-41 de-interleave → LDPC soft decode (min-sum, 50 iter) → LSB-first bit-to-byte → CRC-32 verify. OfdmDemodResult returns payload, diagnostics, per-carrier SNR, and raw LLRs for HARQ Chase combining. All TX/RX parameters match exactly (CRC-8 poly, LFSR seed, FEC field encoding, interleave stride, bit packing order). Tag: [OFDM-RX]. |
-| J | Modem Integration | DONE | Created `include/ofdm/ofdm_session.h` + `source/ofdm/ofdm_session.cc`. OfdmSession class manages OFDM state machine (IDLE→NEGOTIATED→ACTIVE→FAILED). Init from NegotiatedPassband + IrisConfig, creates OfdmModulator/OfdmDemodulator. State transitions on CAP_OFDM negotiation and probe completion. build_tx_frame() and process_rx_frame() delegate to mod/demod with current tone map. Waterfill from probe or channel feedback, uniform preset fallback. O-level gearshift (O0→RATE_1_2 through O3→RATE_7_8). Tone map serialization for peer exchange. OfdmSessionDiag for GUI. Mutex-protected. Tag: [OFDM-SESSION]. |
-| K | Loopback Test | DONE | `tools/ofdm_loopback_test.cc`. Tests 6 uniform presets (BPSK r1/2 through 256QAM r7/8) at 7 SNR levels (5-40 dB), 3 trials each (32/64/128 byte payloads) + 1 waterfill test at 20 dB. Box-Muller AWGN. Results: **123/129 PASS (95.3%)**. All presets BPSK through 64QAM pass at 5 dB. 256QAM r7/8 passes at 15 dB+. Waterfill 3/3 PASS at 20 dB. Only failures: 256QAM at 5/10 dB (expected — insufficient SNR). |
-| - | Sync Bugfixes | DONE | Fixed Schmidl-Cox: (1) Proper Cauchy-Schwarz normalization M=|P|²/(E·R) instead of |P|²/R² (prevents M>1 false peaks). (2) First-peak detection (take first threshold crossing, not global max) prevents false detections from data symbols. (3) Left-edge CP plateau snapping avoids FFT window leaking into next symbol's CP. |
+| Tag | Content |
+|-----|---------|
+| `[OFDM-CFG]` | Config creation: NFFT, carriers, BW, center, pilot spacing |
+| `[OFDM-TX]` | Frame build: symbols, bits, tone map, PAPR, clip stats, DFT-spread |
+| `[OFDM-SYNC]` | Detection: SC metric, ZC metric, timing, CFO |
+| `[OFDM-CE]` | Channel estimate: mean/min/max |H|, SNR per carrier |
+| `[OFDM-RX]` | Frame decode: LLR count, CPE, de-interleave, NUC state |
+| `[OFDM-WF]` | Waterfill: bits per carrier, capacity |
+| `[OFDM-FAIL]` | Failure: sync, quality gate, LDPC non-convergence |
+| `[OFDM-OK]` | Successful decode: payload size, throughput |
+| `[OFDM-SESSION]` | Session state transitions, tone map exchange |
