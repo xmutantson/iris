@@ -9,8 +9,8 @@ namespace iris {
 
 struct OfdmConfig {
     // Core parameters
-    int nfft = 512;                    // FFT size (256/512/1024)
-    int cp_samples = 32;               // Cyclic prefix length in samples (0.67ms, FM delay spread < 0.5ms)
+    int nfft = 512;                    // FFT size (256/512/1024) — 93.75 Hz spacing at 48k
+    int cp_samples = 128;              // Cyclic prefix length in samples (2.67ms, absorbs FM pre-emphasis transients)
     int sample_rate = 48000;           // Fixed
 
     // Derived from probe
@@ -49,6 +49,9 @@ struct OfdmConfig {
     // behave like power amplifier saturators — low PAPR is critical.
     bool dft_spread = true;
 
+    // Sync detection thresholds
+    float fd_zc_threshold = 0.40f;     // FD-ZC quality gate (with de-emphasis-matched reference, genuine ≥ 0.50)
+
     // Header
     int n_header_symbols = 0;          // No header — config pre-negotiated (Mercury approach)
 
@@ -60,7 +63,7 @@ struct OfdmConfig {
 };
 
 // Create OfdmConfig from probe result
-OfdmConfig ofdm_config_from_probe(const NegotiatedPassband& passband, int nfft = 512, int cp_samples = 32,
+OfdmConfig ofdm_config_from_probe(const NegotiatedPassband& passband, int nfft = 512, int cp_samples = 128,
                                    int pilot_carrier_spacing = 6, int pilot_symbol_spacing = 24);
 
 // Get the FFT bin index for a given frequency

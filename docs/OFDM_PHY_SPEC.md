@@ -568,8 +568,9 @@ the peer receives at optimal gain.
 
 ```
 Initiator: SEND_START -> TX_TEST -> WAIT_PEER -> SEND_REPORT -> WAIT_REPORT -> APPLY -> DONE
-Responder:              WAIT_PEER -> SEND_REPORT_AND_TEST -> WAIT_REPORT -> APPLY -> DONE
+Responder:              WAIT_PEER -> SEND_START -> TX_TEST -> SEND_REPORT -> WAIT_REPORT -> APPLY -> DONE
 ```
+Reports are sent AFTER all TX is complete — both sides are listening when reports arrive (half-duplex safe).
 
 ### 11.2 Power Ramp
 

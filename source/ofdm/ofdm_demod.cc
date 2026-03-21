@@ -459,6 +459,7 @@ OfdmDemodResult OfdmDemodulator::demodulate(
     float freq_pred = 0.0f;   // phase rate estimate (rad/symbol)
     float last_total = 0.0f;  // total phase from previous symbol
 
+
     // Pre-allocate reusable buffers for the hot loop (avoid per-symbol heap allocs)
     std::vector<std::complex<float>> fft_buf(nfft);          // Issue 2+3: shared FFT buffer
     std::vector<std::complex<float>> used_carriers_buf(n_used);
@@ -483,19 +484,23 @@ OfdmDemodResult OfdmDemodulator::demodulate(
         for (int i = 0; i < n_used; i++)
             used_carriers_buf[i] = fft_buf[config_.used_carrier_bins[i]];
 
-        // Weighted phase estimate using ALL used carriers as BPSK references.
-        // After MMSE equalization, each carrier should be near ±1. The phase
-        // error is: angle(eq * conj(nearest_BPSK)). For BPSK, nearest is
-        // sign(real(eq)), so ref = sign(real(eq/H)) * |H|.
+        // Phase estimate using PILOT carriers only (known reference values).
+        // Data carriers have unknown modulated phases from DFT-spreading that
+        // corrupt the weighted average, especially when the true offset is
+        // large (>20° from residual CFO). Pilot carriers have known phase
+        // so arg(Y_pilot * conj(H)) gives the true common phase offset.
         float cal_num = 0.0f, cal_den = 0.0f;
-        for (int i = 0; i < n_used; i++) {
+        for (int i = 0; i < n_used; i += config_.pilot_carrier_spacing) {
             std::complex<float> H = channel_est_.H[i];
             float H_mag2 = std::norm(H);
-            if (H_mag2 < 1e-12f) continue;
-            // Phase difference between received and expected (via H)
+            float nv = (i < (int)channel_est_.noise_var.size())
+                       ? channel_est_.noise_var[i] : 1e-6f;
+            if (nv < 1e-12f) nv = 1e-12f;
+            float w = H_mag2 / nv;
+            if (w < 1e-6f) continue;
             float phase = std::arg(used_carriers_buf[i] * std::conj(H));
-            cal_num += H_mag2 * phase;
-            cal_den += H_mag2;
+            cal_num += w * phase;
+            cal_den += w;
         }
         if (cal_den > 0.0f) {
             float cal_phase = cal_num / cal_den;
@@ -525,7 +530,7 @@ OfdmDemodResult OfdmDemodulator::demodulate(
             std::copy(pilot_body, pilot_body + nfft, fft_buf.data());
             fft_complex(fft_buf.data(), nfft);
 
-            // Block pilot CPE: weighted-average phase of all carriers (no PLL)
+            // Block pilot CPE: SNR-weighted phase of all carriers
             {
                 float bp_phase_sum = 0.0f;
                 float bp_weight_sum = 0.0f;
@@ -534,15 +539,35 @@ OfdmDemodResult OfdmDemodulator::demodulate(
                     std::complex<float> Y_bp = fft_buf[bin];
                     std::complex<float> H = channel_est_.H[i];
                     float Hm2 = std::norm(H);
-                    if (Hm2 < 1e-12f) continue;
+                    float nv = (i < (int)channel_est_.noise_var.size())
+                               ? channel_est_.noise_var[i] : 1e-6f;
+                    if (nv < 1e-12f) nv = 1e-12f;
+                    float w = Hm2 / nv;
+                    if (w < 1e-6f) continue;
                     float phase_err = std::arg(Y_bp * std::conj(H));
-                    bp_phase_sum += Hm2 * phase_err;
-                    bp_weight_sum += Hm2;
+                    bp_phase_sum += w * phase_err;
+                    bp_weight_sum += w;
                 }
                 if (bp_weight_sum > 0.0f) {
                     float bp_cpe = bp_phase_sum / bp_weight_sum;
-                    IRIS_LOG("[OFDM-RX] block pilot CPE: %.2f deg",
+                    IRIS_LOG("[OFDM-RX] block pilot CPE: %.2f deg (applied)",
                              bp_cpe * 180.0f / (float)M_PI);
+
+                    // Apply block pilot CPE to channel estimate
+                    std::complex<float> bp_rot(std::cos(bp_cpe), std::sin(bp_cpe));
+                    for (auto& h : channel_est_.H)
+                        h *= bp_rot;
+
+                    // Update PLL tracker with high-quality block pilot observation
+                    float bp_total = phase_pred + bp_cpe;
+                    if (data_sym_count > 0) {
+                        float measured_slope = bp_total - last_total;
+                        while (measured_slope > (float)M_PI) measured_slope -= 2.0f * (float)M_PI;
+                        while (measured_slope < -(float)M_PI) measured_slope += 2.0f * (float)M_PI;
+                        freq_pred = 0.7f * freq_pred + 0.3f * measured_slope;
+                    }
+                    last_total = bp_total;
+                    phase_pred = bp_total + freq_pred;
                 }
             }
 
@@ -615,7 +640,10 @@ OfdmDemodResult OfdmDemodulator::demodulate(
             std::copy(pr_body, pr_body + nfft, fft_buf.data());
             fft_complex(fft_buf.data(), nfft);
 
-            // Pilot row CPE: weighted-average phase of all carriers (no PLL)
+            // Pilot row CPE: SNR-weighted phase of all carriers.
+            // Weight by |H|²/noise_var (= SNR) instead of |H|² alone.
+            // FM discriminator noise is f²-shaped, so high-frequency carriers
+            // have poor SNR even with large |H|. SNR weighting excludes them.
             {
                 float pr_phase_sum = 0.0f;
                 float pr_weight_sum = 0.0f;
@@ -624,16 +652,41 @@ OfdmDemodResult OfdmDemodulator::demodulate(
                     std::complex<float> Y_pr = fft_buf[bin];
                     std::complex<float> H = channel_est_.H[i];
                     float Hm2 = std::norm(H);
-                    if (Hm2 < 1e-12f) continue;
+                    float nv = (i < (int)channel_est_.noise_var.size())
+                               ? channel_est_.noise_var[i] : 1e-6f;
+                    if (nv < 1e-12f) nv = 1e-12f;
+                    float w = Hm2 / nv;  // SNR-based weight
+                    if (w < 1e-6f) continue;
                     float phase_err = std::arg(Y_pr * std::conj(H));
-                    pr_phase_sum += Hm2 * phase_err;
-                    pr_weight_sum += Hm2;
+                    pr_phase_sum += w * phase_err;
+                    pr_weight_sum += w;
                 }
                 if (pr_weight_sum > 0.0f) {
                     float pr_cpe = pr_phase_sum / pr_weight_sum;
-                    IRIS_LOG("[OFDM-RX] pilot row %d: cpe=%.2f deg",
+                    IRIS_LOG("[OFDM-RX] pilot row %d: cpe=%.2f deg (applied)",
                              data_sym_count / config_.pilot_row_spacing,
                              pr_cpe * 180.0f / (float)M_PI);
+
+                    // Apply dense pilot row CPE to channel estimate (80 carriers
+                    // vs 13 comb pilots — 6x more phase information, ~2.5x lower
+                    // estimation noise). Rotates H so subsequent data symbols see
+                    // corrected phase reference.
+                    std::complex<float> pr_rot(std::cos(pr_cpe), std::sin(pr_cpe));
+                    for (auto& h : channel_est_.H)
+                        h *= pr_rot;
+
+                    // Update PLL tracker with high-quality pilot row observation
+                    float pr_total = phase_pred + pr_cpe;
+                    if (data_sym_count > 0) {
+                        float measured_slope = pr_total - last_total;
+                        while (measured_slope > (float)M_PI) measured_slope -= 2.0f * (float)M_PI;
+                        while (measured_slope < -(float)M_PI) measured_slope += 2.0f * (float)M_PI;
+                        freq_pred = 0.7f * freq_pred + 0.3f * measured_slope;
+                    }
+                    last_total = pr_total;
+                    phase_pred = pr_total + freq_pred;
+
+
                 }
             }
 
@@ -691,8 +744,10 @@ OfdmDemodResult OfdmDemodulator::demodulate(
                 used_carriers_buf[i] *= pred_rot;
         }
 
-        // Per-symbol CPE: weighted-average phase of comb pilots.
+        // Per-symbol CPE: SNR-weighted phase of comb pilots.
         // Measures residual phase after PLL prediction pre-correction.
+        // SNR weighting (|H|²/noise_var) naturally excludes pilots on
+        // deep-nulled carriers where FM f²-noise dominates.
         {
             float cpe_num = 0.0f;
             float cpe_den = 0.0f;
@@ -700,10 +755,14 @@ OfdmDemodResult OfdmDemodulator::demodulate(
                 std::complex<float> Y_pilot = used_carriers_buf[i];
                 std::complex<float> H = channel_est_.H[i];
                 float H_mag2 = std::norm(H);
-                if (H_mag2 < 1e-12f) continue;
+                float nv = (i < (int)channel_est_.noise_var.size())
+                           ? channel_est_.noise_var[i] : 1e-6f;
+                if (nv < 1e-12f) nv = 1e-12f;
+                float w = H_mag2 / nv;
+                if (w < 1e-6f) continue;
                 float phase_diff = std::arg(Y_pilot * std::conj(H));
-                cpe_num += H_mag2 * phase_diff;
-                cpe_den += H_mag2;
+                cpe_num += w * phase_diff;
+                cpe_den += w;
             }
             if (cpe_den > 0.0f) {
                 cpe_phase = cpe_num / cpe_den;  // independent per-symbol residual
@@ -852,22 +911,24 @@ OfdmDemodResult OfdmDemodulator::demodulate(
 
         // Phase tracker update: accumulate total phase and update frequency estimate.
         // Total phase = prediction + pilot residual + DD refinement.
+        // DD-CPE is included in PLL state: for BPSK/QPSK, hard decisions are
+        // reliable and provide extra phase information that speeds PLL convergence.
+        // For 16QAM, DD-CPE is clamped to ±5° (limiting damage from bad decisions).
+        // DD-CPE is disabled entirely for 64QAM+ (line above).
         {
             cpe_total = sym_prediction + cpe_phase + dd_correction_applied;
             cpe_history.push_back(cpe_total);
 
             if (data_sym_count > 0) {
-                // Update frequency estimate: IIR blend of current slope measurement
-                // with running estimate. Low beta (0.1) prevents noise amplification
-                // while still tracking ~1 Hz CFO drift over ~80 symbols.
                 float measured_slope = cpe_total - last_total;
-                // Unwrap: if slope jumps >pi, it wrapped around
                 while (measured_slope > (float)M_PI) measured_slope -= 2.0f * (float)M_PI;
                 while (measured_slope < -(float)M_PI) measured_slope += 2.0f * (float)M_PI;
-                freq_pred = 0.9f * freq_pred + 0.1f * measured_slope;
+                float pll_alpha = 0.25f;
+                if (std::abs(cpe_phase) > 0.15f)  // >8.6° residual
+                    pll_alpha = 0.45f;
+                freq_pred = (1.0f - pll_alpha) * freq_pred + pll_alpha * measured_slope;
             }
             last_total = cpe_total;
-            // Predict next symbol's phase
             phase_pred = cpe_total + freq_pred;
         }
 

@@ -530,7 +530,7 @@ static void test_ofdm_phy_roundtrip() {
     pb.center_hz = 1650.0f;
     pb.bandwidth_hz = 2700.0f;
     pb.valid = true;
-    OfdmConfig cfg = ofdm_config_from_probe(pb, 512, 32, 6, 24);
+    OfdmConfig cfg = ofdm_config_from_probe(pb, 512, 128, 6, 24);
 
     printf("  Config: nfft=%d cp=%d, %d used, %d data, %d pilot carriers\n",
            cfg.nfft, cfg.cp_samples, cfg.n_used_carriers,
@@ -772,7 +772,7 @@ static void test_ofdm_multi_codeword() {
     pb.center_hz = 1650.0f;
     pb.bandwidth_hz = 2700.0f;
     pb.valid = true;
-    OfdmConfig cfg = ofdm_config_from_probe(pb, 512, 32, 6, 24);
+    OfdmConfig cfg = ofdm_config_from_probe(pb, 512, 128, 6, 24);
 
     OfdmModulator mod(cfg);
     ToneMap tm = get_uniform_tone_map(2, cfg);  // QPSK r1/2
@@ -830,7 +830,7 @@ static void test_ofdm_speed_levels() {
     pb.center_hz = 1650.0f;
     pb.bandwidth_hz = 2700.0f;
     pb.valid = true;
-    OfdmConfig cfg = ofdm_config_from_probe(pb, 512, 32, 6, 24);
+    OfdmConfig cfg = ofdm_config_from_probe(pb, 512, 128, 6, 24);
 
     uint8_t payload[32];
     for (int i = 0; i < 32; i++) payload[i] = (uint8_t)(i * 37 + 13);
@@ -911,6 +911,41 @@ static void test_ofdm_speed_levels() {
         snprintf(label, sizeof(label), "%s: FM", lv.name);
         bool match = try_decode(fm_audio, tm, label);
         check(label, match);
+    }
+
+    // --- Phase 3a: FM channel + 5 Hz CFO on ENTIRE frame (realistic OTA) ---
+    // Realistic scenario: preamble also sees CFO, Schmidl-Cox corrects most of it.
+    // Tests whether residual CFO after preamble correction is handled.
+    printf("\n  --- FM + 5 Hz CFO (whole frame, realistic) ---\n");
+    for (auto& lv : levels) {
+        if (lv.preset > 5) continue;  // skip 64QAM+
+        ToneMap tm = get_uniform_tone_map(lv.preset, cfg);
+        OfdmModulator mod(cfg);
+        auto iq = mod.build_ofdm_frame(payload, 32, tm, lv.fec);
+        if (iq.empty()) continue;
+
+        // Apply 5 Hz CFO to entire frame (preamble + data)
+        float cfo_hz = 5.0f;
+        for (size_t i = 0; i < iq.size(); i++) {
+            float t = (float)i;
+            float phase = 2.0f * (float)M_PI * cfo_hz * t / 48000.0f;
+            std::complex<float> rot(std::cos(phase), std::sin(phase));
+            iq[i] *= rot;
+        }
+
+        std::vector<float> fm_audio(iq.size());
+        for (size_t i = 0; i < iq.size(); i++)
+            fm_audio[i] = iq[i].real();
+        fm_channel_process(fm_audio.data(), (int)fm_audio.size(), 0.50f, 0.0f);
+
+        char label2[80];
+        snprintf(label2, sizeof(label2), "%s: FM+5Hz-full", lv.name);
+        bool match2 = try_decode(fm_audio, tm, label2);
+        // 16QAM+ with 5 Hz CFO requires proper preamble CFO correction
+        // (Phase 2: Hilbert transform for complex-baseband Schmidl-Cox).
+        // For now, only require BPSK/QPSK to pass with 5 Hz CFO.
+        if (lv.preset <= 3)  // O0-O2: BPSK, QPSK r1/2, QPSK r3/4
+            check(label2, match2);
     }
 
 }
@@ -2516,7 +2551,7 @@ int run_benchmark() {
     pb.center_hz = 1650.0f;
     pb.bandwidth_hz = 2700.0f;
     pb.valid = true;
-    OfdmConfig cfg = ofdm_config_from_probe(pb, 512, 32, 6, 24);
+    OfdmConfig cfg = ofdm_config_from_probe(pb, 512, 128, 6, 24);
 
     printf("OFDM: NFFT=%d, CP=%d, %d used carriers (%d data, %d pilot), spacing=%.1f Hz\n",
            cfg.nfft, cfg.cp_samples, cfg.n_used_carriers, cfg.n_data_carriers,

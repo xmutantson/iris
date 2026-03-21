@@ -192,7 +192,6 @@ IrisConfig load_config(const std::string& path) {
 
     cfg.ofdm_enable = ini.get_bool("OFDM", "Enable", cfg.ofdm_enable);
     cfg.ofdm_nfft = ini.get_int("OFDM", "NFFT", cfg.ofdm_nfft);
-    cfg.ofdm_cp_samples = ini.get_int("OFDM", "CpSamples", cfg.ofdm_cp_samples);
     cfg.ofdm_auto_spacing = ini.get_bool("OFDM", "AutoSpacing", cfg.ofdm_auto_spacing);
     cfg.ofdm_waterfill = ini.get_bool("OFDM", "Waterfill", cfg.ofdm_waterfill);
     cfg.ofdm_nuc = ini.get_bool("OFDM", "NUC", cfg.ofdm_nuc);
@@ -263,7 +262,6 @@ bool save_config(const std::string& path, const IrisConfig& cfg) {
 
     ini.set_bool("OFDM", "Enable", cfg.ofdm_enable);
     ini.set_int("OFDM", "NFFT", cfg.ofdm_nfft);
-    ini.set_int("OFDM", "CpSamples", cfg.ofdm_cp_samples);
     ini.set_bool("OFDM", "AutoSpacing", cfg.ofdm_auto_spacing);
     ini.set_bool("OFDM", "Waterfill", cfg.ofdm_waterfill);
     ini.set_bool("OFDM", "NUC", cfg.ofdm_nuc);

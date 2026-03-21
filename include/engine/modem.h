@@ -61,17 +61,17 @@ enum class CalState {
     DONE,
 };
 
-// Auto-tune state machine (bilateral native-frame gain calibration)
+// Auto-tune state machine (bilateral gain calibration, half-duplex safe)
 // Initiator: SEND_START → TX_TEST → WAIT_PEER → SEND_REPORT → WAIT_REPORT → APPLY → DONE
-// Responder: WAIT_PEER → SEND_REPORT_AND_TEST → WAIT_REPORT → APPLY → DONE
+// Responder: WAIT_PEER → SEND_START → TX_TEST → SEND_REPORT → WAIT_REPORT → APPLY → DONE
+// Reports are sent AFTER all TX is complete — both sides are listening when reports arrive.
 enum class TuneState {
     IDLE,
-    SEND_START,         // Queue TUNE:START, wait for TX drain
-    TX_TEST,            // Transmit native test frame
-    WAIT_PEER,          // Wait to decode peer's native test frame
-    SEND_REPORT,        // Send TUNE:REPORT with our measurement
-    SEND_REPORT_AND_TEST, // Responder: send report + our test frame
-    WAIT_REPORT,        // Wait for peer's TUNE:REPORT
+    SEND_START,         // Queue TUNE:START (or test frames), wait for TX drain
+    TX_TEST,            // Transmit test frame(s)
+    WAIT_PEER,          // Wait to decode peer's test frame(s)
+    SEND_REPORT,        // Send measurement report
+    WAIT_REPORT,        // Wait for peer's report
     APPLY,              // Apply gain corrections
     DONE,
 };
@@ -416,9 +416,9 @@ private:
 
     // Adaptive batch airtime: grows on successful ACKs, shrinks on REJ/loss.
     // TCP-style AIMD: additive increase (+1s per RR), multiplicative decrease (halve on REJ).
-    float batch_airtime_s_ = 3.0f;               // Current batch cap (seconds)
-    static constexpr float BATCH_AIRTIME_MIN = 3.0f;
-    static constexpr float BATCH_AIRTIME_MAX = 9.0f;
+    float batch_airtime_s_ = 6.0f;               // Current batch cap (seconds)
+    static constexpr float BATCH_AIRTIME_MIN = 6.0f;   // Enough for 3-4 OFDM frames at O0
+    static constexpr float BATCH_AIRTIME_MAX = 12.0f;  // Up to 7-8 frames at O0
 
     // TX-without-ACK counter: tracks consecutive native TX frames with no RR/REJ.
     // If we TX 3+ frames without any peer acknowledgment, downshift — the peer

@@ -8,6 +8,7 @@
 #include "engine/speed_level.h"
 #include "common/logging.h"
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <csignal>
 #include <ctime>
@@ -77,6 +78,21 @@ static std::atomic<bool> g_restart{false};
 static void signal_handler(int) {
     g_running = false;
 }
+
+// Ensure rigctld is killed on any exit path (including red X on Windows)
+static void exit_cleanup() {
+    rigctld_shutdown();
+}
+
+#ifdef _WIN32
+static BOOL WINAPI console_ctrl_handler(DWORD event) {
+    // CTRL_CLOSE_EVENT is sent when user clicks the red X on the console window.
+    // Windows gives us ~5 seconds to clean up before force-killing the process.
+    rigctld_shutdown();
+    g_running = false;
+    return TRUE;
+}
+#endif
 
 static Modulation parse_modulation(const char* s) {
     if (strcmp(s, "BPSK") == 0)   return Modulation::BPSK;
@@ -455,6 +471,10 @@ int main(int argc, char** argv) {
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
+    std::atexit(exit_cleanup);
+#ifdef _WIN32
+    SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
+#endif
 
     // Initialize modem engine
     Modem modem;

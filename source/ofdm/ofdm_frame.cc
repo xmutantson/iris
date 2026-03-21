@@ -115,7 +115,7 @@ struct UniformPreset {
 };
 
 static const UniformPreset kUniformPresets[] = {
-    { 1, 1, LdpcRate::RATE_1_2 },  // BPSK r1/2
+    { 1, 1, LdpcRate::RATE_1_2 },  // BPSK r1/2 (O0 — max robustness for FM)
     { 2, 2, LdpcRate::RATE_1_2 },  // QPSK r1/2
     { 3, 2, LdpcRate::RATE_3_4 },  // QPSK r3/4
     { 4, 4, LdpcRate::RATE_1_2 },  // 16QAM r1/2

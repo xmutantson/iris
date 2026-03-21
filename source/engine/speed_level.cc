@@ -19,18 +19,20 @@ const SpeedLevel SPEED_LEVELS[NUM_SPEED_LEVELS] = {
 };
 
 // OFDM O-levels: maps 1:1 to uniform tone map presets (preset_id = level + 1).
-// SNR thresholds raised for FM (deviation limiter distortion ≠ AWGN).
-// Gearshift adds 1 dB margin on top of these values.
+// SNR thresholds for FM OFDM. Gearshift adds 1 dB margin on top.
+// O0 uses r3/4 (not r1/2) — if the channel can't handle r3/4 BPSK,
+// it can't handle OFDM at all. r1/2 wastes 50% on parity for marginal
+// gain on an FM channel where SNR is typically 5-15 dB.
 const SpeedLevel OFDM_SPEED_LEVELS[NUM_OFDM_SPEED_LEVELS] = {
     // name   mod                num den  min_snr  net_bits/baud
-    {"O0",  Modulation::BPSK,    1, 2,   0.0f,  0},   // BPSK r1/2 — most robust
-    {"O1",  Modulation::QPSK,    1, 2,   6.0f,  0},   // QPSK r1/2 (raised: FM distortion ≠ AWGN)
-    {"O2",  Modulation::QPSK,    3, 4,   8.0f,  0},   // QPSK r3/4
-    {"O3",  Modulation::QAM16,   1, 2,  12.0f,  0},   // 16QAM r1/2
-    {"O4",  Modulation::QAM16,   3, 4,  16.0f,  0},   // 16QAM r3/4
-    {"O5",  Modulation::QAM64,   3, 4,  20.0f,  0},   // 64QAM r3/4
-    {"O6",  Modulation::QAM64,   7, 8,  24.0f,  0},   // 64QAM r7/8
-    {"O7",  Modulation::QAM256,  7, 8,  28.0f,  0},   // 256QAM r7/8 — data port only
+    {"O0",  Modulation::BPSK,    1, 2,   0.0f,  0},   // BPSK r1/2 — max robustness for FM
+    {"O1",  Modulation::QPSK,    1, 2,   6.0f,  0},   // QPSK r1/2
+    {"O2",  Modulation::QPSK,    3, 4,  10.0f,  0},   // QPSK r3/4
+    {"O3",  Modulation::QAM16,   1, 2,  14.0f,  0},   // 16QAM r1/2
+    {"O4",  Modulation::QAM16,   3, 4,  18.0f,  0},   // 16QAM r3/4
+    {"O5",  Modulation::QAM64,   3, 4,  22.0f,  0},   // 64QAM r3/4
+    {"O6",  Modulation::QAM64,   7, 8,  26.0f,  0},   // 64QAM r7/8
+    {"O7",  Modulation::QAM256,  7, 8,  30.0f,  0},   // 256QAM r7/8 — data port only
 };
 
 int ofdm_snr_to_speed_level(float snr_db) {

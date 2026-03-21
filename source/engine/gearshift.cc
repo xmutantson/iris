@@ -132,7 +132,7 @@ int Gearshift::ofdm_update(float snr_db) {
 
     if (target > ofdm_level_ && cooldown_ == 0 && !ldpc_hard_gate_) {
         hold_count_++;
-        if (hold_count_ >= HOLD_FRAMES) {
+        if (hold_count_ >= OFDM_HOLD_FRAMES) {
             int old = ofdm_level_;
             ofdm_level_++;
             hold_count_ = 0;

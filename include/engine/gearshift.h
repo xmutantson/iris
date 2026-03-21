@@ -71,7 +71,8 @@ private:
     float ldpc_boost_;     // SNR bonus from easy LDPC convergence
     int cooldown_;         // Frames to suppress upshift after failure-driven downshift
     bool ldpc_hard_gate_ = false;  // True when worst LDPC iters > 30 — blocks upshift
-    static constexpr int HOLD_FRAMES = 6;    // Hold this many frames before upshift (conservative for FM)
+    static constexpr int HOLD_FRAMES = 3;    // Hold this many frames before upshift (Mode A)
+    static constexpr int OFDM_HOLD_FRAMES = 5; // More conservative for OFDM upshift (FM phase noise)
     static constexpr int FAIL_THRESHOLD = 2;  // Downshift after this many failures
     static constexpr int COOLDOWN_FRAMES = 8; // Suppress upshift after failure downshift
     static constexpr float SNR_ALPHA = 0.3f;  // Smoothing factor

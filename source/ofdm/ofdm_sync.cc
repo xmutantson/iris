@@ -312,16 +312,37 @@ OfdmSyncResult ofdm_detect_frame(const std::complex<float>* iq, int n_samples,
             fft_complex(Y2_buf.data(), nfft);
 
             // --- Frequency-domain ZC quality metric ---
-            // Correlate received spectrum with RAW ZC sequence (no de-emphasis).
-            // Average Y1 and Y2 for better SNR (both are the same ZC, just
-            // phase-rotated by CFO — averaging their magnitudes is safe for
-            // a quality metric since we only need |correlation|).
+            // Correlate received spectrum with de-emphasized ZC — what was
+            // actually transmitted.  Previous code used raw ZC (|ZC[k]|=1) but
+            // TX applies de-emphasis gains g[k] (0.62→0.10 across band).  The
+            // Cauchy-Schwarz metric requires Y[k] ∝ ref[k] at every carrier;
+            // without g[k] in the reference, the 6:1 magnitude variation from
+            // de-emphasis collapses the metric to 0.12-0.35 on flat-port radios.
             static std::vector<std::complex<float>> zc_freq_cache;
+            static float zc_ref_energy_cache = 0.0f;
             static int cached_zc_n_used = 0;
+            static float cached_corner_hz = 0.0f;
             const int n_used = config.n_used_carriers;
-            if (cached_zc_n_used != n_used) {
-                zc_freq_cache = generate_zc_sequence(7, n_used);
+            if (cached_zc_n_used != n_used ||
+                cached_corner_hz != config.fm_preemph_corner_hz) {
+                auto zc_raw = generate_zc_sequence(7, n_used);
+                zc_freq_cache.resize(n_used);
+                zc_ref_energy_cache = 0.0f;
+                for (int i = 0; i < n_used; ++i) {
+                    int bin = config.used_carrier_bins[i];
+                    float g = 1.0f;
+                    if (config.fm_preemph_corner_hz > 0.0f) {
+                        float fhz = (float)bin * (float)config.sample_rate / (float)config.nfft;
+                        g = 1.0f / std::sqrt(1.0f + (fhz / config.fm_preemph_corner_hz)
+                                                   * (fhz / config.fm_preemph_corner_hz));
+                        if (g < 1.0f / config.fm_preemph_gain_cap)
+                            g = 1.0f / config.fm_preemph_gain_cap;
+                    }
+                    zc_freq_cache[i] = zc_raw[i] * g;
+                    zc_ref_energy_cache += g * g;  // |ZC[k]|²=1, so |ref[k]|²=g²
+                }
                 cached_zc_n_used = n_used;
+                cached_corner_hz = config.fm_preemph_corner_hz;
             }
 
             std::complex<float> fd_corr(0.0f, 0.0f);
@@ -332,17 +353,16 @@ OfdmSyncResult ofdm_detect_frame(const std::complex<float>* iq, int n_samples,
                 fd_corr += Y1_buf[bin] * std::conj(zc_freq_cache[i]);
                 y_energy += std::norm(Y1_buf[bin]);
             }
-            float zc_ref_energy = (float)n_used;  // |ZC[k]|=1 for all k
+            float zc_ref_energy = zc_ref_energy_cache;
             float fd_denom = y_energy * zc_ref_energy;
             best_zc_metric = (fd_denom > 1e-20f)
                 ? std::sqrt(std::norm(fd_corr) / fd_denom) : 0.0f;
 
             // --- ZC quality gate ---
-            // FD-ZC metric is robust to spectral tilt and FM nonlinearity.
-            // OTA measurements (IC-705/FT-510): genuine frames FD-ZC ≥ 0.45,
-            // FM noise false triggers FD-ZC 0.20-0.37.  Threshold 0.40 eliminates
-            // all observed false triggers while preserving all genuine frames.
-            const float fd_zc_threshold = 0.40f;
+            // With de-emphasis-matched reference, genuine frames should yield
+            // FD-ZC ≥ 0.50 (limited by FM deviation limiter nonlinearity and
+            // channel flatness).  Threshold 0.40 rejects noise false triggers.
+            const float fd_zc_threshold = config.fd_zc_threshold;
             if (best_zc_metric < fd_zc_threshold) {
                 IRIS_LOG("[OFDM-SYNC] SC passed (%.3f) but FD-ZC too low (%.3f < %.2f, td=%.3f, n_used=%d) — rejected",
                          peak_metric, best_zc_metric, fd_zc_threshold, best_zc_td, n_used);
@@ -442,8 +462,8 @@ void ofdm_correct_cfo(std::complex<float>* iq, int n_samples,
     for (int n = 0; n < n_samples; ++n) {
         iq[n] *= phasor;
         phasor *= rot;
-        // Renormalize every 1024 samples to prevent magnitude drift
-        if ((n & 0x3FF) == 0x3FF) {
+        // Renormalize every 512 samples to prevent magnitude drift
+        if ((n & 0x1FF) == 0x1FF) {
             float mag = std::abs(phasor);
             if (mag > 0.0f) phasor /= mag;
         }
