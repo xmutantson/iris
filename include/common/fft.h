@@ -6,11 +6,10 @@
 
 namespace iris {
 
-// Forward FFT (DFT). In-place, radix-2 Cooley-Tukey, requires power-of-2 n.
+// Forward FFT (DFT). In-place via pocketfft. Supports arbitrary sizes.
 void fft(float* re, float* im, int n);
 
-// Inverse FFT (IDFT). In-place, same requirements.
-// Implementation: conjugate inputs, FFT, conjugate outputs, divide by n.
+// Inverse FFT (IDFT). In-place via pocketfft. Supports arbitrary sizes.
 void ifft(float* re, float* im, int n);
 
 // Complex interleaved version of forward FFT.

@@ -524,7 +524,7 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     // samples can be corrupted and the threshold stays correct.  The old
     // RMS-based blanker inflated its threshold when impulse bursts raised
     // RMS, letting subsequent impulses through.
-    // Window ~11 samples (~half a symbol at SPS=23), threshold 3×MAD.
+    // Window ~11 samples, threshold 3×MAD.
     // Soft replacement with local median instead of hard zeroing.
     {
         constexpr int HAMPEL_HALF = 5;   // half-window = 5 → window = 11
@@ -855,18 +855,17 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     }
 
     // ===================================================================
-    // 2-State Kalman Filter with Forward-Backward Smoother
+    // 3-State Kalman Filter with RTS Smoother
     //
-    // Replaces the fixed-gain PLL. Tracks state x = [phase, freq] where
-    // freq is rad/symbol. Optimal adaptive gains via Kalman equations:
+    // Replaces the fixed-gain PLL. Tracks state x = [phase, freq, accel]
+    // where freq is rad/symbol. Optimal adaptive gains via Kalman equations:
     //   - Prediction at every symbol (state transition)
     //   - Measurement update at pilot symbols (known +1 BPSK)
-    //   - No decision-directed updates (avoids random-walk drift)
+    //   - Second pass: DD updates for QAM16+, VV for BPSK
     //
     // Forward-backward combination (Rauch-Tung-Striebel smoother):
     //   - Forward pass: causal Kalman filter
-    //   - Backward pass: anti-causal Kalman filter
-    //   - Smoothed estimate: optimal weighted combination
+    //   - Backward pass: RTS smoother using forward covariances
     //
     // This is mathematically equivalent to Wiener-optimal interpolation
     // between pilots, with adaptive noise tracking.
@@ -1022,11 +1021,10 @@ bool decode_native_frame(const float* iq_samples, size_t count,
                     s.accel += K2 * z;
                     const float max_accel = 1e-4f;
                     s.accel = std::clamp(s.accel, -max_accel, max_accel);
-                    // Joseph form: P = (I-KH)*P*(I-KH)' + K*R*K'
-                    // Guarantees P stays positive semi-definite in float.
-                    // Standard P=(I-KH)*P loses symmetry after many iterations.
-                    // With H=[1,0,0], (I-KH)*P + K*R*K' simplifies to:
-                    // standard update + K[i]*r_meas*K[j] for each element.
+                    // Covariance update: P = (I-KH)*P + K*R*K'
+                    // Standard (I-KH)*P plus K*R*K' stabilization term.
+                    // With H=[1,0,0], simplifies to:
+                    // P[i][j] -= K[i]*P[0][j] and add K[i]*r_meas*K[j].
                     float np00 = s.P00 - K0*s.P00 + K0*r_meas*K0;
                     float np01 = s.P01 - K0*s.P01 + K0*r_meas*K1;
                     float np02 = s.P02 - K0*s.P02 + K0*r_meas*K2;
@@ -1139,7 +1137,7 @@ bool decode_native_frame(const float* iq_samples, size_t count,
     }
 
     // --- Feedforward phase re-estimation (second pass) ---
-    // Viterbi-Viterbi M-th power for BPSK/QPSK: raises symbols to M-th
+    // Viterbi-Viterbi M-th power for BPSK: raises symbols to M-th
     // power to strip data modulation blindly, then sliding-window averages
     // to extract carrier phase.  No feedback, no circularity — the phase
     // estimate cannot be poisoned by wrong symbol decisions.

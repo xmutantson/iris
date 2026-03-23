@@ -32,9 +32,9 @@ uint32_t crc32(const uint8_t* data, size_t len);
 // Frame structure:
 //   [Preamble: 63-symbol m-sequence (BPSK)]
 //   [Sync word: 16-symbol Barker-like (BPSK)]
-//   [Header: 32 bits BPSK — modulation, payload_len, fec_rate, header_crc8]
+//   [Header: 32 bits BPSK — modulation, payload_len, fec_rate(4b), reserved(4b), header_crc8]
 //   [Payload: N symbols at configured modulation, LDPC-protected]
-//     For 16QAM and above: known BPSK pilot inserted every PILOT_SPACING symbols
+//     Known BPSK pilots inserted every PILOT_SPACING symbols (QAM16+ always, BPSK/QPSK on long frames)
 //   [CRC-32: 32 bits appended to payload before FEC encoding]
 
 // Mid-frame pilot spacing (symbols between pilots, 0 = disabled)
@@ -54,7 +54,7 @@ inline int pilot_spacing_for(int mod_int) {
 }
 
 // Legacy constant for backward reference
-constexpr int PILOT_SPACING = 16;  // default (tightest)
+constexpr int PILOT_SPACING = 16;  // default (widest; PILOT_SPACING_LOW=8 is tighter)
 
 // Tail pilots: known +1 BPSK symbols appended after the last data symbol.
 // These give the RTS backward smoother measurement data at the frame tail,
@@ -70,7 +70,7 @@ std::vector<std::complex<float>> generate_preamble();
 std::vector<std::complex<float>> generate_sync_word();
 
 // Header: encodes modulation type, payload byte count, and FEC rate
-// Format: [4 bits modulation][12 bits payload_len][2 bits fec_rate][6 bits reserved][8 bits CRC-8]
+// Format: [4 bits modulation][12 bits payload_len][4 bits fec_rate][4 bits reserved][8 bits CRC-8]
 std::vector<uint8_t> encode_header(Modulation mod, uint16_t payload_len, LdpcRate fec = LdpcRate::NONE, bool harq_flag = false);
 bool decode_header(const std::vector<uint8_t>& bits, Modulation& mod, uint16_t& payload_len, LdpcRate& fec, bool& harq_flag);
 

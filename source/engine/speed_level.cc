@@ -5,7 +5,7 @@ namespace iris {
 // Net bits per baud = bits_per_symbol * fec_rate
 // E.g., QPSK 3/4 = 2 * 3/4 = 1.5 bits per baud
 // SNR thresholds calibrated for LDPC-coded performance (not uncoded AWGN).
-// Gearshift adds 2 dB margin on top of these values.
+// Gearshift adds 1 dB margin on top of these values.
 const SpeedLevel SPEED_LEVELS[NUM_SPEED_LEVELS] = {
     // name       mod              num den  min_snr  net_bits/baud
     {"A0",  Modulation::BPSK,    1, 2,   0.0f,  0},   // BPSK 1/2
@@ -20,9 +20,8 @@ const SpeedLevel SPEED_LEVELS[NUM_SPEED_LEVELS] = {
 
 // OFDM O-levels: maps 1:1 to uniform tone map presets (preset_id = level + 1).
 // SNR thresholds for FM OFDM. Gearshift adds 1 dB margin on top.
-// O0 uses r3/4 (not r1/2) — if the channel can't handle r3/4 BPSK,
-// it can't handle OFDM at all. r1/2 wastes 50% on parity for marginal
-// gain on an FM channel where SNR is typically 5-15 dB.
+// O0 uses r1/2 — maximum coding gain for weakest OFDM signals.
+// If the channel can't handle BPSK r1/2, it can't handle OFDM at all.
 // Monotonically increasing net bits/carrier:
 // O0=0.5, O1=1.0, O2=1.5, O3=2.0, O4=2.5, O5=3.0, O6=3.75, O7=4.5, O8=5.0, O9=6.0
 // Dropped 64QAM r1/2 (= 16QAM r3/4 throughput) and 256QAM r1/2 (< 64QAM r3/4).

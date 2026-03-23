@@ -22,10 +22,10 @@ namespace iris {
 
 // Binary TUNE report: embedded in OFDM ramp frame payload.
 // Format: [0xBB] [count:u8] [entry × count]
-// Entry:  [iters:i8] [H_hi:u8] [H_lo:u8] [snr_i8]
+// Entry:  [index:u8] [iters:i8] [H_hi:u8] [H_lo:u8] [snr_i8]
 //   iters: -2=preamble-only, -1=not measured, 0-50=LDPC iters
 //   H: unsigned 16-bit fixed-point, H * 100 (range 0-655.35)
-//   snr: signed 8-bit, SNR_dB + 30 (range -30 to +95 dB, 0.5 dB res not needed)
+//   snr: signed 8-bit, SNR_dB + 30 (range -30 to +97 dB, 0.5 dB res not needed)
 static std::vector<uint8_t> tune_build_binary_report(
     const int* iters, const float* H, const float* snr, int count) {
     std::vector<uint8_t> buf;
@@ -551,7 +551,7 @@ bool Modem::init(const IrisConfig& config) {
                 xid_peer_call_ = remote;
                 probe_start_pending_ = true;
                 ofdm_kiss_probe_cd_ = 60;  // 3s countdown before tones (3 PROBE:START sends)
-                probe_connect_timeout_ = 700;  // 35s overall timeout (15s initiator + 12s responder captures)
+                probe_connect_timeout_ = 700;  // 35s overall timeout (25s initiator + ~10s responder + analysis)
                 IRIS_LOG("Probe-after-connect: probing %s, I-frames held until done", remote.c_str());
                 if (gui_log_) gui_log_("Probing " + remote + "...");
             }
@@ -891,7 +891,7 @@ void Modem::dispatch_rx_frame(const std::vector<uint8_t>& frame, bool from_fx25,
     // Native data I-frames get a longer holdoff on the responder side:
     // the sender's self-hear guard (300ms) plus FM turnaround (~200ms) means
     // a premature RR arriving within ~500ms of sender's TX end gets discarded.
-    // 1500ms covers the inter-frame gap in a multi-frame burst and ensures
+    // 800ms covers the inter-frame gap in a multi-frame burst and ensures
     // the RR only goes out after the burst is truly done.
     {
         int rx_holdoff;
@@ -1224,8 +1224,8 @@ void Modem::process_rx_native(const float* audio, int count) {
         }
 
         // OFDM bypasses the probe-based channel EQ entirely. The 127-tap FIR
-        // has a 63-sample impulse response that exceeds the OFDM CP (16 samples),
-        // causing catastrophic ISI. OFDM handles per-carrier equalization
+        // has a 63-sample group delay that can exceed the OFDM CP (64 samples
+        // default), risking ISI. OFDM handles per-carrier equalization
         // internally via training symbols and block pilots.
         ofdm_rx_audio_buf_.insert(ofdm_rx_audio_buf_.end(),
                                    audio, audio + count);
@@ -1300,9 +1300,8 @@ void Modem::process_rx_native(const float* audio, int count) {
             sync = ofdm_pending_sync_;
         } else {
             // Lower FD-ZC threshold during TUNE to detect weak ramp frames.
-            // FD-ZC threshold: 0.40 for data, 0.15 during TUNE.
-            // With de-emphasis-matched ZC reference, genuine data frames should
-            // FD-ZC gate: CRC-8 sync word is the real false-positive filter.
+            // FD-ZC threshold: 0.30 for data, 0.15 during TUNE.
+            // CRC-8 sync word is the real false-positive filter.
             // During TUNE, extreme TX levels degrade ZC further — use 0.15.
             // Normal operation: 0.30 catches obvious noise without rejecting
             // genuine frames (OTA scores 0.43-0.49 on FM).
@@ -1421,7 +1420,7 @@ void Modem::process_rx_native(const float* audio, int count) {
 
         // ---- OFDM Chase combining ----
         // Guard: flush stored LLRs if this frame looks like a false trigger.
-        // FD-ZC gate (0.40) rejects most false triggers before we get here.
+        // FD-ZC gate (0.30) rejects most false triggers before we get here.
         // This guard catches residual garbage with SNR below decodable range.
         if (!result.success && result.snr_db < 1.0f) {
             if (!ofdm_chase_llrs_.empty()) {
@@ -1924,7 +1923,7 @@ void Modem::process_rx_native(const float* audio, int count) {
             // Successful native RX proves the link is alive.  Reset the no-ack
             // counter so gearshift doesn't penalise us for sending S-frame ACKs
             // that the peer acknowledges implicitly via I-frame N(R) — which the
-            // S-frame–only sniff at line ~832 doesn't catch.
+            // S-frame–only sniff in the rx_holdoff path doesn't catch.
             tx_no_ack_count_ = 0;
             IRIS_LOG("RX native frame %zu bytes at offset %d", payload.size(), start);
 
@@ -2199,7 +2198,7 @@ void Modem::process_rx_native(const float* audio, int count) {
                 if (timeout_samples > max_timeout) timeout_samples = max_timeout;
                 pending_frame_timeout_ = timeout_samples;
             }
-            IRIS_LOG("RX decode: need more data at offset %d (buf=%zu IQ, need ~%zu, timeout=10s)",
+            IRIS_LOG("RX decode: need more data at offset %d (buf=%zu IQ, need ~%zu, timeout=1-7s)",
                      start, rx_overlap_buf_.size() / 2, pending_need_floats_ / 2);
         } else {
             crc_errors_++;
@@ -2485,7 +2484,7 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
             if ((native_mode_ && native_tx_ready_) || native_hail_active || ofdm_kiss_tx_) {
                 // Batch multiple queued frames into one multi-payload frame.
                 // Limit total payload based on speed level to cap air time.
-                // Adaptive: grows from 3s toward 9s on success, halves on REJ.
+                // Adaptive: grows from 6s toward 12s on success, halves on REJ.
                 // PHY bps: use OFDM tone map throughput when OFDM active,
                 // otherwise legacy single-carrier throughput.
                 int phy_bps;
@@ -2526,7 +2525,7 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                 size_t total_bytes = 0;
                 while (!tx_queue_.empty()) {
                     auto& front = tx_queue_.front();
-                    // 3 bytes overhead per sub-frame (2 len + data), plus magic byte
+                    // First sub-frame: 3 bytes (1 magic + 2 len), subsequent: 2 bytes (2 len)
                     size_t overhead = batch.empty() ? 3 : 2;
                     // Always take the first frame (even if oversized) to avoid empty batches
                     if (!batch.empty() && total_bytes + overhead + front.size() > max_batch)
@@ -2762,23 +2761,23 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                     // Bypass upconverter — signal is already at audio frequencies.
                     // Normalize RMS to match native single-carrier level (~0.707).
                     // Without this, OFDM with N carriers is √(2N) louder than native
-                    // (29 carriers → 5.4× → 15 dB overdrive → FM limiter destroys signal).
+                    // (e.g. 42 carriers → 9.2× → 19 dB overdrive → FM limiter destroys signal).
                     // Extract real passband audio from OFDM IFFT
                     tx_buffer_.resize(ofdm_iq.size());
                     for (size_t i = 0; i < ofdm_iq.size(); i++)
                         tx_buffer_[i] = ofdm_iq[i].real();
                     frame_airtime_s = (float)ofdm_iq.size() / (float)config_.sample_rate;
 
-                    // OFDM bypasses probe-based TX EQ. The 127-tap FIR exceeds
-                    // the OFDM CP (16 samples), causing ISI. OFDM handles
-                    // per-carrier equalization via training symbols internally.
+                    // OFDM bypasses probe-based TX EQ. The 127-tap FIR group
+                    // delay can exceed the OFDM CP (64 samples default), risking
+                    // ISI. OFDM handles per-carrier equalization internally.
 
                     // Normalize RMS AFTER EQ to control total power.
                     // Target 0.50 is the "full scale" OFDM output before tx_level
                     // scaling. tx_level (set by TUNE) controls actual drive into FM
                     // transmitter. Default tx_level=0.50 → output RMS≈0.25.
                     // TUNE adjusts tx_level targeting mean|H|≈1.0 at the receiver.
-                    // Normalize DATA portion only — preamble (ZC sequence with
+                    // Normalize DATA portion only — preamble (Schmidl-Cox with
                     // sqrt(2) boost) is scaled separately to preserve correlation.
                     int preamble_samples = 2 * (ofdm_config_.nfft + ofdm_config_.cp_samples);
                     int data_start = std::min(preamble_samples, (int)tx_buffer_.size());
@@ -2794,7 +2793,7 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                     for (int i = data_start; i < (int)tx_buffer_.size(); i++)
                         tx_buffer_[i] *= ofdm_scale;
 
-                    // Scale preamble so its peak fits within ±0.90 (preserves ZC
+                    // Scale preamble so its peak fits within ±0.90 (preserves SC
                     // correlation properties, leaves margin below 0.95 hard clip).
                     constexpr float PREAMBLE_PEAK_LIMIT = 0.90f;
                     float preamble_peak = 0.0f;
@@ -3048,7 +3047,7 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                 IRIS_LOG("[TX-OFDM] pre-delay: %d ms (TXDELAY%s)", ptt_settle_ms,
                          ofdm_txdelay_ms_ > 0 ? ", adaptive" : "");
             } else {
-                ptt_settle_ms = 50;  // native: flag preamble handles the rest
+                ptt_settle_ms = 50;  // native SC / AX.25: preamble handles the rest
             }
             int pre_samples = ptt_settle_ms * config_.sample_rate / 1000;
             if (pre_samples > 0)
@@ -3750,7 +3749,7 @@ void Modem::tick() {
                  dcd_holdoff_.load(), csma_holdoff_.load(), (int)ptt_active_);
     }
 
-    // Probe timeout: if probe doesn't complete in 25s, give up and stay AFSK.
+    // Probe timeout: if probe doesn't complete in 35s, give up and stay AFSK.
     // Connection is already established — just release held I-frames.
     if (probe_connect_timeout_ > 0) {
         probe_connect_timeout_--;
@@ -4086,9 +4085,9 @@ void Modem::tick() {
             // single-carrier when the peer doesn't support OFDM.
             if (config_.ofdm_enable && ofdm_mod_ && (ofdm_kiss_peer_caps_ & CAP_OFDM)) {
                 ofdm_phy_active_ = true;
-                // Limit AX.25 I-frame info to fit multi-codeword OFDM frame.
-                // Total capacity = (k_bytes - 6 overhead) * n_codewords - 16 AX.25 hdr.
-                // At O0 r3/4: (150-6)*2 - 16 = 272 bytes.  At O1 r1/2: (100-6)*2 - 16 = 172.
+                // Limit AX.25 I-frame info to fit OFDM frame capacity.
+                // Capacity = (k_bytes - 6 overhead) * codewords_per_frame - 16 AX.25 hdr.
+                // At O0 BPSK r1/2: (100-6)*2 - 16 = 172 bytes.
                 // Use worst-case (r1/2) so I-frames always fit regardless of speed level.
                 int ofdm_max_info = (LdpcCodec::block_size(LdpcRate::RATE_1_2) / 8 - 6) * 2 - 16;
                 ax25_session_.set_max_info(ofdm_max_info);
@@ -4346,7 +4345,7 @@ ModemDiag Modem::get_diagnostics() const {
 
 void Modem::compute_spectrum(const float* audio, int count) {
     // Downsample 48k→8k then FFT. At 8 kHz, NFFT=512 gives:
-    //   15.6 Hz bins, 256 bins covering 0-4 kHz. DFT is 256×512 = 131k ops.
+    //   15.6 Hz bins, 256 bins covering 0-4 kHz (pocketfft O(N log N)).
     constexpr int DS_RATE = 8000;
     constexpr int NFFT = 512;
 
@@ -4398,9 +4397,9 @@ void Modem::compute_spectrum(const float* audio, int count) {
 //              TX own test frame(s) → sends report → waits for initiator's report → DONE.
 //   Both reports are sent AFTER all TX is complete, avoiding half-duplex collision.
 //
-// The test frames are standard native frames (BPSK, LDPC 1/2) with a known payload.
-// channel_gain from preamble correlation gives the receive amplitude.
-// Each side adjusts TX: tx_level *= (1.0 / peer_measured_gain) to normalize to gain≈1.0.
+// When OFDM is active, test frames are OFDM power-ramp frames (BPSK r1/2) at
+// varying TX levels. Peer measures LDPC quality + |H| for each; parabolic fit
+// finds optimal drive. Legacy native mode uses single-level gain targeting.
 
 void Modem::send_tune_ui(const char* payload) {
     // Caller holds modem_mutex_
@@ -4446,9 +4445,9 @@ void Modem::tune_build_and_queue_test_frame() {
     for (int i = 0; i < tune_test_frames_target_; i++) {
         if (ofdm_phy_active_ && ofdm_mod_) {
             // OFDM power-ramp TUNE: each of the N frames is sent at a different
-            // TX level. Peer measures LDPC quality for
-            // each and reports which one decoded best. This finds the optimal drive
-            // level in a single exchange (3 frames, ~3.4 seconds airtime).
+            // TX level. Peer measures LDPC quality for each and reports which
+            // one decoded best. This finds the optimal drive level in a single
+            // exchange (5 frames via TUNE_RAMP_COUNT).
             // BPSK r1/2 for TUNE: maximum robustness for TX power calibration.
             // Explicit r1/2 overrides the preset's FEC rate.
             ToneMap tune_map = get_uniform_tone_map(1, ofdm_config_);
@@ -4956,7 +4955,7 @@ void Modem::tune_apply_corrections() {
     float old_level = config_.tx_level;
 
     if (native_mode_ || ofdm_kiss_) {
-        // OFDM power-ramp TUNE: peer reported (iters, H) for each of our 3 ramp
+        // OFDM power-ramp TUNE: peer reported (iters, H) for each of our 5 ramp
         // frames at different TX levels. Use parabolic fit to find optimal tx_level.
         //
         // If peer sent RAMP report: fit parabola to find optimal drive level.

@@ -411,8 +411,8 @@ OfdmSyncResult ofdm_detect_frame(const std::complex<float>* iq, int n_samples,
     // CFO sanity check: reject false triggers with implausible CFO.
     // FM radio audio paths introduce real frequency offsets from discriminator
     // tuning error and audio path phase shifts. OTA testing shows 17-25 Hz CFO
-    // is normal between FM stations. Subcarrier spacing is 93.75 Hz, so up to
-    // ±46 Hz (half-spacing) is correctable. Limit at 35 Hz to allow real FM
+    // is normal between FM stations. Subcarrier spacing is 46.875 Hz (NFFT=1024),
+    // so up to ~23 Hz (half-spacing) is correctable. Limit at 35 Hz to allow real FM
     // offsets while rejecting noise triggers.
     constexpr float CFO_MAX_HZ = 35.0f;
     if (std::abs(result.cfo_hz) > CFO_MAX_HZ) {

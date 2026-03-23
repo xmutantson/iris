@@ -1349,9 +1349,4 @@ void Ax25Session::set_max_info(int n) {
     IRIS_LOG("AX25 MAX_INFO set to %d bytes", max_info_);
 }
 
-// ---------------------------------------------------------------------------
-// KISS injection helpers
-// ---------------------------------------------------------------------------
-
-// Find control byte offset in raw AX.25 frame (after address field)
 } // namespace iris

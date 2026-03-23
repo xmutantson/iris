@@ -13,7 +13,7 @@ struct PaprClipResult {
     int n_clipped_samples;  // total across all iterations
 };
 
-// Hilbert PAPR clipper: reduces peak-to-average power ratio of OFDM frame.
+// Clip-and-filter PAPR reducer: reduces peak-to-average power ratio of OFDM frame.
 //
 // Clips time-domain amplitude to target PAPR, then per-symbol bandpass
 // filters to remove out-of-band spectral regrowth. Iterates n_iter times

@@ -26,7 +26,8 @@ struct ToneMap {
 
 // Build a uniform tone map (all data carriers same modulation).
 // Preset IDs: 1=BPSK r1/2, 2=QPSK r1/2, 3=QPSK r3/4, 4=16QAM r1/2,
-//             5=16QAM r3/4, 6=64QAM r3/4, 7=64QAM r7/8, 8=256QAM r7/8
+//   5=16QAM r5/8, 6=16QAM r3/4, 7=64QAM r5/8, 8=64QAM r3/4,
+//   9=256QAM r5/8, 10=256QAM r3/4
 ToneMap make_uniform_tone_map(uint8_t preset_id, int n_data_carriers, int nfft);
 
 // Modulation enum for bits_per_carrier lookup
@@ -72,7 +73,7 @@ private:
     // Returns number of samples clipped.
     int soft_clip(std::vector<std::complex<float>>& samples, float clip_ratio = 3.0f);
 
-    // OFDM header: encode metadata into BPSK bits for 3 header symbols.
+    // OFDM header: encode metadata into BPSK bits (currently disabled, n_header_symbols=0).
     std::vector<uint8_t> encode_ofdm_header(uint8_t tone_map_id, LdpcRate fec,
                                              uint16_t payload_len, int nfft_mode,
                                              bool harq_flag);

@@ -15,11 +15,10 @@ constexpr float RRC_ALPHA = 0.2f;
 constexpr int   RRC_SPAN  = 6;      // symbols each side
 constexpr int   SPS       = 10;     // samples per symbol (at 48kHz)
 
-// Mode A: 2400 baud (48000/20=2400, but we use SPS=10 -> 4800 sym/s)
-// Actually: Mode A = 2400 baud -> SPS = 48000/2400 = 20
-// Mode B: 4800 baud -> SPS = 48000/4800 = 10
-// Mode C: 19200 baud -> SPS = 48000/19200 = 2.5 (need 96kHz or fractional)
-// For simplicity, we'll use a configurable baud rate
+// Mode A: 800 baud default (SPS=60, 960 Hz BW), auto-adjusted by probe discovery.
+// Mode B: 4800 baud (9600 bps QPSK).
+// Mode C: 19200 baud (SDR only).
+// Baud rate is configurable; SPS dynamically computed from sample_rate / baud_rate.
 
 struct PhyConfig {
     int baud_rate;          // Symbol rate in baud
@@ -31,7 +30,7 @@ struct PhyConfig {
 // Predefined modes
 PhyConfig mode_a_config();                      // 800 baud default (SPS=60, 960 Hz BW)
 PhyConfig mode_a_config(float bandwidth_hz);    // baud = BW / (1 + alpha)
-PhyConfig mode_b_config();  // 4800 baud, 9600 port
+PhyConfig mode_b_config();  // 4800 baud, 9600 bps QPSK
 PhyConfig mode_c_config();  // 19200 baud, SDR
 
 class NativeModulator {

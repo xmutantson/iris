@@ -10,8 +10,8 @@ namespace iris {
 // Result of frame detection
 struct OfdmSyncResult {
     bool detected = false;
-    int frame_start = -1;        // Sample offset of first training symbol (after CP)
-    float schmidl_metric = 0;    // Peak metric value [0,1] (ZC cross-correlation peak)
+    int frame_start = -1;        // Sample offset of first training symbol CP start
+    float schmidl_metric = 0;    // Peak metric value [0,1] (Schmidl-Cox autocorrelation)
     float cfo_hz = 0;            // Estimated carrier frequency offset
     float snr_est = 0;           // SNR estimate from training symbols (dB)
     float zc_metric = 0;         // ZC cross-correlation peak [0,1]
@@ -32,7 +32,7 @@ std::vector<std::complex<float>> generate_zc_sequence(int root, int length);
 //   1. Generate ZC sequence of length n_used_carriers
 //   2. Place into correct FFT bins (config.used_carrier_bins)
 //   3. IFFT to get nfft time-domain samples
-//   4. Normalize to unit RMS
+//   4. Scale by nfft to match data symbol amplitude
 // Returns nfft samples WITHOUT cyclic prefix (caller adds CP).
 std::vector<std::complex<float>> generate_zc_training_symbol(const OfdmConfig& config,
                                                               int root = 7);

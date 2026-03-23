@@ -125,8 +125,8 @@ static void print_usage() {
     printf("  --speed-level <n>  Force speed level 0-7 (default: auto)\n");
     printf("  --tx-level <f>     TX level 0.0-1.0 (default: 0.5)\n");
     printf("  --rx-gain <f>      RX gain multiplier (default: 1.0)\n");
-    printf("  --band-low <Hz>    Band low edge (default: 300, must be >254 for CTCSS)\n");
-    printf("  --band-high <Hz>   Band high edge (default: 3500)\n");
+    printf("  --band-low <Hz>    Band low edge (default: 1200, must be >254 for CTCSS)\n");
+    printf("  --band-high <Hz>   Band high edge (default: 2200)\n");
     printf("  --center-freq <Hz> Center frequency (default: auto = midpoint of band)\n");
     printf("\nAudio:\n");
     printf("  --noaudio          Disable audio I/O (for testing)\n");
@@ -145,8 +145,8 @@ static void print_usage() {
     printf("  --rigctl-port <n>  Rigctl port (default: 4532)\n");
     printf("  --serial <port>    Serial port for PTT\n");
     printf("  --serial-baud <n>  Serial baud rate (default: 9600)\n");
-    printf("  --ptt-pre <ms>     TXDelay: PTT pre-delay ms (default: 300)\n");
-    printf("  --ptt-post <ms>    TXTail: PTT post-delay ms (default: 100)\n");
+    printf("  --ptt-pre <ms>     TXDelay: PTT pre-delay ms (default: 100)\n");
+    printf("  --ptt-post <ms>    TXTail: PTT post-delay ms (default: 50)\n");
     printf("  --slottime <ms>    CSMA slot time ms (default: 100)\n");
     printf("  --persist <0-255>  p-persistence (default: 63 = 25%%)\n");
     printf("\nSecurity:\n");

@@ -3,7 +3,7 @@
 #include "ofdm/ofdm_frame.h"   // get_uniform_tone_map
 #include "common/fft.h"
 #include "common/logging.h"
-#include "native/constellation.h"  // demap_soft, bits_to_modulation (from ofdm_mod.h)
+#include "native/constellation.h"  // demap_soft
 #include "native/nuc_tables.h"     // NucTable, get_nuc_table (for BPS)
 #include "native/frame.h"      // crc32, KalmanTrace
 #include <cmath>
@@ -20,8 +20,8 @@ namespace iris {
 //  Blind Phase Search (BPS) — replaces DD-CPE for QAM16+
 //
 //  Two-stage search exploiting QAM 4-fold symmetry (±45° unambiguous range).
-//  Stage 1: 8 coarse test angles in [-π/4, +π/4)
-//  Stage 2: 8 fine angles around stage-1 winner
+//  Stage 1: 16 coarse test angles in [-π/4, +π/4)
+//  Stage 2: 16 fine angles around stage-1 winner
 //  Returns: estimated residual phase error (radians)
 //
 //  References: Pfau et al. 2009 (coherent optical BPS);
@@ -393,7 +393,7 @@ OfdmDemodResult OfdmDemodulator::demodulate(
     int min_frame_samples = 5 * sym_len;
     int remaining = n_samples - frame_start;
     if (remaining < min_frame_samples) {
-        IRIS_LOG("[OFDM-RX] insufficient samples after detection: %d < %d (need 4 syms)",
+        IRIS_LOG("[OFDM-RX] insufficient samples after detection: %d < %d (need 5 syms)",
                  remaining, min_frame_samples);
         // Don't consume samples — leave preamble in buffer for retry with more data.
         // samples_consumed = 0 signals "frame detected but incomplete, wait for more".
@@ -626,9 +626,9 @@ OfdmDemodResult OfdmDemodulator::demodulate(
     // is tracked by Kalman [phase, freq, accel].
     //
     // Measurements:
-    //   - Pilot rows (every 5 data sym): all carriers, ~6° RMS, r=0.01
+    //   - Pilot rows (every 8 data sym): all carriers, ~6° RMS, r=0.01
     //   - Block pilots (every 24 data sym): all carriers, ~3° RMS, r=0.01
-    //   - Comb pilots (every sym): 4-7 carriers, ~17° RMS, r=0.09
+    //   - Comb pilots (every sym): ~14 carriers (NBFM), ~17° RMS, r=0.09
     //   - BPS (QAM16+, every sym): all data carriers, r=0.05
     //
     // After all symbols: RTS backward smoother, then re-correct stored
@@ -647,7 +647,7 @@ OfdmDemodResult OfdmDemodulator::demodulate(
 
     // Process noise — scaled proportionally to symbol period.
     // Reference: NFFT=512, CP=32 → 544/48000 = 11.33ms. Values tuned empirically.
-    // Phase variance ~ √t (Wiener process), freq drift ~ t, accel ~ t^1.5.
+    // Phase std dev ~ √t (Wiener process), freq drift ~ t, accel ~ t^1.5.
     // Using conservative sqrt scaling to keep Kalman responsive to measurements.
     const float sym_t = config_.symbol_duration_s();
     const float ref_t = 544.0f / 48000.0f;  // reference period (NFFT=512, CP=32)

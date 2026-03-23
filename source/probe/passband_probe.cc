@@ -145,7 +145,7 @@ ProbeResult probe_analyze(const float* samples, int n_samples, int sample_rate) 
             power_db_mean[i] /= n_segments;
     }
 
-    // Estimate noise floor: median of all bins in our range
+    // Estimate noise floor: 25th percentile of all bins in our range
     std::vector<float> range_powers;
     int bin_lo = (int)(PassbandProbeConfig::TONE_LOW_HZ / bin_hz);
     int bin_hi = (int)(PassbandProbeConfig::TONE_HIGH_HZ / bin_hz);

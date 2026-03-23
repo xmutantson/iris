@@ -30,7 +30,7 @@ enum class OfdmSessionState {
 // Diagnostics for GUI/logging
 struct OfdmSessionDiag {
     OfdmSessionState state = OfdmSessionState::IDLE;
-    int speed_level = 0;           // Current O-level (0-3)
+    int speed_level = 0;           // Current O-level (0-9)
     float mean_snr_db = 0;
     float throughput_bps = 0;
     int n_data_carriers = 0;

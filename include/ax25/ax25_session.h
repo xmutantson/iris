@@ -41,7 +41,7 @@ public:
     void set_t1_ticks(int ticks) { t1_value_ = ticks; }
 
     // Update T1 floor based on TNC TXDELAY (accounts for real turnaround time).
-    // T1 >= 2*TXDELAY + 2s processing/frame-time, but never below FRACK default.
+    // T1 >= 2*TXDELAY + 1.5s processing/frame-time, but never below FRACK default.
     void set_txdelay_ms(int ms);
 
     // Update T3 (idle supervision) in ticks
@@ -103,7 +103,7 @@ public:
     // Request immediate retransmission: sends REJ(V(R)) to tell the peer
     // to retransmit from the last expected sequence number.  Use when the
     // modem detects a native frame decode failure (CRC/LDPC) — much faster
-    // than waiting for the AX.25 T1 timeout (~30s).
+    // than waiting for the AX.25 T1 timeout (2-4s in native mode).
     void request_retransmit();
 
     // Start T1 if there are unacknowledged frames (V(A) != V(S)).

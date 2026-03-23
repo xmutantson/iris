@@ -18,7 +18,7 @@ namespace {
 
 // Small-N DFT/IDFT for DFT-spread OFDM (SC-FDMA).
 // O(N²) — fine for N < 100 (our data carrier count).
-// forward=true: DFT (analysis), forward=false: IDFT (synthesis, divides by N).
+// forward=true: DFT (analysis), forward=false: IDFT (synthesis). Both scale by 1/√N.
 static void small_dft(const std::complex<float>* in, std::complex<float>* out,
                        int N, bool forward) {
     float sign = forward ? -1.0f : 1.0f;
