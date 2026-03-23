@@ -4,6 +4,7 @@
 #include "ofdm/ofdm_config.h"
 #include "ofdm/ofdm_sync.h"
 #include "ofdm/ofdm_mod.h"    // ToneMap
+#include "native/frame.h"   // KalmanTrace
 #include "fec/ldpc.h"
 #include <complex>
 #include <vector>
@@ -45,6 +46,9 @@ struct OfdmDemodResult {
 
     // Per-LDPC-block decode results (for HARQ selective retransmit)
     std::vector<LdpcCodec::BlockResult> block_results;
+
+    // Kalman filter trace (for GUI 3D viewer and CSV logging)
+    KalmanTrace kalman_trace;
 };
 
 class OfdmDemodulator {

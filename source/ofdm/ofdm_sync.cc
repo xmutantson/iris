@@ -95,8 +95,12 @@ std::vector<std::complex<float>> generate_zc_training_symbol(const OfdmConfig& c
 // SC detection threshold.  SC metric for identical training symbols:
 //   M ≈ (SNR/(SNR+1))² → ~0.82 at 10 dB, ~0.64 at 5 dB, ~0.25 at 0 dB.
 // Noise-only: M ≈ 1/nfft ≈ 0.002.  Data symbols: ~0.01-0.05 (no repetition).
-// Threshold 0.40 detects signals down to ~3 dB with wide margin above noise.
-static constexpr float SC_DETECTION_THRESHOLD = 0.40f;
+// SC is a COARSE pre-filter — rejects obvious silence/noise.
+// FD-ZC (0.50) is the secondary gate.  The sync word symbol after the
+// preamble is the real discriminator (deterministic bit-check, no threshold).
+// Threshold 0.25 passes signals down to ~0 dB SNR.  False triggers that
+// pass SC+FD-ZC are caught by the sync word check (random bits → ~50% BER).
+static constexpr float SC_DETECTION_THRESHOLD = 0.25f;  // coarse pre-filter only
 
 // Helper: next power of 2 >= n
 static int next_pow2(int n) {
@@ -359,9 +363,10 @@ OfdmSyncResult ofdm_detect_frame(const std::complex<float>* iq, int n_samples,
                 ? std::sqrt(std::norm(fd_corr) / fd_denom) : 0.0f;
 
             // --- ZC quality gate ---
-            // With de-emphasis-matched reference, genuine frames should yield
-            // FD-ZC ≥ 0.50 (limited by FM deviation limiter nonlinearity and
-            // channel flatness).  Threshold 0.40 rejects noise false triggers.
+            // OTA 2026-03-22: real frames FD-ZC 0.87-0.96, false detections
+            // 0.41-0.60 (originally thought real frames went as low as 0.43,
+            // but those were false detections too).  CRC-8 sync word is the
+            // deterministic false-positive filter; this threshold pre-filters.
             const float fd_zc_threshold = config.fd_zc_threshold;
             if (best_zc_metric < fd_zc_threshold) {
                 IRIS_LOG("[OFDM-SYNC] SC passed (%.3f) but FD-ZC too low (%.3f < %.2f, td=%.3f, n_used=%d) — rejected",
@@ -403,11 +408,13 @@ OfdmSyncResult ofdm_detect_frame(const std::complex<float>* iq, int n_samples,
     IRIS_LOG("[OFDM-SYNC] detect: SC=%.3f FD-ZC=%.3f at sample %d, CFO=%.1f Hz, SNR~%.1f dB",
              peak_metric, best_zc_metric, peak_d, result.cfo_hz, result.snr_est);
 
-    // CFO sanity check: real FM signals have < 2 Hz CFO (crystal offsets are small).
-    // False triggers produce wildly wrong CFO (10-50 Hz) because the
-    // "training symbols" are noise — their cross-correlation phase is random.
-    // Reject these to avoid wasting demod time and corrupting Chase combining.
-    constexpr float CFO_MAX_HZ = 10.0f;
+    // CFO sanity check: reject false triggers with implausible CFO.
+    // FM radio audio paths introduce real frequency offsets from discriminator
+    // tuning error and audio path phase shifts. OTA testing shows 17-25 Hz CFO
+    // is normal between FM stations. Subcarrier spacing is 93.75 Hz, so up to
+    // ±46 Hz (half-spacing) is correctable. Limit at 35 Hz to allow real FM
+    // offsets while rejecting noise triggers.
+    constexpr float CFO_MAX_HZ = 35.0f;
     if (std::abs(result.cfo_hz) > CFO_MAX_HZ) {
         IRIS_LOG("[OFDM-SYNC] CFO sanity check FAILED: |%.1f Hz| > %.0f Hz — false trigger rejected",
                  result.cfo_hz, CFO_MAX_HZ);
@@ -442,15 +449,13 @@ OfdmSyncResult ofdm_detect_frame(const std::complex<float>* iq, int n_samples,
 // CFO correction (in-place)
 // ---------------------------------------------------------------------------
 // Complex derotation exp(-jθ) correctly shifts the positive-frequency carriers
-// (bins 4-33) that the demodulator extracts. For real-valued OFDM inputs
-// (imag=0), this creates an imaginary component, but that's fine — we only
-// read positive-frequency FFT bins.
+// (bins 4-33) that the demodulator extracts.
 //
-// NOTE: The frequency-domain CFO ESTIMATOR is biased toward zero for real-valued
-// signals. At each bin k, Y[k] = A·exp(jφ) + conj(A)·exp(-jφ) (from Hermitian
-// symmetry), so Y2·conj(Y1) ≈ 2|A|²·cos(Δφ) — a REAL quantity whose arg() ≈ 0
-// regardless of true CFO. The residual frequency offset manifests as CPE drift
-// (~2°/symbol OTA) which the per-symbol pilot CPE tracker corrects.
+// The input is now an analytic signal (via Hilbert transform in modem.cc),
+// so the CFO estimator works correctly: Y2·conj(Y1) is a complex quantity
+// whose arg() gives the true CFO phase. Before the Hilbert transform, the
+// real-valued input produced Hermitian symmetry that made the correlation
+// real-valued and biased the estimator toward zero.
 void ofdm_correct_cfo(std::complex<float>* iq, int n_samples,
                        float cfo_hz, int sample_rate)
 {

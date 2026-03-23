@@ -20,6 +20,53 @@
 
 namespace iris {
 
+// Binary TUNE report: embedded in OFDM ramp frame payload.
+// Format: [0xBB] [count:u8] [entry × count]
+// Entry:  [iters:i8] [H_hi:u8] [H_lo:u8] [snr_i8]
+//   iters: -2=preamble-only, -1=not measured, 0-50=LDPC iters
+//   H: unsigned 16-bit fixed-point, H * 100 (range 0-655.35)
+//   snr: signed 8-bit, SNR_dB + 30 (range -30 to +95 dB, 0.5 dB res not needed)
+static std::vector<uint8_t> tune_build_binary_report(
+    const int* iters, const float* H, const float* snr, int count) {
+    std::vector<uint8_t> buf;
+    buf.push_back(TUNE_REPORT_MAGIC);
+    int n = 0;
+    for (int i = 0; i < count; i++)
+        if (iters[i] != -1) n++;
+    buf.push_back((uint8_t)n);
+    for (int i = 0; i < count; i++) {
+        if (iters[i] == -1) continue;
+        buf.push_back((uint8_t)i);              // frame index
+        buf.push_back((uint8_t)(int8_t)iters[i]); // iters as signed byte
+        uint16_t h16 = (uint16_t)std::min(65535.0f, H[i] * 100.0f);
+        buf.push_back((uint8_t)(h16 >> 8));
+        buf.push_back((uint8_t)(h16 & 0xFF));
+        int8_t s = (int8_t)std::clamp((int)(snr[i] + 30.0f), 0, 127);
+        buf.push_back((uint8_t)s);
+    }
+    return buf;
+}
+
+static bool tune_parse_binary_report(const uint8_t* data, size_t len,
+    int* out_iters, float* out_H, float* out_snr, int max_entries) {
+    if (len < 2 || data[0] != TUNE_REPORT_MAGIC) return false;
+    int n = data[1];
+    size_t pos = 2;
+    for (int i = 0; i < n && pos + 5 <= len; i++) {
+        int idx = data[pos];
+        int8_t it = (int8_t)data[pos + 1];
+        uint16_t h16 = ((uint16_t)data[pos + 2] << 8) | data[pos + 3];
+        int8_t s = (int8_t)data[pos + 4];
+        pos += 5;
+        if (idx < max_entries) {
+            out_iters[idx] = it;
+            out_H[idx] = h16 / 100.0f;
+            out_snr[idx] = s - 30.0f;
+        }
+    }
+    return n > 0;
+}
+
 // Describe an AX.25 frame for GUI logging
 static std::string describe_ax25(const uint8_t* data, size_t len) {
     Ax25Frame f;
@@ -251,13 +298,13 @@ bool Modem::init(const IrisConfig& config) {
     probe_.set_local_caps(local_cap_.capabilities);
     // Advertise our preferred OFDM PHY parameters in probe result
     {
-        uint8_t nfft_code = 0;  // 0=512
-        if (config_.ofdm_nfft == 256) nfft_code = 1;
-        else if (config_.ofdm_nfft == 1024) nfft_code = 2;
+        uint8_t nfft_code = 2;  // 0=512, 1=256, 2=1024
+        if (config_.ofdm_nfft == 512) nfft_code = 0;
+        else if (config_.ofdm_nfft == 256) nfft_code = 1;
         probe_.set_local_ofdm_config(
             (uint8_t)config_.ofdm_cp_samples,  // e.g. 64
-            4,   // pilot_carrier_spacing (default)
-            14,  // pilot_symbol_spacing (default)
+            4,   // pilot_carrier_spacing
+            24,  // pilot_symbol_spacing
             nfft_code);
     }
     ArqCallbacks arq_cb;
@@ -1210,15 +1257,40 @@ void Modem::process_rx_native(const float* audio, int count) {
 
         size_t n_samples = ofdm_rx_audio_buf_.size();
         // Need enough samples for a minimum OFDM frame:
-        // 2 training + n_header + 1 data + 1 tail = (4 + n_header) symbols.
+        // 2 training + 1 sync word + 1 data + 1 tail = 5 symbols.
         size_t sym_len = (size_t)(ofdm_config_.cp_samples + ofdm_config_.nfft);
-        size_t min_samples = sym_len * 4;  // 2 preamble + 1 data + 1 margin (no header)
+        size_t min_samples = sym_len * 5;  // 2 preamble + 1 sync + 1 data + 1 tail
         if (n_samples < min_samples) return;
 
-        // Convert real audio to complex (real + j*0) for Schmidl-Cox
+        // Convert real audio to analytic signal via Hilbert transform.
+        // This enables Schmidl-Cox to extract CFO phase (real-only signals
+        // produce real-valued correlation, losing the sign of freq offset).
+        // Method: FFT, zero negative freqs, double positive freqs, IFFT.
         ofdm_rx_iq_.resize(n_samples);
-        for (size_t i = 0; i < n_samples; i++) {
-            ofdm_rx_iq_[i] = std::complex<float>(ofdm_rx_audio_buf_[i], 0.0f);
+        {
+            // Find next power of 2 for FFT
+            int nfft_h = 1;
+            while (nfft_h < (int)n_samples) nfft_h <<= 1;
+
+            // Copy real audio into complex buffer, zero-pad
+            std::vector<std::complex<float>> hbuf(nfft_h, {0.0f, 0.0f});
+            for (size_t i = 0; i < n_samples; i++)
+                hbuf[i] = std::complex<float>(ofdm_rx_audio_buf_[i], 0.0f);
+
+            fft_complex(hbuf.data(), nfft_h);
+
+            // Keep DC (bin 0) and Nyquist (bin N/2) as-is.
+            // Double positive frequencies (bins 1..N/2-1).
+            // Zero negative frequencies (bins N/2+1..N-1).
+            for (int k = 1; k < nfft_h / 2; k++)
+                hbuf[k] *= 2.0f;
+            for (int k = nfft_h / 2 + 1; k < nfft_h; k++)
+                hbuf[k] = {0.0f, 0.0f};
+
+            ifft_complex(hbuf.data(), nfft_h);
+
+            for (size_t i = 0; i < n_samples; i++)
+                ofdm_rx_iq_[i] = hbuf[i];
         }
 
         // Use cached sync if available (avoids re-detecting same preamble
@@ -1230,12 +1302,14 @@ void Modem::process_rx_native(const float* audio, int count) {
             // Lower FD-ZC threshold during TUNE to detect weak ramp frames.
             // FD-ZC threshold: 0.40 for data, 0.15 during TUNE.
             // With de-emphasis-matched ZC reference, genuine data frames should
-            // yield FD-ZC ≥ 0.50.  TUNE ramp at extreme TX levels may still be
-            // lower due to deviation limiter clipping, so use relaxed gate.
+            // FD-ZC gate: CRC-8 sync word is the real false-positive filter.
+            // During TUNE, extreme TX levels degrade ZC further — use 0.15.
+            // Normal operation: 0.30 catches obvious noise without rejecting
+            // genuine frames (OTA scores 0.43-0.49 on FM).
             {
                 bool in_tune = (tune_state_ != TuneState::IDLE &&
                                 tune_state_ != TuneState::DONE);
-                ofdm_config_.fd_zc_threshold = in_tune ? 0.15f : 0.40f;
+                ofdm_config_.fd_zc_threshold = in_tune ? 0.15f : 0.30f;
             }
             sync = ofdm_detect_frame(ofdm_rx_iq_.data(), (int)n_samples, ofdm_config_);
             if (!sync.detected) {
@@ -1286,8 +1360,8 @@ void Modem::process_rx_native(const float* audio, int count) {
             // Dense pilot rows: one every pilot_row_spacing data symbols
             int n_pilot_rows = (ofdm_config_.pilot_row_spacing > 0)
                 ? n_data_syms / ofdm_config_.pilot_row_spacing : 0;
-            // Total: 2 training + data + block pilots + pilot rows + 1 tail
-            int total_syms = 2 + n_data_syms + n_block_pilots + n_pilot_rows + 1;
+            // Total: 2 training + 1 sync word + data + block pilots + pilot rows + 1 tail
+            int total_syms = 2 + 1 + n_data_syms + n_block_pilots + n_pilot_rows + 1;
             size_t frame_samples = (size_t)(total_syms * sym_len);
             size_t available = n_samples - (size_t)sync.frame_start;
 
@@ -1300,7 +1374,7 @@ void Modem::process_rx_native(const float* audio, int count) {
                     ofdm_sync_cached_ = true;
                 }
                 ofdm_redetect_count_++;
-                if (ofdm_redetect_count_ > 150) {
+                if (ofdm_redetect_count_ > 300) {
                     IRIS_LOG("[OFDM-RX] redetect limit reached (%d) — abandoning cached sync", ofdm_redetect_count_);
                     size_t skip = (size_t)(ofdm_pending_sync_.frame_start + ofdm_config_.nfft);
                     skip = std::min(skip, ofdm_rx_audio_buf_.size());
@@ -1334,7 +1408,11 @@ void Modem::process_rx_native(const float* audio, int count) {
         if (!result.success && result.llrs.empty()) {
             IRIS_LOG("[OFDM-RX] false positive / quality gate (mean_H=%.3f, M=%.3f) — skipping",
                      result.mean_H_mag, sync.schmidl_metric);
-            size_t skip = (size_t)(sync.frame_start + ofdm_config_.nfft);
+            // Skip past the full frame length (not just nfft) to avoid
+            // re-triggering on the same noise burst.  OTA showed clusters of
+            // 3-5 false triggers within 100ms on the same noise event.
+            int sym_len_skip = ofdm_config_.nfft + ofdm_config_.cp_samples;
+            size_t skip = (size_t)(sync.frame_start + sym_len_skip * 3);
             skip = std::min(skip, ofdm_rx_audio_buf_.size());
             ofdm_rx_audio_buf_.erase(ofdm_rx_audio_buf_.begin(),
                                       ofdm_rx_audio_buf_.begin() + skip);
@@ -1462,6 +1540,45 @@ void Modem::process_rx_native(const float* audio, int count) {
                     tune_audit("MEASURE peer=%s frame=%d raw_gain=%.4f ldpc_iters=%d decode=OK",
                                tune_peer_call_.c_str(), idx + 1, gain, result.worst_ldpc_iters);
                 }
+                // Extract embedded binary report from responder's ramp payload
+                if (!result.payload.empty() && result.payload[0] == TUNE_REPORT_MAGIC) {
+                    if (tune_parse_binary_report(result.payload.data(), result.payload.size(),
+                            tune_peer_iters_, tune_peer_H_, tune_peer_snr_, TUNE_RAMP_COUNT)) {
+                        int rpt_count = 0;
+                        for (int ri = 0; ri < TUNE_RAMP_COUNT; ri++)
+                            if (tune_peer_iters_[ri] != -1) rpt_count++;
+                        IRIS_LOG("[TUNE] Extracted embedded report: %d entries from ramp payload",
+                                 rpt_count);
+                        tune_audit("EMBEDDED_REPORT entries=%d", rpt_count);
+                    }
+                }
+            }
+
+            // Also check for report in frames received during WAIT_REPORT
+            // (initiator's dedicated report frame after ramp)
+            if (tune_state_ == TuneState::WAIT_REPORT &&
+                !result.payload.empty() && result.payload[0] == TUNE_REPORT_MAGIC) {
+                // Debug: log raw report bytes for diagnostics
+                {
+                    std::string hex;
+                    for (size_t bi = 0; bi < std::min(result.payload.size(), (size_t)32); bi++) {
+                        char hb[4]; snprintf(hb, sizeof(hb), "%02X ", result.payload[bi]);
+                        hex += hb;
+                    }
+                    IRIS_LOG("[TUNE] report payload (%zu bytes): %s", result.payload.size(), hex.c_str());
+                }
+                if (tune_parse_binary_report(result.payload.data(), result.payload.size(),
+                        tune_peer_iters_, tune_peer_H_, tune_peer_snr_, TUNE_RAMP_COUNT)) {
+                    int rpt_count = 0;
+                    for (int ri = 0; ri < TUNE_RAMP_COUNT; ri++) {
+                        if (tune_peer_iters_[ri] != -1) rpt_count++;
+                        IRIS_LOG("[TUNE]   slot[%d]: iters=%d H=%.3f snr=%.1f",
+                                 ri, tune_peer_iters_[ri], tune_peer_H_[ri], tune_peer_snr_[ri]);
+                    }
+                    IRIS_LOG("[TUNE] Received OFDM report frame: %d entries", rpt_count);
+                    tune_audit("OFDM_REPORT entries=%d", rpt_count);
+                    tune_state_ = TuneState::APPLY;
+                }
             }
 
             // Update OFDM gearshift via Gearshift class (smoothing, LDPC boost,
@@ -1503,6 +1620,13 @@ void Modem::process_rx_native(const float* audio, int count) {
                 last_constellation_ = std::move(result.eq_constellation);
             }
 
+            // Feed OFDM Kalman trace to GUI 3D viewer + CSV logging
+            if (!result.kalman_trace.fwd.empty()) {
+                last_kalman_trace_ = result.kalman_trace;
+                kalman_log_trace(last_kalman_trace_, result.success,
+                                 result.snr_db, result.mean_H_mag);
+            }
+
             // Waterfilling: DISABLED for FM mode.
             // The channel estimate SNR (from preamble |H|) overestimates link quality
             // because the FM deviation limiter clips high-PAPR data symbols but not
@@ -1529,6 +1653,25 @@ void Modem::process_rx_native(const float* audio, int count) {
                     payload.assign(decomp_buf.begin(), decomp_buf.begin() + dec_len);
                 } else {
                     IRIS_LOG("OFDM-KISS: decompression failed, dropping");
+                    rx_overlap_buf_.clear();
+                    return;
+                }
+            }
+
+            // Filter TUNE payloads — not AX.25 data.  Without this filter,
+            // "TUNE_TEST_FRAME" (15 bytes) and binary reports (0xBB prefix)
+            // are dispatched to the KISS client as garbage AX.25 frames,
+            // potentially corrupting AX.25 session state (N(R) stuck at 0).
+            {
+                static const uint8_t tune_marker[] = "TUNE_TEST_FRAME";
+                if (payload.size() == sizeof(tune_marker) - 1 &&
+                    memcmp(payload.data(), tune_marker, payload.size()) == 0) {
+                    IRIS_LOG("[TUNE] Discarded OFDM test frame (not dispatching to AX.25)");
+                    rx_overlap_buf_.clear();
+                    return;
+                }
+                if (!payload.empty() && payload[0] == TUNE_REPORT_MAGIC) {
+                    IRIS_LOG("[TUNE] Discarded OFDM report frame (not dispatching to AX.25)");
                     rx_overlap_buf_.clear();
                     return;
                 }
@@ -2042,9 +2185,20 @@ void Modem::process_rx_native(const float* audio, int count) {
             pending_need_floats_ = need_iq * 2;
             if (pending_need_floats_ > RX_OVERLAP_MAX)
                 pending_need_floats_ = RX_OVERLAP_MAX;
-            // Timeout: allow enough time for the full frame to arrive, plus margin.
-            // At SPS=60, 4949 symbols = 6.2s; use 10s to cover largest frames + radio delays.
-            pending_frame_timeout_ = config_.sample_rate * 10;
+            // Timeout: enough time for remaining samples to arrive, plus 50% margin.
+            // Replaces fixed 10s timeout that caused 30-40s dead gaps on noisy FM
+            // channels when false preamble detections blocked TX for the full duration.
+            {
+                size_t have = rx_overlap_buf_.size() / 2;  // IQ pairs already buffered
+                size_t remaining = (pending_need_floats_ / 2 > have)
+                    ? (pending_need_floats_ / 2 - have) : 0;
+                int timeout_samples = (int)(remaining * 3 / 2);  // 1.5x margin
+                int min_timeout = config_.sample_rate * 1;       // floor: 1s
+                int max_timeout = config_.sample_rate * 7;       // cap: 7s
+                if (timeout_samples < min_timeout) timeout_samples = min_timeout;
+                if (timeout_samples > max_timeout) timeout_samples = max_timeout;
+                pending_frame_timeout_ = timeout_samples;
+            }
             IRIS_LOG("RX decode: need more data at offset %d (buf=%zu IQ, need ~%zu, timeout=10s)",
                      start, rx_overlap_buf_.size() / 2, pending_need_floats_ / 2);
         } else {
@@ -2317,7 +2471,8 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
             }
             have_frame = true;
         } else if (!tx_queue_.empty() && !ofdm_kiss_probing_ &&
-                   (tune_state_ == TuneState::IDLE || tune_state_ == TuneState::DONE)) {
+                   (tune_state_ == TuneState::IDLE || tune_state_ == TuneState::DONE) &&
+                   tune_post_holdoff_ <= 0) {
             // Native hail: use native PHY for ARQ hail/connect frames
             bool native_hail_active = false;
             if (config_.native_hail && !native_mode_) {
@@ -2346,7 +2501,12 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                 // LDPC k bits = data bits per block.  Minus 6 bytes overhead (2 len + 4 CRC).
                 // Multi-codeword: pack multiple LDPC blocks per frame to amortize
                 // preamble + pilot overhead. Each block is independently decodable.
-                static constexpr int OFDM_CODEWORDS_PER_FRAME = 2;
+                // Single codeword per frame: keeps frames short (~1.3s at O0)
+                // for reliable sync+decode. Multi-codeword doubles frame length
+                // (2.5s at O0) — too long for the redetect buffer (1.5s limit)
+                // and exposes more phase drift on FM. Re-enable for O2+ when
+                // throughput > reliability.
+                static constexpr int OFDM_CODEWORDS_PER_FRAME = 1;
                 size_t max_payload;
                 if (ofdm_phy_active_ && !native_hail_active) {
                     // Worst-case per-block capacity (O1 r1/2, K=800) × n_codewords.
@@ -2419,6 +2579,13 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                          frame_data.size(), batch.size(),
                          ofdm_kiss_ ? "OFDM-KISS" : "native");
 
+                // Start T1 at TX time for OFDM-KISS frames.
+                // notify_outgoing() may have been called before native_active_
+                // was set (KISS I-frames queued during AFSK/probe phase).
+                if (ofdm_kiss_tx_) {
+                    ax25_session_.start_t1_if_unacked();
+                }
+
                 // OFDM-KISS batch compression: compress the assembled payload.
                 // Prepend COMPRESSED_PAYLOAD_MAGIC so RX knows to decompress.
                 // Skip if payload is B2F_DATA (already compressed internally).
@@ -2477,13 +2644,18 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                     }
 
                     // Select tone map: O-levels map 1:1 to uniform presets (preset = level + 1)
-                    // O0=BPSK r3/4, O1=QPSK r1/2, O2=QPSK r3/4, O3=16QAM r1/2,
-                    // O4=16QAM r3/4, O5=64QAM r3/4, O6=64QAM r7/8, O7=256QAM r7/8
                     static const LdpcRate ofdm_level_to_fec[] = {
-                        LdpcRate::RATE_1_2, LdpcRate::RATE_1_2,  // O0 BPSK, O1 QPSK
-                        LdpcRate::RATE_3_4, LdpcRate::RATE_1_2,  // O2 QPSK, O3 16QAM
-                        LdpcRate::RATE_3_4, LdpcRate::RATE_3_4,  // O4 16QAM, O5 64QAM
-                        LdpcRate::RATE_7_8, LdpcRate::RATE_7_8}; // O6 64QAM, O7 256QAM
+                        LdpcRate::RATE_1_2,  // O0: BPSK r1/2
+                        LdpcRate::RATE_1_2,  // O1: QPSK r1/2
+                        LdpcRate::RATE_3_4,  // O2: QPSK r3/4
+                        LdpcRate::RATE_1_2,  // O3: 16QAM r1/2
+                        LdpcRate::RATE_5_8,  // O4: 16QAM r5/8
+                        LdpcRate::RATE_3_4,  // O5: 16QAM r3/4
+                        LdpcRate::RATE_5_8,  // O6: 64QAM r5/8
+                        LdpcRate::RATE_3_4,  // O7: 64QAM r3/4
+                        LdpcRate::RATE_5_8,  // O8: 256QAM r5/8
+                        LdpcRate::RATE_3_4,  // O9: 256QAM r3/4
+                    };
 
                     int sl = std::clamp(ofdm_speed_level_, 0, NUM_OFDM_SPEED_LEVELS - 1);
                     if (config_.ofdm_waterfill && ofdm_tone_map_.tone_map_id == 0 &&
@@ -3330,29 +3502,53 @@ void Modem::tick() {
         }
     }
 
+    // OFDM-KISS T1 watchdog: if native mode is active, session is connected,
+    // and T1 isn't running despite unacked frames, force-start T1.
+    // Belt-and-suspenders for the T1-never-starts bug (OTA 2026-03-22).
+    // Runs every tick (50ms) — start_t1_if_unacked() is a fast no-op when
+    // T1 is already running or V(A)==V(S).
+    if (ofdm_kiss_tx_) {
+        ax25_session_.start_t1_if_unacked();
+    }
+
     // Auto-tune FSM tick
     if (tune_state_ != TuneState::IDLE && tune_state_ != TuneState::DONE) {
         tune_timeout_--;
         if (tune_timeout_ <= 0) {
-            IRIS_LOG("[TUNE] Timeout — aborting (state=%d, frames=%d)",
+            IRIS_LOG("[TUNE] Timeout (state=%d, frames=%d)",
                      (int)tune_state_.load(), tune_frames_measured_);
-            // On timeout, apply probe-calibrated OFDM base as safe fallback.
-            // Without this, tx_level stays at the uncalibrated config value
-            // (often 0.88+) which overdrives FM deviation and clips the signal.
-            if (ofdm_tx_base_ > 0.01f && config_.tx_level > ofdm_tx_base_ * 1.5f) {
-                float old_level = config_.tx_level;
-                config_.tx_level = ofdm_tx_base_;
-                config_.calibrated_tx_level = ofdm_tx_base_;
-                IRIS_LOG("[TUNE] Timeout fallback: tx_level %.3f -> %.3f (probe-calibrated base)",
-                         old_level, ofdm_tx_base_);
-            }
             tune_audit("TIMEOUT peer=%s role=%s state=%d my_gain=%.4f peer_gain=%.4f frames=%d",
                        tune_peer_call_.c_str(),
                        tune_is_initiator_ ? "initiator" : "responder",
                        (int)tune_state_.load(), tune_my_gain_, tune_peer_gain_,
                        tune_frames_measured_);
-            if (gui_log_) gui_log_("[TUNE] Timeout — no response from peer");
-            tune_state_ = TuneState::IDLE;
+
+            // Unilateral fallback: if we received and measured the peer's ramp
+            // frames but never got their report (report exchange collision),
+            // apply corrections from our local measurements.  We know our own
+            // TX levels and the peer's measured channel gain from the frames we
+            // decoded — that's enough to set RX gain.  TX level stays at probe
+            // base (no peer report to refine it).
+            if (tune_my_gain_ > 0.01f && tune_frames_measured_ >= 3) {
+                IRIS_LOG("[TUNE] Timeout fallback: applying local measurements "
+                         "(my_gain=%.4f, %d frames)",
+                         tune_my_gain_, tune_frames_measured_);
+                if (gui_log_) gui_log_("[TUNE] Timeout — applying local measurements");
+                tune_apply_corrections();  // sets DONE
+            } else {
+                // No usable local data — apply probe-calibrated OFDM base as safe fallback.
+                // Without this, tx_level stays at the uncalibrated config value
+                // (often 0.88+) which overdrives FM deviation and clips the signal.
+                if (ofdm_tx_base_ > 0.01f && config_.tx_level > ofdm_tx_base_ * 1.5f) {
+                    float old_level = config_.tx_level;
+                    config_.tx_level = ofdm_tx_base_;
+                    config_.calibrated_tx_level = ofdm_tx_base_;
+                    IRIS_LOG("[TUNE] Timeout fallback: tx_level %.3f -> %.3f (probe-calibrated base)",
+                             old_level, ofdm_tx_base_);
+                }
+                if (gui_log_) gui_log_("[TUNE] Timeout — no response from peer");
+                tune_state_ = TuneState::IDLE;
+            }
         } else {
             TuneState ts = tune_state_;
             if (ts == TuneState::SEND_START) {
@@ -3378,21 +3574,23 @@ void Modem::tick() {
                         tune_state_ = TuneState::WAIT_PEER;
                         tune_wait_peer_ticks_ = 0;
                     } else {
-                        // Responder: test frames done — now send our report.
-                        // We TX'd first so the initiator is listening and will
-                        // receive our report reliably (no half-duplex collision).
-                        IRIS_LOG("[TUNE] Responder: test frames sent, sending report now");
-                        if (gui_log_) gui_log_("[TUNE] Sending measurement report...");
-                        tune_state_ = TuneState::SEND_REPORT;
+                        // Responder: test frames done — wait for initiator's report.
+                        // Lockstep: initiator sends first, responder replies.
+                        // This eliminates the half-duplex collision where both sides
+                        // send AFSK reports simultaneously and neither receives.
+                        IRIS_LOG("[TUNE] Responder: test frames sent, waiting for initiator's report");
+                        if (gui_log_) gui_log_("[TUNE] Waiting for peer report...");
+                        tune_state_ = TuneState::WAIT_REPORT;
+                        tune_report_resend_cd_ = 0;
+                        tune_report_resends_ = 0;
                     }
                 }
             } else if (ts == TuneState::WAIT_PEER) {
                 // Accumulate gain measurements from peer's test frames.
-                // Early termination: report as soon as we have enough data.
-                //  - All expected frames received + 0.5s grace, OR
-                //  - ≥3 measurements and 1s silence (no new frame for 1s)
-                // The grace period avoids TX-ing our report while the peer
-                // is still transmitting (half-duplex collision).
+                // Exit conditions (lockstep):
+                //  1. Initiator: peer's AFSK ramp report received + local frames measured
+                //     → respond immediately (3s silence guard). Don't wait for min_wait.
+                //  2. Fallback: enough local frames + silence timeout (peer report late)
                 tune_wait_peer_ticks_++;
                 // Track silence: ticks since last measurement changed
                 if (tune_frames_measured_ != tune_last_measured_count_) {
@@ -3401,34 +3599,43 @@ void Modem::tick() {
                 } else {
                     tune_silence_ticks_++;
                 }
+
+                // Check if peer's AFSK ramp report has arrived
+                bool have_peer_report = false;
+                for (int i = 0; i < TUNE_RAMP_COUNT; i++)
+                    if (tune_peer_iters_[i] != -1) { have_peer_report = true; break; }
+                if (!have_peer_report && tune_peer_gain_ > 0.01f)
+                    have_peer_report = true;
+
                 bool all_received = (tune_frames_measured_ >= tune_test_frames_target_);
-                // Both sides need sufficient silence guard to avoid TX-ing
-                // our report while the peer is still transmitting ramp frames.
-                // Ramp is ~12.5s (10 frames × ~1.2s each). Minimum wait ensures
-                // we don't exit early due to inter-frame detection gaps.
-                int silence_full = 60;    // 3.0s silence after all frames
-                int silence_early = 60;   // 3.0s silence for early termination
-                int min_wait = 240;       // 12s minimum (covers full ramp duration)
+                int silence_guard = 60;   // 3.0s silence before TX (avoid collision)
+
+                // Lockstep path: peer's report arrived → respond ASAP.
+                bool lockstep_ready = have_peer_report &&
+                    tune_frames_measured_ >= 1 && tune_silence_ticks_ >= silence_guard;
+
+                // Fallback path: got at least 1 frame + silence (peer ramp is over).
+                // Don't require >= 3 frames — on FM, quieter ramp frames may be
+                // below noise floor (OTA: only 2/5 frames detected at 26 dB range).
+                // Silence guard is the structural exit; frame count is a sanity check.
+                int min_wait = 160;       // 8s minimum (covers 5-frame ramp ~6s + margin)
                 bool waited_enough = (tune_wait_peer_ticks_ >= min_wait);
-                bool enough_with_silence = waited_enough &&
-                    (tune_frames_measured_ >= 3 &&
-                     tune_silence_ticks_ >= silence_early);
-                bool ready = tune_my_gain_ > 0 &&
-                    ((all_received && tune_silence_ticks_ >= silence_full) ||
-                     enough_with_silence);
+                bool fallback_ready = tune_my_gain_ > 0 && waited_enough &&
+                    tune_frames_measured_ >= 1 && tune_silence_ticks_ >= silence_guard;
+
+                bool ready = lockstep_ready || fallback_ready;
                 if (ready) {
-                    IRIS_LOG("[TUNE] WAIT_PEER done: %d/%d frames measured, avg gain=%.4f (waited %d ticks, silence %d)",
+                    IRIS_LOG("[TUNE] WAIT_PEER done: %d/%d frames measured, avg gain=%.4f "
+                             "(waited %d ticks, silence %d, peer_report=%s)",
                              tune_frames_measured_, tune_test_frames_target_,
-                             tune_my_gain_, tune_wait_peer_ticks_, tune_silence_ticks_);
+                             tune_my_gain_, tune_wait_peer_ticks_, tune_silence_ticks_,
+                             have_peer_report ? "YES" : "no");
                     tune_last_measured_count_ = 0;
                     tune_silence_ticks_ = 0;
                     if (tune_is_initiator_) {
                         tune_state_ = TuneState::SEND_REPORT;
                     } else {
                         // Responder: TX our test frames first, then send report.
-                        // This avoids the half-duplex collision where we used to
-                        // send the report then immediately TX — the initiator's
-                        // response would arrive during our TX and be lost.
                         IRIS_LOG("[TUNE] Responder: sending test frames first, report after");
                         if (gui_log_) gui_log_("[TUNE] Sending test frames...");
                         tune_test_frames_sent_ = 0;
@@ -3436,53 +3643,87 @@ void Modem::tick() {
                     }
                 }
             } else if (ts == TuneState::SEND_REPORT) {
-                // Send our measurement to peer (twice for reliability).
-                std::string report;
-                if (ofdm_phy_active_ && ofdm_mod_) {
-                    report = tune_build_ramp_report();
-                    IRIS_LOG("[TUNE] OFDM ramp report (%d frames): %s",
-                             TUNE_RAMP_COUNT, report.c_str());
-                } else {
-                    char buf[64];
-                    snprintf(buf, sizeof(buf), "TUNE:GAIN=%.4f", tune_my_gain_);
-                    report = buf;
-                    IRIS_LOG("[TUNE] Sending gain report: %.4f", tune_my_gain_);
-                }
-                send_tune_ui(report.c_str());
-                tune_state_ = TuneState::WAIT_REPORT;
-                tune_report_resend_cd_ = 160;  // Resend after 8s if no response
-                tune_report_resends_ = 0;
-                // Fast-track: if peer data already received (arrived during TX or WAIT_PEER)
-                {
+                // Send report as an OFDM frame (not AFSK — eliminates collision).
+                // Wait for TX queue to drain first (same as SEND_START).
+                if (tx_buffer_.empty() && ax25_tx_queue_.empty()) {
+                    if (ofdm_phy_active_ && ofdm_mod_) {
+                        auto report = tune_build_binary_report(
+                            tune_rx_frame_iters_, tune_rx_frame_H_, tune_rx_frame_snr_,
+                            TUNE_RAMP_COUNT);
+                        int rpt_count = 0;
+                        for (int ri = 0; ri < TUNE_RAMP_COUNT; ri++)
+                            if (tune_rx_frame_iters_[ri] != -1) rpt_count++;
+                        IRIS_LOG("[TUNE] Sending OFDM report frame (%d entries, %zu bytes)",
+                                 rpt_count, report.size());
+                        // Build single OFDM frame at safe tx_level
+                        ToneMap tune_map = get_uniform_tone_map(1, ofdm_config_);
+                        auto ofdm_iq = ofdm_mod_->build_ofdm_frame(
+                            report.data(), report.size(), tune_map, LdpcRate::RATE_1_2);
+                        if (!ofdm_iq.empty()) {
+                            std::vector<float> audio(ofdm_iq.size());
+                            for (size_t j = 0; j < ofdm_iq.size(); j++)
+                                audio[j] = ofdm_iq[j].real();
+                            // Normalize like ramp frames
+                            int pre_samp = 2 * (ofdm_config_.nfft + ofdm_config_.cp_samples);
+                            int dstart = std::min(pre_samp, (int)audio.size());
+                            float ssq = 0.0f;
+                            for (int k = dstart; k < (int)audio.size(); k++)
+                                ssq += audio[k] * audio[k];
+                            int dlen = (int)audio.size() - dstart;
+                            float rms = (dlen > 0) ? std::sqrt(ssq / (float)dlen) : 0.0f;
+                            float sc = (rms > 1e-6f) ? (0.50f / rms) : 0.1f;
+                            for (int k = dstart; k < (int)audio.size(); k++)
+                                audio[k] *= sc;
+                            float ppeak = 0.0f;
+                            for (int k = 0; k < dstart; k++)
+                                ppeak = std::max(ppeak, std::abs(audio[k]));
+                            if (ppeak > 0.90f) {
+                                float ps = 0.90f / ppeak;
+                                for (int k = 0; k < dstart; k++)
+                                    audio[k] *= ps;
+                            }
+                            // TX at mid-range level (safe for both FM clipping and noise floor)
+                            float report_tx = std::clamp(
+                                (ofdm_tx_base_ > 0.01f) ? ofdm_tx_base_ : config_.tx_level,
+                                0.15f, 0.8f);
+                            for (auto& s : audio) s *= report_tx;
+                            for (auto& s : audio) s = std::clamp(s, -0.95f, 0.95f);
+                            // Pre/post delay for radio settle
+                            int pre_samples = config_.ptt_pre_delay_ms * config_.sample_rate / 1000;
+                            int post_samples = std::max(config_.ptt_post_delay_ms, 100) * config_.sample_rate / 1000;
+                            tx_buffer_.insert(tx_buffer_.end(), pre_samples, 0.0f);
+                            tx_buffer_.insert(tx_buffer_.end(), audio.begin(), audio.end());
+                            tx_buffer_.insert(tx_buffer_.end(), post_samples, 0.0f);
+                        }
+                    } else {
+                        // Non-OFDM fallback: AFSK report
+                        char buf[64];
+                        snprintf(buf, sizeof(buf), "TUNE:GAIN=%.4f", tune_my_gain_);
+                        IRIS_LOG("[TUNE] Sending AFSK gain report: %.4f", tune_my_gain_);
+                        send_tune_ui(buf);
+                        send_tune_ui(buf);
+                    }
+                    // Fast-track: if peer report already received from embedded ramp payload
                     bool have_peer_ramp = false;
                     for (int i = 0; i < TUNE_RAMP_COUNT; i++)
                         if (tune_peer_iters_[i] != -1) { have_peer_ramp = true; break; }
                     if (have_peer_ramp || tune_peer_gain_ > 0.01f) {
-                        IRIS_LOG("[TUNE] Fast-track: peer data already received (ramp=%d gain=%.4f)",
-                                 have_peer_ramp ? 1 : 0, tune_peer_gain_);
+                        IRIS_LOG("[TUNE] Fast-track: peer report already received");
                         tune_state_ = TuneState::APPLY;
+                    } else {
+                        tune_state_ = TuneState::WAIT_REPORT;
+                        tune_report_resend_cd_ = 0;
+                        tune_report_resends_ = 0;
                     }
                 }
             } else if (ts == TuneState::WAIT_REPORT) {
-                // Resend TUNE:GAIN if the peer hasn't responded.
-                // This handles half-duplex collisions: our report may have been
-                // sent while the peer was still transmitting (PTT on, rx_muted).
-                tune_report_resend_cd_--;
-                if (tune_report_resend_cd_ <= 0 && tune_report_resends_ < 2) {
-                    std::string report;
-                    if (ofdm_phy_active_ && ofdm_mod_) {
-                        report = tune_build_ramp_report();
-                    } else {
-                        char buf[64];
-                        snprintf(buf, sizeof(buf), "TUNE:GAIN=%.4f", tune_my_gain_);
-                        report = buf;
-                    }
-                    send_tune_ui(report.c_str());
-                    tune_report_resends_++;
-                    tune_report_resend_cd_ = 160;  // retry in 8s
-                    IRIS_LOG("[TUNE] Resending report (%d/%d) — peer may have missed it",
-                             tune_report_resends_, 2);
-                }
+                // Waiting for peer's OFDM report frame.
+                // Initiator: already sent its report via OFDM in SEND_REPORT.
+                //   Normally fast-tracked to APPLY because responder's report was
+                //   embedded in ramp frames. This state is fallback only.
+                // Responder: waiting for initiator's dedicated OFDM report frame.
+                //   Handled in OFDM RX path (payload with TUNE_REPORT_MAGIC → APPLY).
+                // No AFSK resend logic needed — reports travel via OFDM.
             } else if (ts == TuneState::APPLY) {
                 tune_apply_corrections();  // sets DONE
             }
@@ -3492,8 +3733,11 @@ void Modem::tick() {
     // Reset DONE state after 5 seconds (100 ticks)
     if (tune_state_ == TuneState::DONE) {
         tune_timeout_--;
+        if (tune_post_holdoff_ > 0)
+            tune_post_holdoff_--;
         if (tune_timeout_ <= 0) {
             tune_state_ = TuneState::IDLE;
+            tune_post_holdoff_ = 0;
         }
     }
 
@@ -3648,6 +3892,10 @@ void Modem::tick() {
             ofdm_kiss_ = true;
             ofdm_kiss_tx_ = true;
             ax25_session_.set_native_active(true);  // Enable T1 polls in native mode
+            // I-frames may have been sent during AFSK phase (before native_active_).
+            // Start T1 now if any are unacked — otherwise T1 never starts and the
+            // session hangs forever when OFDM fails (OTA bug 2026-03-22).
+            ax25_session_.start_t1_if_unacked();
 
             // Initialize OFDM PHY if enabled (default).
             // Uses the negotiated passband from probe to configure OFDM carriers.
@@ -3664,7 +3912,7 @@ void Modem::tick() {
                 // (max CP, min pilot spacings) so both sides compute identical config.
                 // Old peers (v3 or earlier) have ofdm_* = 0, meaning "use defaults."
                 int cp = config_.ofdm_cp_samples;
-                int carrier_pilot_spacing = 6;  // default (was 4, widened for throughput)
+                int carrier_pilot_spacing = 4;  // default: 1:4 comb pilots
                 int block_pilot_spacing = 24;   // default (was 14, widened for throughput)
                 int nfft = config_.ofdm_nfft;
                 {
@@ -4175,21 +4423,37 @@ void Modem::tune_build_and_queue_test_frame() {
     // When OFDM is active, build OFDM frames (Schmidl-Cox preamble) so the
     // peer's OFDM RX can detect them. Otherwise, build native Mode A frames.
     // Caller must hold modem_mutex_.
-    const uint8_t test_payload[] = "TUNE_TEST_FRAME";
+    //
+    // Responder embeds its measurements of the initiator's ramp frames in the
+    // payload of each ramp frame (binary report). This eliminates the AFSK
+    // report exchange — the initiator gets the report by decoding the ramp.
+    const uint8_t default_payload[] = "TUNE_TEST_FRAME";
+    std::vector<uint8_t> report_payload;
+    if (!tune_is_initiator_ && tune_frames_measured_ > 0) {
+        report_payload = tune_build_binary_report(
+            tune_rx_frame_iters_, tune_rx_frame_H_, tune_rx_frame_snr_,
+            TUNE_RAMP_COUNT);
+        IRIS_LOG("[TUNE] Responder: embedding %d-frame report in ramp payload (%zu bytes)",
+                 tune_frames_measured_, report_payload.size());
+    }
+    const uint8_t* payload_data = report_payload.empty()
+        ? default_payload : report_payload.data();
+    size_t payload_len = report_payload.empty()
+        ? sizeof(default_payload) - 1 : report_payload.size();
 
     tx_buffer_.clear();
 
     for (int i = 0; i < tune_test_frames_target_; i++) {
         if (ofdm_phy_active_ && ofdm_mod_) {
-            // OFDM power-ramp TUNE: each of the 3 frames is sent at a different
-            // TX level (hot/current/conservative). Peer measures LDPC quality for
+            // OFDM power-ramp TUNE: each of the N frames is sent at a different
+            // TX level. Peer measures LDPC quality for
             // each and reports which one decoded best. This finds the optimal drive
             // level in a single exchange (3 frames, ~3.4 seconds airtime).
             // BPSK r1/2 for TUNE: maximum robustness for TX power calibration.
             // Explicit r1/2 overrides the preset's FEC rate.
             ToneMap tune_map = get_uniform_tone_map(1, ofdm_config_);
             auto ofdm_iq = ofdm_mod_->build_ofdm_frame(
-                test_payload, sizeof(test_payload) - 1, tune_map, LdpcRate::RATE_1_2);
+                payload_data, payload_len, tune_map, LdpcRate::RATE_1_2);
             if (ofdm_iq.empty()) {
                 IRIS_LOG("[TUNE] Failed to build OFDM test frame %d", i + 1);
                 continue;
@@ -4238,7 +4502,7 @@ void Modem::tune_build_and_queue_test_frame() {
             tune_test_frames_sent_++;
         } else {
             // Native Mode A TUNE frame
-            auto iq = build_native_frame(test_payload, sizeof(test_payload) - 1,
+            auto iq = build_native_frame(payload_data, payload_len,
                                           phy_config_, LdpcRate::RATE_1_2);
             if (iq.empty()) {
                 IRIS_LOG("[TUNE] Failed to build native test frame %d", i + 1);
@@ -4333,10 +4597,10 @@ void Modem::handle_tune_frame(const uint8_t* info, size_t len) {
                 float ramp_base = (ofdm_tx_base_ > 0.01f) ? ofdm_tx_base_ : config_.tx_level;
                 tune_compute_scales(ramp_base);
             }
-            // Responder timeout: generous — must cover initiator TX + our TX + reports.
-            // 10 frames ≈ 12s TX each side + turnaround. 60s covers the full exchange.
-            tune_timeout_ = 1200;  // 60s at 50ms/tick
-            IRIS_LOG("[TUNE] Ramp count: %d, timeout: 60s", rc);
+            // Responder timeout: generous — must cover initiator TX + our TX +
+            // 2s stagger delay + reports + retransmits.
+            tune_timeout_ = 800;  // 40s at 50ms/tick
+            IRIS_LOG("[TUNE] Ramp count: %d, timeout: 40s", rc);
             for (int i = 0; i < TUNE_RAMP_COUNT; i++) {
                 tune_rx_frame_iters_[i] = -1;
                 tune_rx_frame_H_[i] = 0;
@@ -4401,16 +4665,11 @@ void Modem::handle_tune_frame(const uint8_t* info, size_t len) {
         tune_audit("RAMP_REPORT entries=%d state=%d",
                    parsed_count, (int)tune_state_.load());
 
-        if (tune_is_initiator_) {
-            if (tune_my_gain_ > 0 && tune_state_ == TuneState::WAIT_REPORT) {
-                tune_state_ = TuneState::APPLY;
-            } else if (tune_state_ == TuneState::WAIT_PEER) {
-                IRIS_LOG("[TUNE] Stored peer ramp report (still measuring their frames)");
-            }
-        } else {
-            if (tune_state_ == TuneState::WAIT_REPORT) {
-                tune_state_ = TuneState::APPLY;
-            }
+        // AFSK report fallback (non-OFDM mode only; OFDM uses embedded binary reports)
+        if (tune_state_ == TuneState::WAIT_REPORT) {
+            tune_state_ = TuneState::APPLY;
+        } else if (tune_state_ == TuneState::WAIT_PEER) {
+            IRIS_LOG("[TUNE] Stored peer ramp report (still measuring their frames)");
         }
     } else if (payload.find("TUNE:GAIN=") != std::string::npos) {
         // Legacy/Mode A gain report. Also serves as OFDM fallback.
@@ -4432,16 +4691,11 @@ void Modem::handle_tune_frame(const uint8_t* info, size_t len) {
                    remote_gain, tune_my_gain_, (int)tune_state_.load());
         tune_peer_gain_ = remote_gain;
 
-        if (tune_is_initiator_) {
-            if (tune_my_gain_ > 0 && tune_state_ == TuneState::WAIT_REPORT) {
-                tune_state_ = TuneState::APPLY;
-            } else if (tune_state_ == TuneState::WAIT_PEER) {
-                IRIS_LOG("[TUNE] Stored peer gain (still measuring their frames)");
-            }
-        } else {
-            if (tune_state_ == TuneState::WAIT_REPORT) {
-                tune_state_ = TuneState::APPLY;
-            }
+        // AFSK report fallback (non-OFDM mode only)
+        if (tune_state_ == TuneState::WAIT_REPORT) {
+            tune_state_ = TuneState::APPLY;
+        } else if (tune_state_ == TuneState::WAIT_PEER) {
+            IRIS_LOG("[TUNE] Stored peer gain (still measuring their frames)");
         }
     }
 }
@@ -4466,7 +4720,7 @@ std::string Modem::tune_build_ramp_report() const {
 }
 
 // Static constexpr member definitions (C++14 ODR-use)
-constexpr float Modem::ofdm_level_offset_db_[8];
+constexpr float Modem::ofdm_level_offset_db_[10];
 
 void Modem::tune_compute_scales(float base) {
     // Compute TUNE_RAMP_COUNT distinct scales so that base*scale spans
@@ -4496,23 +4750,130 @@ void Modem::tune_compute_scales(float base) {
              tune_computed_scales_[0], db_hi - db_lo);
 }
 
-float Modem::tune_parabolic_fit() const {
-    // Always use SNR-based fit. SNR is continuous and works on both FM
-    // (where H is invariant due to deviation limiter) and linear channels.
+float Modem::tune_fit_tx_level() const {
+    // SNR-based parabolic fit for TX level optimization.
     // Fit (tx_dB, -SNR) parabola; minimum of -SNR = maximum SNR = optimal TX.
+    //
+    // FM-specific considerations:
+    //   - FM deviation limiter makes |H| invariant across TX levels → H-based fit useless
+    //   - Preamble-only SNR (from SC metric on failed frames) is unreliable: it measures
+    //     ZC preamble correlation, not data quality. Can be 5-8 dB off from true SNR.
+    //   - When ALL frames fail LDPC, we have ZERO reliable SNR measurements.
+    //   - Navalekar (2019) optimal FM OFDM backoff: 0.65-0.88 of deviation limiter threshold.
 
-    // Collect SNR data points from peer's report
+    // Count LDPC-decoded vs preamble-only measurements
+    int n_ldpc = 0, n_preamble = 0;
+    for (int i = 0; i < TUNE_RAMP_COUNT; i++) {
+        if (tune_peer_iters_[i] >= 0) n_ldpc++;
+        else if (tune_peer_iters_[i] == -2) n_preamble++;
+    }
+
+    // CRITICAL FIX: If zero frames decoded, preamble-only SNR is unreliable.
+    // Don't run a parabolic fit on garbage data — it produces absurd results
+    // (e.g., tx_level 0.883→0.141, making the station inaudible).
+    // Fall back to a conservative FM-appropriate level.
+    if (n_ldpc == 0) {
+        // No LDPC convergence at any TX level. Two scenarios:
+        // 1. FM channel: use 0.75× max ramp level (Navalekar optimal backoff region)
+        // 2. Linear channel: keep current level (problem is likely not TX power)
+        //
+        // Detect FM: |H| nearly invariant across measurements (max/min < 2.0)
+        float h_min = 1e9f, h_max = -1e9f;
+        int h_count = 0;
+        for (int i = 0; i < TUNE_RAMP_COUNT; i++) {
+            if (tune_peer_iters_[i] != -1 && tune_peer_H_[i] > 0.01f) {
+                h_min = std::min(h_min, tune_peer_H_[i]);
+                h_max = std::max(h_max, tune_peer_H_[i]);
+                h_count++;
+            }
+        }
+        bool fm_channel = (h_count >= 3 && h_max / h_min < 2.0f);
+
+        if (fm_channel) {
+            // FM: use 75% of maximum ramp level (in Navalekar 0.65-0.88 optimal zone).
+            // This is conservative enough to avoid clipping but loud enough to be heard.
+            float tx_max = 0.0f;
+            for (int i = 0; i < TUNE_RAMP_COUNT; i++)
+                tx_max = std::max(tx_max, tune_ramp_tx_levels_[i]);
+            float tx_fm = 0.75f * tx_max;
+            IRIS_LOG("[TUNE] SNR fit: ALL %d frames failed LDPC, FM channel detected "
+                     "(H range %.2f-%.2f, ratio %.1f). Using 0.75×max = %.4f",
+                     n_preamble, h_min, h_max, h_max / h_min, tx_fm);
+            return std::clamp(tx_fm, 0.05f, 1.0f);
+        } else {
+            // Linear or unknown: keep current level, don't make things worse
+            IRIS_LOG("[TUNE] SNR fit: ALL %d frames failed LDPC, non-FM channel. "
+                     "Keeping current tx_level=%.4f", n_preamble, config_.tx_level);
+            return config_.tx_level;
+        }
+    }
+
+    // Detect FM channel: |H| nearly invariant across DECODED frames.
+    // Only consider frames that decoded (iters >= 0) — preamble-only frames
+    // at extreme TX levels can have very different H (below limiter threshold
+    // at low TX, clipped at high TX) even on FM channels.
+    float h_min = 1e9f, h_max = -1e9f;
+    int h_count = 0;
+    for (int i = 0; i < TUNE_RAMP_COUNT; i++) {
+        if (tune_peer_iters_[i] >= 0 && tune_peer_H_[i] > 0.01f) {
+            h_min = std::min(h_min, tune_peer_H_[i]);
+            h_max = std::max(h_max, tune_peer_H_[i]);
+            h_count++;
+        }
+    }
+    bool fm_channel = (h_count >= 3 && h_max / h_min < 3.0f);
+
+    // FM channel strategy: find the clipping edge, back off one step.
+    // The FM deviation limiter creates a plateau — any level below the
+    // clipping point works roughly equally well. We don't need the optimal
+    // level, we need a SAFE level. Find the highest TX level where a frame
+    // decoded (clipping edge), then use the next lower ramp level.
+    if (fm_channel) {
+        // Ramp frames are ordered highest TX first (index 0 = loudest).
+        // Find the first (highest-TX) index that decoded.
+        int clip_edge_idx = -1;
+        for (int i = 0; i < TUNE_RAMP_COUNT; i++) {
+            if (tune_peer_iters_[i] >= 0) {
+                clip_edge_idx = i;
+                break;
+            }
+        }
+
+        // Back off one step from the clipping edge
+        int use_idx = (clip_edge_idx >= 0) ? std::min(clip_edge_idx + 1, TUNE_RAMP_COUNT - 1) : 0;
+        // If the backed-off index didn't decode, use the edge itself
+        if (tune_peer_iters_[use_idx] < 0 && clip_edge_idx >= 0)
+            use_idx = clip_edge_idx;
+
+        float tx_opt = tune_ramp_tx_levels_[use_idx];
+
+        IRIS_LOG("[TUNE] FM channel (H ratio %.1f): clip edge at ramp[%d] tx=%.3f, "
+                 "backed off to ramp[%d] tx=%.3f",
+                 h_max / h_min, clip_edge_idx,
+                 clip_edge_idx >= 0 ? tune_ramp_tx_levels_[clip_edge_idx] : 0.0f,
+                 use_idx, tx_opt);
+        return std::clamp(tx_opt, 0.05f, 1.0f);
+    }
+
+    // Linear channel: use SNR-based parabolic fit
     float sx[TUNE_RAMP_COUNT], sy[TUNE_RAMP_COUNT];
     int n_snr = 0;
+    bool using_preamble_pts = (n_ldpc < 3);
+
     for (int i = 0; i < TUNE_RAMP_COUNT; i++) {
         float tx = tune_ramp_tx_levels_[i];
         if (tx < 0.001f) continue;
         if (tune_peer_snr_[i] > -90.0f) {
-            sx[n_snr] = 20.0f * std::log10(tx);
-            sy[n_snr] = -tune_peer_snr_[i];  // negate: minimize = best SNR
-            n_snr++;
+            if (tune_peer_iters_[i] >= 0 || using_preamble_pts) {
+                sx[n_snr] = 20.0f * std::log10(tx);
+                sy[n_snr] = -tune_peer_snr_[i];
+                n_snr++;
+            }
         }
     }
+
+    IRIS_LOG("[TUNE] Linear channel: %d LDPC + %d preamble-only, using %d points",
+             n_ldpc, n_preamble, n_snr);
 
     if (n_snr == 0) {
         IRIS_LOG("[TUNE] SNR fit: no valid data points");
@@ -4520,7 +4881,6 @@ float Modem::tune_parabolic_fit() const {
     }
 
     if (n_snr < 3) {
-        // Few points — pick the one with best SNR
         int best = 0;
         for (int i = 1; i < n_snr; i++) if (sy[i] < sy[best]) best = i;
         float tx_opt = std::pow(10.0f, sx[best] / 20.0f);
@@ -4529,24 +4889,13 @@ float Modem::tune_parabolic_fit() const {
         return std::clamp(tx_opt, 0.05f, 1.0f);
     }
 
-    // Check if SNR actually varies (>1 dB spread)
+    // Parabolic fit on (tx_dB, -SNR)
     float snr_min = 1e9f, snr_max = -1e9f;
     for (int i = 0; i < n_snr; i++) {
         snr_min = std::min(snr_min, -sy[i]);
         snr_max = std::max(snr_max, -sy[i]);
     }
-    if (snr_max - snr_min < 3.0f) {
-        // SNR nearly flat — FM deviation limiter normalizes power.
-        // Use geometric midpoint of the ramp range (avoids both clipping at high
-        // TX and noise at low TX). 3 dB threshold covers typical FM channels.
-        float tx_geo = std::sqrt(tune_ramp_tx_levels_[0] *
-            tune_ramp_tx_levels_[TUNE_RAMP_COUNT - 1]);
-        IRIS_LOG("[TUNE] SNR fit: flat (range %.1f dB), using midpoint tx=%.4f",
-                 snr_max - snr_min, tx_geo);
-        return std::clamp(tx_geo, 0.05f, 1.0f);
-    }
 
-    // Parabolic fit on (tx_dB, -SNR)
     float S0 = (float)n_snr, S1 = 0, S2 = 0, S3 = 0, S4 = 0;
     float Sy0 = 0, Sy1 = 0, Sy2 = 0;
     for (int i = 0; i < n_snr; i++) {
@@ -4555,7 +4904,7 @@ float Modem::tune_parabolic_fit() const {
         Sy0 += yi; Sy1 += xi*yi; Sy2 += xi*xi*yi;
     }
     float D = S0*(S2*S4 - S3*S3) - S1*(S1*S4 - S3*S2) + S2*(S1*S3 - S2*S2);
-    if (std::abs(D) > 1e-12f) {
+    if (std::abs(D) > 1e-12f && snr_max - snr_min >= 3.0f) {
         float Da = S0*(S2*Sy2 - S3*Sy1) - S1*(S1*Sy2 - S3*Sy0) + S2*(S1*Sy1 - S2*Sy0);
         float Db = S0*(Sy1*S4 - S3*Sy2) - S1*(Sy0*S4 - Sy2*S2) + S2*(Sy0*S3 - Sy1*S2);
         float a = Da / D;
@@ -4569,28 +4918,18 @@ float Modem::tune_parabolic_fit() const {
         }
     }
 
-    // Parabola didn't open upward or degenerate.
-    // On FM, SNR is often monotonic (higher TX = slightly better SNR up to clipping).
-    // "Best SNR" would pick the highest TX, risking FM clipping and FD-ZC degradation.
-    // Use midpoint if spread is moderate (<5 dB), best SNR only for large spread.
-    if (snr_max - snr_min < 5.0f) {
-        float tx_geo = std::sqrt(tune_ramp_tx_levels_[0] *
-            tune_ramp_tx_levels_[TUNE_RAMP_COUNT - 1]);
-        IRIS_LOG("[TUNE] SNR fit: parabola invalid, spread %.1f dB — using midpoint tx=%.4f",
-                 snr_max - snr_min, tx_geo);
-        return std::clamp(tx_geo, 0.05f, 1.0f);
-    }
+    // Fallback: best SNR frame
     int best = 0;
     for (int i = 1; i < n_snr; i++) if (sy[i] < sy[best]) best = i;
     float tx_opt = std::pow(10.0f, sx[best] / 20.0f);
-    IRIS_LOG("[TUNE] SNR fit: parabola invalid, using best SNR frame at %.1f dB SNR (tx=%.4f)",
-             -sy[best], tx_opt);
+    IRIS_LOG("[TUNE] SNR fit: parabola invalid (spread=%.1f dB), using best SNR=%.1f dB (tx=%.4f)",
+             snr_max - snr_min, -sy[best], tx_opt);
     return std::clamp(tx_opt, 0.05f, 1.0f);
 }
 
 float Modem::ofdm_effective_tx_level() const {
     if (ofdm_tx_base_ <= 0.0f) return config_.tx_level;
-    int level = std::clamp(ofdm_speed_level_, 0, 7);
+    int level = std::clamp(ofdm_speed_level_, 0, NUM_OFDM_SPEED_LEVELS - 1);
     float offset_db = ofdm_level_offset_db_[level];
     float scale = std::pow(10.0f, offset_db / 20.0f);
     float eff = ofdm_tx_base_ * scale;
@@ -4627,7 +4966,7 @@ void Modem::tune_apply_corrections() {
         for (int i = 0; i < TUNE_RAMP_COUNT; i++)
             if (tune_peer_iters_[i] >= -2 && tune_peer_iters_[i] != -1) { have_ramp = true; break; }
         if (have_ramp) {
-            float fitted_tx = tune_parabolic_fit();
+            float fitted_tx = tune_fit_tx_level();
             config_.tx_level = std::clamp(fitted_tx, 0.05f, 1.0f);
             config_.calibrated_tx_level = config_.tx_level;
             ofdm_tx_base_ = config_.tx_level;
@@ -4651,8 +4990,76 @@ void Modem::tune_apply_corrections() {
             IRIS_LOG("[TUNE] OFDM TX fallback: peer saw H=%.3f, level %.3f → %.3f",
                      tune_peer_gain_, old_level, config_.tx_level);
         } else {
-            IRIS_LOG("[TUNE] OFDM TX: no peer report, keeping level %.3f", config_.tx_level);
-            ofdm_tx_base_ = config_.tx_level;
+            // No peer report — we don't know how the peer received our frames.
+            // But we DO know how WE received the peer's frames (tune_rx_frame_*).
+            // On FM, both radios have similar deviation limiters, so the optimal
+            // TX level is roughly symmetric.
+            // Both sides use identical scale arrays (tune_computed_scales_[]).
+            int local_decoded = 0;
+            float local_h_min = 1e9f, local_h_max = -1e9f;
+            int local_h_count = 0;
+            for (int i = 0; i < TUNE_RAMP_COUNT; i++) {
+                if (tune_rx_frame_iters_[i] >= 0) {
+                    local_decoded++;
+                    if (tune_rx_frame_H_[i] > 0.01f) {
+                        local_h_min = std::min(local_h_min, tune_rx_frame_H_[i]);
+                        local_h_max = std::max(local_h_max, tune_rx_frame_H_[i]);
+                        local_h_count++;
+                    }
+                }
+            }
+            bool local_fm = (local_h_count >= 3 && local_h_max / local_h_min < 3.0f);
+
+            if (local_decoded >= 2 && local_fm) {
+                // FM mirror: clip-edge-backoff on local RX (same as peer path).
+                // Find highest-TX index (lowest i) that decoded locally.
+                int clip_edge_idx = -1;
+                for (int i = 0; i < TUNE_RAMP_COUNT; i++) {
+                    if (tune_rx_frame_iters_[i] >= 0) {
+                        clip_edge_idx = i;
+                        break;
+                    }
+                }
+                int use_idx = (clip_edge_idx >= 0) ? std::min(clip_edge_idx + 1, TUNE_RAMP_COUNT - 1) : 0;
+                if (tune_rx_frame_iters_[use_idx] < 0 && clip_edge_idx >= 0)
+                    use_idx = clip_edge_idx;
+                float ramp_base = (ofdm_tx_base_ > 0.01f) ? ofdm_tx_base_ : config_.tx_level;
+                float mirror_tx = std::clamp(ramp_base * tune_computed_scales_[use_idx], 0.05f, 1.0f);
+                config_.tx_level = mirror_tx;
+                config_.calibrated_tx_level = config_.tx_level;
+                ofdm_tx_base_ = config_.tx_level;
+                IRIS_LOG("[TUNE] OFDM TX: no peer report, FM mirror clip-edge-backoff: "
+                         "clip_edge ramp[%d], using ramp[%d] (scale=%.2f) → tx=%.3f (was %.3f)",
+                         clip_edge_idx, use_idx, tune_computed_scales_[use_idx],
+                         config_.tx_level, old_level);
+            } else if (local_decoded >= 2) {
+                // Linear mirror: best SNR index
+                int best_rx_idx = -1;
+                float best_rx_snr = -1e9f;
+                for (int i = 0; i < TUNE_RAMP_COUNT; i++) {
+                    if (tune_rx_frame_iters_[i] >= 0 && tune_rx_frame_snr_[i] > best_rx_snr) {
+                        best_rx_snr = tune_rx_frame_snr_[i];
+                        best_rx_idx = i;
+                    }
+                }
+                float ramp_base = (ofdm_tx_base_ > 0.01f) ? ofdm_tx_base_ : config_.tx_level;
+                float best_scale = tune_computed_scales_[best_rx_idx];
+                float mirror_tx = std::clamp(ramp_base * best_scale, 0.05f, 1.0f);
+                config_.tx_level = mirror_tx;
+                config_.calibrated_tx_level = config_.tx_level;
+                ofdm_tx_base_ = config_.tx_level;
+                IRIS_LOG("[TUNE] OFDM TX: no peer report, linear mirror: "
+                         "best SNR=%.1f dB at ramp[%d] (scale=%.2f) → tx=%.3f (was %.3f)",
+                         best_rx_snr, best_rx_idx, best_scale, config_.tx_level, old_level);
+            } else if (ofdm_tx_base_ > 0.01f) {
+                config_.tx_level = ofdm_tx_base_;
+                config_.calibrated_tx_level = ofdm_tx_base_;
+                IRIS_LOG("[TUNE] OFDM TX: no peer report, using probe base %.3f (was %.3f)",
+                         ofdm_tx_base_, old_level);
+            } else {
+                IRIS_LOG("[TUNE] OFDM TX: no peer report, keeping level %.3f", config_.tx_level);
+                ofdm_tx_base_ = config_.tx_level;
+            }
         }
 
         // RX: MMSE equalizer handles arbitrary gain. No RX correction needed.
@@ -4704,6 +5111,15 @@ void Modem::tune_apply_corrections() {
 
     tune_state_ = TuneState::DONE;
     tune_timeout_ = 100;  // 5s display before resetting to IDLE
+
+    // Responder defers TX after TUNE so initiator (commander) goes first.
+    // Without this, both sides TX simultaneously → half-duplex collision → T1 timeout.
+    if (!tune_is_initiator_) {
+        tune_post_holdoff_ = 60;  // 3s — enough for initiator to TX one frame
+        IRIS_LOG("[TUNE] Responder post-TUNE holdoff: deferring TX for 3s");
+    } else {
+        tune_post_holdoff_ = 0;
+    }
 }
 
 void Modem::tune_audit(const char* fmt, ...) {
@@ -4797,7 +5213,7 @@ void Modem::start_autotune(const std::string& remote_callsign) {
     tune_wait_peer_ticks_ = 0;
     tune_last_measured_count_ = 0;
     tune_silence_ticks_ = 0;
-    tune_timeout_ = 800;  // 40s: 10 frames ~12s TX + responder turnaround + reports
+    tune_timeout_ = 800;  // 40s: 5 frames ~6s TX each side + report exchange + margin
     tune_test_frames_target_ = TUNE_RAMP_COUNT;
     // Compute adaptive ramp scales based on current TX base
     {
@@ -5110,7 +5526,7 @@ bool Modem::try_use_cached_probe(const std::string& callsign) {
         ofdm_pb.valid = true;
 
         int cp = config_.ofdm_cp_samples;
-        int carrier_pilot_spacing = 6;
+        int carrier_pilot_spacing = 4;
         int block_pilot_spacing = 24;
         int nfft = config_.ofdm_nfft;
 

@@ -111,8 +111,8 @@ struct IrisConfig {
 
     // OFDM PHY settings
     bool ofdm_enable = true;           // Master OFDM enable/disable
-    int ofdm_nfft = 512;              // FFT size (256, 512, or 1024) — 93.75 Hz spacing at 48k
-    int ofdm_cp_samples = 128;        // Cyclic prefix samples (2.67ms, absorbs FM pre-emphasis transients)
+    int ofdm_nfft = 1024;             // FFT size (256, 512, or 1024) — 46.875 Hz spacing at 48k (~44 baud)
+    int ofdm_cp_samples = 64;         // Cyclic prefix samples (1.33ms). FM ~0 delay spread; minimal CP.
     bool ofdm_auto_spacing = false;   // Auto-train subcarrier spacing
     bool ofdm_waterfill = true;       // Per-subcarrier adaptive bit loading
     bool ofdm_nuc = true;             // Non-uniform constellations
@@ -139,7 +139,7 @@ inline const ParamVersion PARAM_VERSIONS[] = {
     {"Modem", "BandHighHz",    2},  // v1: 3500, v2: 2200 (AFSK space)
     {"Modem", "DcdThreshold",  1},  // v1: 0.05
     {"Modem", "FX25Mode",      1},  // v1: 0
-    {"OFDM",  "NFFT",          2},  // v1: 512, v2: 256 (wider carriers for FM)
+    {"OFDM",  "NFFT",          3},  // v1: 512, v2: 256, v3: 1024 (46.875 Hz spacing, ~44 baud)
 };
 inline constexpr int NUM_PARAM_VERSIONS = sizeof(PARAM_VERSIONS) / sizeof(PARAM_VERSIONS[0]);
 

@@ -300,27 +300,49 @@ def main():
             success = False
 
         if connected_a and connected_b:
-            # Wait for native mode upgrade before sending large data.
-            # Without this, data gets queued as AFSK (~67s for 10KB at 1200 baud)
-            # which buries the probe exchange and prevents native mode activation.
-            if not args.ax25_only and args.payload_size >= 1024:
-                print(f"\n[4b] Waiting for native mode upgrade (probe + SWITCH)...")
-                native_deadline = time.time() + 45
-                native_ready = False
-                while time.time() < native_deadline:
+            # Wait for probe + TUNE to complete before sending data.
+            # TUNE takes ~40s per direction (10 ramp frames × ~1.8s × 2 dirs).
+            # If we send data before TUNE finishes, it gets stuck behind ramp
+            # frames and the test times out.
+            if not args.ax25_only:
+                print(f"\n[4b] Waiting for probe + TUNE to complete...")
+                tune_deadline = time.time() + 120
+                tune_done_a = False
+                tune_done_b = False
+                while time.time() < tune_deadline:
                     time.sleep(2)
-                    # Check log A for native TX activation (initiator promotes first)
+                    for path, name, done_ref in [
+                        (log_a, "A", "a"), (log_b, "B", "b")]:
+                        if (done_ref == "a" and tune_done_a) or \
+                           (done_ref == "b" and tune_done_b):
+                            continue
+                        if os.path.isfile(path):
+                            with open(path) as f:
+                                content = f.read()
+                            if "[TUNE-AUDIT] APPLY" in content:
+                                if done_ref == "a":
+                                    tune_done_a = True
+                                else:
+                                    tune_done_b = True
+                                print(f"    TUNE complete on {name}")
+                    if tune_done_a and tune_done_b:
+                        break
+                    # Also accept if neither side started TUNE (ax25-only path)
                     if os.path.isfile(log_a):
                         with open(log_a) as f:
                             content = f.read()
-                        if "native TX active" in content or "native confirmed" in content:
-                            native_ready = True
-                            print("    Native mode active on A")
+                        if "native" not in content.lower() and \
+                           time.time() - tune_deadline + 120 > 30:
+                            print("    No native mode detected after 30s — "
+                                  "proceeding with AFSK")
                             break
-                if not native_ready:
-                    print("    Native mode not reached — sending data over AFSK")
+                if not (tune_done_a and tune_done_b):
+                    print(f"    TUNE not complete on both sides "
+                          f"(A={tune_done_a}, B={tune_done_b}) — "
+                          f"proceeding anyway")
                 else:
-                    time.sleep(2)  # Let both sides settle
+                    print("    Both sides TUNE complete")
+                time.sleep(2)  # Let both sides settle
             else:
                 time.sleep(1)
 

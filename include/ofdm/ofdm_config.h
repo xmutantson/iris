@@ -9,8 +9,8 @@ namespace iris {
 
 struct OfdmConfig {
     // Core parameters
-    int nfft = 512;                    // FFT size (256/512/1024) — 93.75 Hz spacing at 48k
-    int cp_samples = 128;              // Cyclic prefix length in samples (2.67ms, absorbs FM pre-emphasis transients)
+    int nfft = 1024;                   // FFT size (256/512/1024) — 46.875 Hz spacing at 48k (~44 baud, matches VARA FM)
+    int cp_samples = 64;               // Cyclic prefix length in samples (1.33ms). FM has ~0 delay spread; minimal CP for filter transients.
     int sample_rate = 48000;           // Fixed
 
     // Derived from probe
@@ -31,9 +31,9 @@ struct OfdmConfig {
     std::vector<int> data_carrier_bins;    // Data FFT bin indices
 
     // Pilot pattern
-    int pilot_carrier_spacing = 6;     // Every Nth used carrier — comb pilots for CPE + interpolation
+    int pilot_carrier_spacing = 4;     // Every Nth used carrier — comb pilots for CPE. 4 gives ~14 pilots in NBFM (~25% overhead).
     int pilot_symbol_spacing = 24;     // Every Mth OFDM symbol is all-pilot (block pilots for channel tracking)
-    int pilot_row_spacing = 5;         // Every Kth data symbol is a dense pilot row (all carriers = known ref)
+    int pilot_row_spacing = 8;         // Every Kth data symbol is a dense pilot row (all carriers = known ref)
 
     // FM TX de-emphasis: attenuate higher carriers on TX so that after the
     // radio's own pre-emphasis the signal is flat entering the deviation limiter.
@@ -50,7 +50,7 @@ struct OfdmConfig {
     bool dft_spread = true;
 
     // Sync detection thresholds
-    float fd_zc_threshold = 0.40f;     // FD-ZC quality gate (with de-emphasis-matched reference, genuine ≥ 0.50)
+    float fd_zc_threshold = 0.30f;     // FD-ZC quality gate (CRC-8 sync word is primary false-positive filter)
 
     // Header
     int n_header_symbols = 0;          // No header — config pre-negotiated (Mercury approach)
@@ -63,8 +63,8 @@ struct OfdmConfig {
 };
 
 // Create OfdmConfig from probe result
-OfdmConfig ofdm_config_from_probe(const NegotiatedPassband& passband, int nfft = 512, int cp_samples = 128,
-                                   int pilot_carrier_spacing = 6, int pilot_symbol_spacing = 24);
+OfdmConfig ofdm_config_from_probe(const NegotiatedPassband& passband, int nfft = 1024, int cp_samples = 64,
+                                   int pilot_carrier_spacing = 4, int pilot_symbol_spacing = 24);
 
 // Get the FFT bin index for a given frequency
 int freq_to_bin(float freq_hz, int nfft, int sample_rate);

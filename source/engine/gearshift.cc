@@ -163,13 +163,20 @@ void Gearshift::report_failure() {
     if (fail_count_ >= FAIL_THRESHOLD) {
         int old_level = current_level_;
         int old_ofdm = ofdm_level_;
+        bool can_downshift = (current_level_ > 0 || ofdm_level_ > 0);
         if (current_level_ > 0) current_level_--;
         if (ofdm_level_ > 0) ofdm_level_--;
         hold_count_ = 0;
         fail_count_ = 0;
-        cooldown_ = COOLDOWN_FRAMES;  // Suppress re-upshift for N frames
+        // Only set cooldown if we actually downshifted.  At the floor
+        // (A0/O0), cooldown blocks recovery without benefit — there is
+        // nowhere lower to go, so preventing re-upshift just delays
+        // adaptation after transient failures.
+        if (can_downshift)
+            cooldown_ = COOLDOWN_FRAMES;
         printf("[GEARSHIFT] modem failure downshift: A%d->A%d O%d->O%d (cooldown=%d frames)\n",
-               old_level, current_level_, old_ofdm, ofdm_level_, cooldown_);
+               old_level, current_level_, old_ofdm, ofdm_level_,
+               can_downshift ? cooldown_ : 0);
         fflush(stdout);
     }
 }

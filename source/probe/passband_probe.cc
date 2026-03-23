@@ -182,10 +182,17 @@ ProbeResult probe_analyze(const float* samples, int n_samples, int sample_rate) 
         if (peak > peak_tone_power) peak_tone_power = peak;
     }
 
-    // Pass 2: detect tones within threshold of peak
-    float threshold = peak_tone_power - PassbandProbeConfig::DETECT_THRESHOLD_DB;
+    // Pass 2: detect tones using dual threshold.
+    // Primary: within DETECT_THRESHOLD_DB of peak (15 dB — catches most tones).
+    // Secondary: above noise_floor + NOISE_FLOOR_MARGIN_DB (10 dB — catches
+    // upper tones weakened by FM de-emphasis rolloff that fall below the peak-
+    // relative threshold but are clearly real signals above the noise floor).
+    // The comb validation pass (Pass 3) rejects false positives from noise.
+    float threshold_peak = peak_tone_power - PassbandProbeConfig::DETECT_THRESHOLD_DB;
+    float threshold_floor = noise_floor + PassbandProbeConfig::NOISE_FLOOR_MARGIN_DB;
     for (int k = 0; k < PassbandProbeConfig::N_TONES; k++) {
-        result.tone_detected[k] = (result.tone_power_db[k] >= threshold);
+        result.tone_detected[k] = (result.tone_power_db[k] >= threshold_peak ||
+                                   result.tone_power_db[k] >= threshold_floor);
         if (result.tone_detected[k]) {
             if (first_detected < 0) first_detected = k;
             last_detected = k;

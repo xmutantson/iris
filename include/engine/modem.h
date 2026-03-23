@@ -80,7 +80,7 @@ enum class TuneState {
 struct ModemDiag {
     ModemState state;
     int speed_level;
-    int ofdm_speed_level = 0;  // O0-O7 OFDM level
+    int ofdm_speed_level = 0;  // O0-O9 OFDM level
     bool ofdm_active = false;  // True when OFDM PHY is active
     float snr_db;
     float agc_gain;
@@ -486,18 +486,21 @@ private:
     int tune_silence_ticks_ = 0;         // Ticks since last new measurement
     int tune_report_resend_cd_ = 0;      // Countdown to resend TUNE report in WAIT_REPORT
     int tune_report_resends_ = 0;        // Number of report retransmissions (max 2)
+    int tune_report_delay_cd_ = 0;       // Responder delay before sending report (avoid collision)
+    int tune_post_holdoff_ = 0;           // Responder TX holdoff after TUNE DONE (let initiator go first)
 
     // OFDM power-ramp TUNE: send 10 frames at geometrically-spaced TX levels.
     // Peer measures channel estimate H from preamble (even on LDPC failure)
     // and LDPC iters when decode succeeds. Reports all data points.
     // Sender fits a parabola in dB space to find the optimal drive level.
     //
-    // 10 levels spanning the usable range from max to min hardware output.
+    // 5 levels spanning the usable range from max to min hardware output.
     // Scales computed dynamically at TUNE start based on current tx_base to
-    // guarantee all 10 frames use distinct power levels (no clamping waste).
+    // guarantee all 5 frames use distinct power levels (no clamping waste).
     // Quality vs tx_dB is U-shaped: too quiet = noise, too loud = FM clipping.
-    static constexpr int TUNE_RAMP_COUNT = 10;
-    static constexpr float TUNE_SCALE_MIN = 0.05f;  // minimum absolute tx_level
+    // OTA testing shows 5-7 of 10 frames typically decode; 5 is sufficient.
+    static constexpr int TUNE_RAMP_COUNT = 5;
+    static constexpr float TUNE_SCALE_MIN = 0.15f;  // minimum absolute tx_level (OTA: <0.15 below FM noise floor)
     static constexpr float TUNE_SCALE_MAX = 1.0f;   // maximum absolute tx_level
     float tune_computed_scales_[TUNE_RAMP_COUNT] = {};  // computed per-session
     void tune_compute_scales(float base);  // populate tune_computed_scales_
@@ -513,22 +516,24 @@ private:
     float tune_rx_frame_H_[TUNE_RAMP_COUNT] = {};
     float tune_rx_frame_snr_[TUNE_RAMP_COUNT] = {};  // SC-metric SNR (dB) per frame
     // Compute optimal tx_level from parabolic fit of (tx_dB, iters) data
-    float tune_parabolic_fit() const;
+    float tune_fit_tx_level() const;
     std::string tune_build_ramp_report() const;  // builds RAMP3 or RAMP7 payload
 
     // Per-O-level TX drive offset (dB below O0 baseline).
     // Higher modulations have tighter constellations → more sensitive to FM
     // deviation limiter clipping. Applied multiplicatively at TX time.
     float ofdm_tx_base_ = 0.0f;         // O0 baseline tx_level (set by TUNE)
-    static constexpr float ofdm_level_offset_db_[8] = {
-         0.0f,   // O0 BPSK r1/2
-         0.0f,   // O1 QPSK r1/2
-         0.0f,   // O2 QPSK r3/4
-        -1.0f,   // O3 16QAM r1/2
-        -1.0f,   // O4 16QAM r3/4
-        -2.0f,   // O5 64QAM r3/4
-        -2.0f,   // O6 64QAM r7/8
-        -3.0f,   // O7 256QAM r7/8
+    static constexpr float ofdm_level_offset_db_[10] = {
+         0.0f,   // O0: BPSK r1/2
+         0.0f,   // O1: QPSK r1/2
+         0.0f,   // O2: QPSK r3/4
+        -1.0f,   // O3: 16QAM r1/2
+        -1.0f,   // O4: 16QAM r5/8
+        -1.0f,   // O5: 16QAM r3/4
+        -2.0f,   // O6: 64QAM r5/8
+        -2.0f,   // O7: 64QAM r3/4
+        -3.0f,   // O8: 256QAM r5/8
+        -3.0f,   // O9: 256QAM r3/4
     };
     float ofdm_effective_tx_level() const;  // base * 10^(offset/20)
 

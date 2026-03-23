@@ -68,6 +68,7 @@ constexpr uint16_t CAP_HARQ        = 0x0100;  // Per-symbol soft HARQ with piggy
 constexpr uint16_t CAP_OFDM        = 0x0200;  // OFDM PHY capable
 
 // OFDM-KISS transport layer markers
+constexpr uint8_t TUNE_REPORT_MAGIC = 0xBB;         // TUNE ramp report embedded in OFDM frame
 constexpr uint8_t COMPRESSED_PAYLOAD_MAGIC = 0xCC;  // Batch-compressed OFDM-KISS payload
 constexpr uint8_t B2F_DATA_MAGIC = 0xCD;            // B2F proxy data frame
 constexpr size_t  B2F_BUFFER_SIZE = 2 * 1024 * 1024; // 2MB B2F proxy buffer

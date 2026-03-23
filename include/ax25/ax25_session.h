@@ -106,6 +106,11 @@ public:
     // than waiting for the AX.25 T1 timeout (~30s).
     void request_retransmit();
 
+    // Start T1 if there are unacknowledged frames (V(A) != V(S)).
+    // Belt-and-suspenders: called at OFDM TX time to ensure T1 is running
+    // even if notify_outgoing() was called before native_active_ was set.
+    void start_t1_if_unacked();
+
 private:
     void set_state(Ax25SessionState s);
 

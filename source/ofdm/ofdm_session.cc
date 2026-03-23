@@ -7,18 +7,19 @@
 namespace iris {
 
 // Map speed level to FEC rate (matches OFDM_SPEED_LEVELS[] table).
-// O0=BPSK r1/2, O1=QPSK r1/2, O2=QPSK r3/4, O3=16QAM r1/2,
-// O4=16QAM r3/4, O5=64QAM r3/4, O6=64QAM r7/8, O7=256QAM r7/8
+// Monotonic: O0-O9, no throughput inversions.
 static LdpcRate speed_level_to_fec(int level) {
     switch (level) {
-        case 0:  return LdpcRate::RATE_1_2;   // BPSK r1/2
-        case 1:  return LdpcRate::RATE_1_2;   // QPSK r1/2
-        case 2:  return LdpcRate::RATE_3_4;   // QPSK r3/4
-        case 3:  return LdpcRate::RATE_1_2;   // 16QAM r1/2
-        case 4:  return LdpcRate::RATE_3_4;   // 16QAM r3/4
-        case 5:  return LdpcRate::RATE_3_4;   // 64QAM r3/4
-        case 6:  return LdpcRate::RATE_7_8;   // 64QAM r7/8
-        case 7:  return LdpcRate::RATE_7_8;   // 256QAM r7/8
+        case 0:  return LdpcRate::RATE_1_2;   // O0: BPSK r1/2
+        case 1:  return LdpcRate::RATE_1_2;   // O1: QPSK r1/2
+        case 2:  return LdpcRate::RATE_3_4;   // O2: QPSK r3/4
+        case 3:  return LdpcRate::RATE_1_2;   // O3: 16QAM r1/2
+        case 4:  return LdpcRate::RATE_5_8;   // O4: 16QAM r5/8
+        case 5:  return LdpcRate::RATE_3_4;   // O5: 16QAM r3/4
+        case 6:  return LdpcRate::RATE_5_8;   // O6: 64QAM r5/8
+        case 7:  return LdpcRate::RATE_3_4;   // O7: 64QAM r3/4
+        case 8:  return LdpcRate::RATE_5_8;   // O8: 256QAM r5/8
+        case 9:  return LdpcRate::RATE_3_4;   // O9: 256QAM r3/4
         default: return LdpcRate::RATE_1_2;
     }
 }

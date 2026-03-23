@@ -18,7 +18,7 @@ struct ToneMap {
     int n_data_carriers = 0;
     int total_bits_per_symbol = 0;  // sum of bits_per_carrier
     LdpcRate fec_rate = LdpcRate::RATE_1_2;
-    int nfft = 512;
+    int nfft = 1024;
     uint8_t tone_map_id = 0;  // 0=waterfill, 1-8=uniform presets
     bool use_nuc = false;     // Use Non-Uniform Constellations (ATSC 3.0 optimized)
     int n_codewords = 1;      // LDPC blocks per frame (>1 = multi-codeword)

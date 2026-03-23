@@ -312,6 +312,28 @@ static int decode_min_sum(const std::vector<float>& llr, const IraMatrix& M,
             }
         }
 
+        // Early bail-out for noise: after iteration 3, count unsatisfied
+        // parity checks (syndrome weight).  Real frames at decodable SNR
+        // reduce syndrome weight to <30% by iteration 3.  Pure noise stays
+        // at ~50% (random bits satisfy half the checks by chance).
+        // Bail if syndrome weight > 45% after iter 3 — saves ~47 wasted
+        // iterations on false triggers.
+        if (iter == 3) {
+            int unsatisfied = 0;
+            for (int j = 0; j < M.p; j++) {
+                int parity = 0;
+                for (int idx = 0; idx < M.cwidth; idx++) {
+                    int col = M.c_adj(j, idx);
+                    if (col == -1) break;
+                    if (ws.posterior[col] < 0) parity ^= 1;
+                }
+                if (parity != 0) unsatisfied++;
+            }
+            float sw = (float)unsatisfied / M.p;
+            if (sw > 0.45f)
+                return max_iter;  // noise — no point continuing
+        }
+
         if (ws.check_syndrome(M))
             return iter + 1;
     }

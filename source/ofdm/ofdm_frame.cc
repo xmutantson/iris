@@ -115,14 +115,16 @@ struct UniformPreset {
 };
 
 static const UniformPreset kUniformPresets[] = {
-    { 1, 1, LdpcRate::RATE_1_2 },  // BPSK r1/2 (O0 — max robustness for FM)
-    { 2, 2, LdpcRate::RATE_1_2 },  // QPSK r1/2
-    { 3, 2, LdpcRate::RATE_3_4 },  // QPSK r3/4
-    { 4, 4, LdpcRate::RATE_1_2 },  // 16QAM r1/2
-    { 5, 4, LdpcRate::RATE_3_4 },  // 16QAM r3/4
-    { 6, 6, LdpcRate::RATE_3_4 },  // 64QAM r3/4
-    { 7, 6, LdpcRate::RATE_7_8 },  // 64QAM r7/8
-    { 8, 8, LdpcRate::RATE_7_8 },  // 256QAM r7/8
+    { 1, 1, LdpcRate::RATE_1_2 },  // O0: BPSK r1/2
+    { 2, 2, LdpcRate::RATE_1_2 },  // O1: QPSK r1/2
+    { 3, 2, LdpcRate::RATE_3_4 },  // O2: QPSK r3/4
+    { 4, 4, LdpcRate::RATE_1_2 },  // O3: 16QAM r1/2
+    { 5, 4, LdpcRate::RATE_5_8 },  // O4: 16QAM r5/8
+    { 6, 4, LdpcRate::RATE_3_4 },  // O5: 16QAM r3/4
+    { 7, 6, LdpcRate::RATE_5_8 },  // O6: 64QAM r5/8
+    { 8, 6, LdpcRate::RATE_3_4 },  // O7: 64QAM r3/4
+    { 9, 8, LdpcRate::RATE_5_8 },  // O8: 256QAM r5/8
+    {10, 8, LdpcRate::RATE_3_4 },  // O9: 256QAM r3/4
 };
 static constexpr int kNumPresets = sizeof(kUniformPresets) / sizeof(kUniformPresets[0]);
 

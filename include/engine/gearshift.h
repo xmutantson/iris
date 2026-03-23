@@ -61,7 +61,7 @@ public:
 private:
     int current_level_;
     int max_level_;
-    int ofdm_level_;             // Current OFDM O-level (O0-O7)
+    int ofdm_level_;             // Current OFDM O-level (O0-O9)
     int max_ofdm_level_;
     bool locked_ = false;
     bool initialized_ = false;

@@ -26,6 +26,7 @@ struct PassbandProbeConfig {
         (TONE_HIGH_HZ - TONE_LOW_HZ) / (N_TONES - 1);  // ~66.7 Hz
     static constexpr float PROBE_DURATION_S = 2.25f;     // 2.25s probe burst (3x for better SNR)
     static constexpr float DETECT_THRESHOLD_DB = 15.0f;  // Below peak tone (wider catches edge rolloff)
+    static constexpr float NOISE_FLOOR_MARGIN_DB = 10.0f; // Above noise floor (catches FM de-emphasis rolloff)
     static constexpr float EDGE_MARGIN_HZ = 25.0f;       // Safety margin (was 50 Hz)
 };
 

@@ -133,6 +133,21 @@ void Ax25Session::notify_outgoing(const uint8_t* frame, size_t len) {
         if (dist_new > dist_old) {
             vs_ = next_vs;
         }
+        // In native/OFDM mode, Iris owns the transport layer and must
+        // supervise the link.  Start T1 so we can poll the peer if the
+        // KISS client's frame doesn't get acknowledged.  Without this,
+        // recovery depends entirely on the KISS client's retry logic
+        // (typically exponential backoff — 35-75s per retry cycle).
+        if (native_active_ && t1_ == 0 && va_ != vs_) {
+            t1_ = t1_value_;
+            t3_ = 0;
+            IRIS_LOG("AX25 T1 started for KISS I-frame in native mode: %d ticks (%.1fs) [V(A)=%d V(S)=%d]",
+                     t1_value_, t1_value_ * 0.05, va_, vs_);
+        } else if (native_active_) {
+            // Diagnostic: log why T1 was NOT started
+            IRIS_LOG("AX25 notify_outgoing I-frame: T1 not started [native=%d t1=%d V(A)=%d V(S)=%d chan_busy=%d]",
+                     (int)native_active_, t1_, va_, vs_, (int)channel_busy_);
+        }
     }
 }
 
@@ -291,6 +306,20 @@ void Ax25Session::request_retransmit() {
     reject_exception_ = true;
     send_rej(false, true);  // Command REJ, no poll bit
     acknowledge_pending_ = false;
+}
+
+void Ax25Session::start_t1_if_unacked() {
+    if (!native_active_) return;
+    if (state_ != Ax25SessionState::CONNECTED &&
+        state_ != Ax25SessionState::TIMER_RECOVERY)
+        return;
+    std::lock_guard<std::mutex> lock(timer_mutex_);
+    if (t1_ == 0 && va_ != vs_) {
+        t1_ = t1_value_;
+        t3_ = 0;
+        IRIS_LOG("AX25 T1 started (start_t1_if_unacked): %d ticks (%.1fs) [V(A)=%d V(S)=%d]",
+                 t1_value_, t1_value_ * 0.05, va_, vs_);
+    }
 }
 
 void Ax25Session::send_next_iframe() {
@@ -1289,6 +1318,15 @@ void Ax25Session::lower_t1_for_native() {
         t1_value_ = native_floor;
         IRIS_LOG("AX25 T1 lowered for native mode: %d ticks (%.1fs)",
                  t1_value_, t1_value_ * 0.05);
+    }
+    // KISS I-frames may have been queued before native_active_ was set
+    // (during AFSK/probe phase).  Start T1 now if there are unacknowledged
+    // frames so the link doesn't stall waiting for the KISS client's
+    // much slower retry logic.
+    if (t1_ == 0 && va_ != vs_) {
+        t1_ = t1_value_;
+        IRIS_LOG("AX25 T1 started on native activation: %d ticks (%.1fs) [V(A)=%d V(S)=%d]",
+                 t1_value_, t1_value_ * 0.05, va_, vs_);
     }
 }
 

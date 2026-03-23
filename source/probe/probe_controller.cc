@@ -227,6 +227,7 @@ void ProbeController::analyze_captured() {
         // (from the AFSK message in Turn 2), try_finalize completes.
         // Otherwise wait for it.
         send_result(their_tx_result_);
+        send_result(their_tx_result_);  // Send twice for half-duplex reliability
         state_ = ProbeState::WAITING_RESULT;
         timeout_ = TIMEOUT_TICKS;
         try_finalize();
@@ -234,6 +235,7 @@ void ProbeController::analyze_captured() {
         // Responder: we've analyzed initiator's probe from Turn 1.
         // Turn 2: send RESULT + our own probe tones.
         send_result(their_tx_result_);
+        send_result(their_tx_result_);  // Send twice for half-duplex reliability
         generate_and_send_probe();
         state_ = ProbeState::WAITING_RESULT;
         timeout_ = TIMEOUT_TICKS;
@@ -259,6 +261,13 @@ void ProbeController::tick() {
         timeout_--;
         if (timeout_ == 0) {
             IRIS_LOG("[PROBE] Timeout in state %d, aborting", (int)state_);
+            // If we analyzed peer's probe but never got their analysis of ours,
+            // assume symmetric passband: use our analysis for both directions.
+            // This prevents total probe failure when one RESULT frame is lost.
+            if (their_tx_result_.valid && !my_tx_result_.valid) {
+                IRIS_LOG("[PROBE] Timeout: using symmetric assumption (our analysis for both directions)");
+                my_tx_result_ = their_tx_result_;
+            }
             if (their_tx_result_.valid || my_tx_result_.valid) {
                 negotiated_ = probe_negotiate(my_tx_result_, their_tx_result_);
                 has_results_ = true;

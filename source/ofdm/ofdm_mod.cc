@@ -138,18 +138,20 @@ ToneMap make_uniform_tone_map(uint8_t preset_id, int n_data_carriers, int nfft) 
         LdpcRate fec;
     };
     static const Preset presets[] = {
-        {0, LdpcRate::NONE},         // 0 = waterfill placeholder
-        {1, LdpcRate::RATE_1_2},     // 1 = BPSK r1/2
-        {2, LdpcRate::RATE_1_2},     // 2 = QPSK r1/2
-        {2, LdpcRate::RATE_3_4},     // 3 = QPSK r3/4
-        {4, LdpcRate::RATE_1_2},     // 4 = 16QAM r1/2
-        {4, LdpcRate::RATE_3_4},     // 5 = 16QAM r3/4
-        {6, LdpcRate::RATE_3_4},     // 6 = 64QAM r3/4
-        {6, LdpcRate::RATE_7_8},     // 7 = 64QAM r7/8
-        {8, LdpcRate::RATE_7_8},     // 8 = 256QAM r7/8
+        {0, LdpcRate::NONE},         //  0 = waterfill placeholder
+        {1, LdpcRate::RATE_1_2},     //  1 = O0: BPSK r1/2
+        {2, LdpcRate::RATE_1_2},     //  2 = O1: QPSK r1/2
+        {2, LdpcRate::RATE_3_4},     //  3 = O2: QPSK r3/4
+        {4, LdpcRate::RATE_1_2},     //  4 = O3: 16QAM r1/2
+        {4, LdpcRate::RATE_5_8},     //  5 = O4: 16QAM r5/8
+        {4, LdpcRate::RATE_3_4},     //  6 = O5: 16QAM r3/4
+        {6, LdpcRate::RATE_5_8},     //  7 = O6: 64QAM r5/8
+        {6, LdpcRate::RATE_3_4},     //  8 = O7: 64QAM r3/4
+        {8, LdpcRate::RATE_5_8},     //  9 = O8: 256QAM r5/8
+        {8, LdpcRate::RATE_3_4},     // 10 = O9: 256QAM r3/4
     };
 
-    int idx = (preset_id <= 8) ? preset_id : 2;  // default to QPSK r1/2
+    int idx = (preset_id <= 10) ? preset_id : 2;  // default to QPSK r1/2
     if (idx == 0) idx = 2;  // waterfill fallback = QPSK r1/2
 
     tm.bits_per_carrier.assign(n_data_carriers, (uint8_t)presets[idx].bpc);
@@ -646,7 +648,51 @@ std::vector<std::complex<float>> OfdmModulator::build_ofdm_frame(
     for (auto& s : train1) s *= PREAMBLE_BOOST;
     for (auto& s : train2) s *= PREAMBLE_BOOST;
 
-    // ---- 9. (Header removed — config pre-negotiated, Mercury approach) ----
+    // ---- 9. Sync word symbol ----
+    // Deterministic BPSK symbol after preamble with embedded CRC-8.
+    // First (n_used - 8) carriers carry LFSR pseudo-random BPSK bits.
+    // Last 8 carriers carry CRC-8 of those bits (one bit per carrier).
+    // RX equalizes, hard-decides, recomputes CRC-8 and compares.
+    // False triggers: random bits → CRC match probability = 1/256.
+    // Real frames: known pattern → CRC always matches (0 errors at decodable SNR).
+    // Purely structural check — no threshold, no gray zone.
+    std::vector<std::complex<float>> sync_word_sym;
+    {
+        std::vector<std::complex<float>> sync_freq(config_.nfft, {0.0f, 0.0f});
+        int n_data_bits = n_used - 8;  // LFSR bits (data portion)
+
+        // Generate LFSR bits for data carriers
+        uint16_t lfsr = 0xACE1;
+        std::vector<uint8_t> sw_bits(n_used);
+        for (int i = 0; i < n_data_bits; i++) {
+            sw_bits[i] = lfsr & 1;
+            uint16_t bit = lfsr & 1;
+            lfsr >>= 1;
+            if (bit) lfsr ^= 0xB400;
+        }
+
+        // Compute CRC-8 over data bits (pack into bytes)
+        int n_bytes = (n_data_bits + 7) / 8;
+        std::vector<uint8_t> packed(n_bytes, 0);
+        for (int i = 0; i < n_data_bits; i++)
+            packed[i / 8] |= (sw_bits[i] << (i % 8));
+        uint8_t crc = crc8(packed.data(), n_bytes);
+
+        // Place CRC-8 in last 8 carriers
+        for (int i = 0; i < 8; i++)
+            sw_bits[n_data_bits + i] = (crc >> i) & 1;
+
+        // Map all bits to BPSK on carriers with de-emphasis
+        for (int i = 0; i < n_used; i++) {
+            int bin = config_.used_carrier_bins[i];
+            float g = fm_tx_deemph_gain(bin, config_.nfft, config_.sample_rate,
+                                   config_.fm_preemph_corner_hz,
+                                   config_.fm_preemph_gain_cap);
+            float sign = sw_bits[i] ? 1.0f : -1.0f;
+            sync_freq[bin] = {sign * g, 0.0f};
+        }
+        sync_word_sym = symbol_to_time(sync_freq);
+    }
 
     // ---- 10. Assemble data symbols with block pilots + dense pilot rows ----
     std::vector<std::vector<std::complex<float>>> all_data_time;
@@ -681,15 +727,27 @@ std::vector<std::complex<float>> OfdmModulator::build_ofdm_frame(
     auto tail = generate_pilot_symbol();
 
     // ---- 12. Concatenate all time-domain symbols ----
-    // Frame: [train1][train2][data+block_pilots][tail] — no header symbols
-    int total_ofdm_symbols = 2 + (int)all_data_time.size() + 1;
+    // Frame: [noise][train1][train2][sync_word][data+block_pilots][tail]
+    // The leading noise symbol absorbs AGC settling, squelch opening, and
+    // FM PTT transients — prevents preamble corruption on real radios.
+    int total_ofdm_symbols = 1 + 2 + 1 + (int)all_data_time.size() + 1;
     int sym_len = config_.symbol_samples();
     std::vector<std::complex<float>> frame;
     frame.reserve(total_ofdm_symbols * sym_len);
 
+    // Leading noise symbol: noise-like OFDM symbol for AGC/squelch settling.
+    // Use the same pilot symbol structure (known +1 on all carriers) — the
+    // RX Schmidl-Cox correlator ignores it because it's a single symbol
+    // (SC needs two identical symbols). Same amplitude as data symbols.
+    auto noise_sym = generate_pilot_symbol();
+    frame.insert(frame.end(), noise_sym.begin(), noise_sym.end());
+
     // Training
     frame.insert(frame.end(), train1.begin(), train1.end());
     frame.insert(frame.end(), train2.begin(), train2.end());
+
+    // Sync word (known BPSK pattern for false-trigger rejection)
+    frame.insert(frame.end(), sync_word_sym.begin(), sync_word_sym.end());
 
     // Data + block pilots
     for (auto& ds : all_data_time)
@@ -711,7 +769,7 @@ std::vector<std::complex<float>> OfdmModulator::build_ofdm_frame(
     // Skip preamble (2 training symbols) to keep channel estimate clean.
     // Preamble has inherently lower PAPR (ZC sequence ≈ constant envelope)
     // and doesn't go through the deviation limiter independently.
-    int preamble_samples = 2 * sym_len;
+    int preamble_samples = 4 * sym_len;  // noise + train1 + train2 + sync_word (skip clipper)
     std::vector<std::complex<float>> data_part(frame.begin() + preamble_samples, frame.end());
     // Adaptive PAPR target based on modulation order: higher-order QAM needs
     // gentler clipping to keep EVM low enough for LDPC convergence.
@@ -865,8 +923,14 @@ std::vector<std::complex<float>> OfdmModulator::build_ofdm_frame(
     }
 
     // ---- 14. Log frame stats ----
-    IRIS_LOG("[OFDM-TX] frame: %d OFDM syms, %d bytes, PAPR=%.1f->%.1f dB, %d clipped, NUC=%s%s",
-             total_ofdm_symbols, (int)len,
+    IRIS_LOG("[OFDM-TX] frame: %d OFDM syms (%d data), %d bytes, %zu IQ samples (%.0f ms)",
+             total_ofdm_symbols, (int)all_data_time.size(), (int)len,
+             frame.size(), frame.size() * 1000.0f / config_.sample_rate);
+    IRIS_LOG("[OFDM-TX] config: nfft=%d cp=%d sym=%d pilots=%d data=%d spacing=%d dft_spread=%d",
+             config_.nfft, config_.cp_samples, sym_len,
+             config_.n_pilot_carriers, config_.n_data_carriers,
+             config_.pilot_carrier_spacing, config_.dft_spread ? 1 : 0);
+    IRIS_LOG("[OFDM-TX] PAPR=%.1f->%.1f dB, %d clipped, NUC=%s%s",
              papr_before_db, papr_after_db,
              n_clipped, tone_map.use_nuc ? "ON" : "off",
              skip_clip ? " (clip skipped)" : "");
