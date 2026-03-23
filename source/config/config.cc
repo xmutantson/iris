@@ -191,11 +191,6 @@ IrisConfig load_config(const std::string& path) {
     cfg.sim_bandpass_high = ini.get_float("Test", "SimBandpassHigh", cfg.sim_bandpass_high);
 
     cfg.ofdm_enable = ini.get_bool("OFDM", "Enable", cfg.ofdm_enable);
-    cfg.ofdm_nfft = ini.get_int("OFDM", "NFFT", cfg.ofdm_nfft);
-    cfg.ofdm_auto_spacing = ini.get_bool("OFDM", "AutoSpacing", cfg.ofdm_auto_spacing);
-    cfg.ofdm_waterfill = ini.get_bool("OFDM", "Waterfill", cfg.ofdm_waterfill);
-    cfg.ofdm_nuc = ini.get_bool("OFDM", "NUC", cfg.ofdm_nuc);
-    cfg.ofdm_preemph_corner_hz = ini.get_float("OFDM", "PreemphCornerHz", cfg.ofdm_preemph_corner_hz);
 
     cfg.show_constellation = ini.get_bool("GUI", "ShowConstellation", cfg.show_constellation);
     cfg.show_waterfall = ini.get_bool("GUI", "ShowWaterfall", cfg.show_waterfall);
@@ -261,11 +256,6 @@ bool save_config(const std::string& path, const IrisConfig& cfg) {
     ini.set_float("Test", "SimBandpassHigh", cfg.sim_bandpass_high);
 
     ini.set_bool("OFDM", "Enable", cfg.ofdm_enable);
-    ini.set_int("OFDM", "NFFT", cfg.ofdm_nfft);
-    ini.set_bool("OFDM", "AutoSpacing", cfg.ofdm_auto_spacing);
-    ini.set_bool("OFDM", "Waterfill", cfg.ofdm_waterfill);
-    ini.set_bool("OFDM", "NUC", cfg.ofdm_nuc);
-    ini.set_float("OFDM", "PreemphCornerHz", cfg.ofdm_preemph_corner_hz);
 
     ini.set_bool("GUI", "ShowConstellation", cfg.show_constellation);
     ini.set_bool("GUI", "ShowWaterfall", cfg.show_waterfall);

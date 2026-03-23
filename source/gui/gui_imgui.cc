@@ -1514,17 +1514,6 @@ void IrisGui::update(const ModemDiag& diag, IrisConfig& config,
 
                 ImGui::Text("OFDM PHY (high-throughput, default)");
                 ImGui::Checkbox("Use OFDM PHY (uncheck for legacy single-carrier)", &config.ofdm_enable);
-                if (config.ofdm_enable) {
-                    // NFFT dropdown
-                    const char* nfft_items[] = { "256", "512", "1024" };
-                    int nfft_idx = (config.ofdm_nfft == 256) ? 0 : (config.ofdm_nfft == 1024) ? 2 : 1;
-                    if (ImGui::Combo("NFFT", &nfft_idx, nfft_items, 3)) {
-                        config.ofdm_nfft = (nfft_idx == 0) ? 256 : (nfft_idx == 2) ? 1024 : 512;
-                    }
-                    ImGui::Checkbox("Waterfilling", &config.ofdm_waterfill);
-                    ImGui::Checkbox("Non-uniform constellations (NUC)", &config.ofdm_nuc);
-                    ImGui::Checkbox("Auto-train spacing", &config.ofdm_auto_spacing);
-                }
 
                 ImGui::EndTabItem();
             }

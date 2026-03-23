@@ -1652,6 +1652,12 @@ void Modem::process_rx_native(const float* audio, int count) {
                     payload.assign(decomp_buf.begin(), decomp_buf.begin() + dec_len);
                 } else {
                     IRIS_LOG("OFDM-KISS: decompression failed, dropping");
+                    size_t consumed_samples = (result.samples_consumed > 0)
+                        ? (size_t)(sync.frame_start + result.samples_consumed)
+                        : (size_t)(sync.frame_start + ofdm_config_.nfft * 4);
+                    size_t consumed = std::min(consumed_samples, ofdm_rx_audio_buf_.size());
+                    ofdm_rx_audio_buf_.erase(ofdm_rx_audio_buf_.begin(),
+                                              ofdm_rx_audio_buf_.begin() + consumed);
                     rx_overlap_buf_.clear();
                     return;
                 }
@@ -1663,14 +1669,21 @@ void Modem::process_rx_native(const float* audio, int count) {
             // potentially corrupting AX.25 session state (N(R) stuck at 0).
             {
                 static const uint8_t tune_marker[] = "TUNE_TEST_FRAME";
-                if (payload.size() == sizeof(tune_marker) - 1 &&
-                    memcmp(payload.data(), tune_marker, payload.size()) == 0) {
-                    IRIS_LOG("[TUNE] Discarded OFDM test frame (not dispatching to AX.25)");
-                    rx_overlap_buf_.clear();
-                    return;
-                }
-                if (!payload.empty() && payload[0] == TUNE_REPORT_MAGIC) {
-                    IRIS_LOG("[TUNE] Discarded OFDM report frame (not dispatching to AX.25)");
+                bool is_tune_test = (payload.size() == sizeof(tune_marker) - 1 &&
+                    memcmp(payload.data(), tune_marker, payload.size()) == 0);
+                bool is_tune_report = (!payload.empty() && payload[0] == TUNE_REPORT_MAGIC);
+                if (is_tune_test || is_tune_report) {
+                    IRIS_LOG("[TUNE] Discarded OFDM %s frame (not dispatching to AX.25)",
+                             is_tune_test ? "test" : "report");
+                    // Drain consumed samples so the same frame isn't re-detected.
+                    // Without this, self-hear audio loops: the preamble stays in
+                    // ofdm_rx_audio_buf_ and is decoded 100+ times (OTA bug 2026-03-23).
+                    size_t consumed_samples = (result.samples_consumed > 0)
+                        ? (size_t)(sync.frame_start + result.samples_consumed)
+                        : (size_t)(sync.frame_start + ofdm_config_.nfft * 4);
+                    size_t consumed = std::min(consumed_samples, ofdm_rx_audio_buf_.size());
+                    ofdm_rx_audio_buf_.erase(ofdm_rx_audio_buf_.begin(),
+                                              ofdm_rx_audio_buf_.begin() + consumed);
                     rx_overlap_buf_.clear();
                     return;
                 }

@@ -139,7 +139,6 @@ inline const ParamVersion PARAM_VERSIONS[] = {
     {"Modem", "BandHighHz",    2},  // v1: 3500, v2: 2200 (AFSK space)
     {"Modem", "DcdThreshold",  1},  // v1: 0.05
     {"Modem", "FX25Mode",      1},  // v1: 0
-    {"OFDM",  "NFFT",          3},  // v1: 512, v2: 256, v3: 1024 (46.875 Hz spacing, ~44 baud)
 };
 inline constexpr int NUM_PARAM_VERSIONS = sizeof(PARAM_VERSIONS) / sizeof(PARAM_VERSIONS[0]);
 
