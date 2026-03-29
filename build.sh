@@ -1,13 +1,20 @@
 #!/bin/bash
 # Iris FM data modem build script
-# Usage: bash build.sh [debug|release|o0|o1|o2|o3|asan|ubsan|gui|gui-debug|gui-sdl|gui-sdl-debug]
+# Usage: bash build.sh [debug|release|o0|o1|o2|o3|asan|ubsan|gui|gui-debug|gui-sdl|gui-sdl-debug] [clean]
 
 set -e
 
 MODE="${1:-gui}"
 CXX="${CXX:-g++}"
-OUTDIR="build"
 BINARY="iris"
+CLEAN=""
+
+# Parse arguments
+for arg in "$@"; do
+    case "$arg" in
+        clean) CLEAN=1 ;;
+    esac
+done
 
 CXXFLAGS="-std=c++17 -Wall -Wextra -Wpedantic -I include -I third_party/monocypher -I third_party/zstd -I third_party/ppmd -I third_party/lzhuf -I third_party/mlkem"
 IMGUI_FLAGS=""
@@ -40,6 +47,24 @@ fi
 
 if [ -n "$SANITIZER_FLAGS" ]; then
     CXXFLAGS="$CXXFLAGS $SANITIZER_FLAGS"
+fi
+
+# Build directory (separate per mode)
+OUTDIR="build"
+OBJDIR="build/obj_${MODE}"
+
+# Clean function
+do_clean() {
+    echo "Cleaning..."
+    rm -rf build/
+    echo "Clean done."
+}
+
+if [ "$CLEAN" = "1" ]; then
+    do_clean
+    if [ "$MODE" = "clean" ] || [ "$1" = "clean" ]; then
+        exit 0
+    fi
 fi
 
 # Platform detection
@@ -88,36 +113,88 @@ else
     LDFLAGS="-lpthread"
 fi
 
-mkdir -p "$OUTDIR"
+mkdir -p "$OUTDIR" "$OBJDIR"
 
 # C library optimization level (matches CXX for o3, else O2)
 C_OPT="${OPT_LEVEL:--O2}"
 
 # Parallel job count
-NPROC=$(nproc 2>/dev/null || echo 4)
+NPROC=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
-# Compile C libraries (in parallel)
-CC="${CC:-gcc}"
-MONOCYPHER_OBJ="$OUTDIR/monocypher.o"
-ZSTD_OBJ="$OUTDIR/zstd.o"
-LZHUF_OBJ="$OUTDIR/lzhuf.o"
-MLKEM_OBJ="$OUTDIR/mlkem_native.o"
+# --- Dependency-tracked parallel compilation ---
 
-$CC -c $C_OPT $SANITIZER_FLAGS -I third_party/monocypher third_party/monocypher/monocypher.c -o "$MONOCYPHER_OBJ" &
-$CC -c $C_OPT $SANITIZER_FLAGS -I third_party/zstd third_party/zstd/zstd.c -o "$ZSTD_OBJ" &
-$CC -c $C_OPT $SANITIZER_FLAGS -DLZHUF -DB2F -I third_party/lzhuf third_party/lzhuf/lzhuf.c -o "$LZHUF_OBJ" &
-$CC -c $C_OPT $SANITIZER_FLAGS -I third_party/mlkem -I third_party/mlkem/src third_party/mlkem/mlkem_native.c -o "$MLKEM_OBJ" &
+PIDS=()
+FAIL=0
 
-PPMD_OBJS=""
-for f in third_party/ppmd/Ppmd8.c third_party/ppmd/Ppmd8Enc.c third_party/ppmd/Ppmd8Dec.c; do
-    OBJ="$OUTDIR/$(basename $f .c).o"
-    $CC -c $C_OPT $SANITIZER_FLAGS -I third_party/ppmd "$f" -o "$OBJ" &
-    PPMD_OBJS="$PPMD_OBJS $OBJ"
-done
-wait
+wait_slot() {
+    while [ ${#PIDS[@]} -ge "$NPROC" ]; do
+        local new_pids=()
+        for pid in "${PIDS[@]}"; do
+            if kill -0 "$pid" 2>/dev/null; then
+                new_pids+=("$pid")
+            else
+                wait "$pid" || FAIL=1
+            fi
+        done
+        if [ ${#new_pids[@]} -ge "$NPROC" ]; then
+            wait -n 2>/dev/null || {
+                for pid in "${PIDS[@]}"; do wait "$pid" || FAIL=1; done
+                PIDS=()
+                return
+            }
+            new_pids=()
+            for pid in "${PIDS[@]}"; do
+                if kill -0 "$pid" 2>/dev/null; then
+                    new_pids+=("$pid")
+                else
+                    wait "$pid" || FAIL=1
+                fi
+            done
+        fi
+        PIDS=("${new_pids[@]}")
+    done
+}
 
+wait_all() {
+    for pid in "${PIDS[@]}"; do
+        wait "$pid" || FAIL=1
+    done
+    PIDS=()
+    if [ "$FAIL" = "1" ]; then
+        echo "*** Compilation failed"
+        exit 1
+    fi
+}
+
+# needs_rebuild SRC OBJ — true if obj missing, src newer, or any dep header changed
+needs_rebuild() {
+    local src="$1" obj="$2"
+    [ ! -f "$obj" ] && return 0
+    [ "$src" -nt "$obj" ] && return 0
+    local dep="${obj%.o}.d"
+    if [ -f "$dep" ]; then
+        while IFS= read -r line; do
+            line="${line%\\}"
+            line="${line#*: }"
+            for f in $line; do
+                [ -f "$f" ] && [ "$f" -nt "$obj" ] && return 0
+            done
+        done < "$dep"
+    else
+        return 0
+    fi
+    return 1
+}
+
+# obj_name: flatten source path to single filename in objdir
+obj_name() {
+    echo "$OBJDIR/$(echo "$1" | sed 's|/|_|g; s|\.cc$|.o|; s|\.cpp$|.o|; s|\.c$|.o|')"
+}
+
+# Collect sources
 SOURCES=$(find source -name '*.cc' -o -name '*.cpp' | sort)
 
+IMGUI_SOURCES=""
 if [ "$USE_IMGUI" = "1" ]; then
     IMGUI_SOURCES="third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp third_party/imgui/imgui_tables.cpp third_party/imgui/imgui_widgets.cpp third_party/imgui/backends/imgui_impl_opengl3.cpp"
 
@@ -128,35 +205,92 @@ if [ "$USE_IMGUI" = "1" ]; then
         IMGUI_SOURCES="$IMGUI_SOURCES third_party/imgui/backends/imgui_impl_win32.cpp"
         echo "=== Building Iris ($MODE + Dear ImGui + Win32) ==="
     fi
-
-    SOURCES="$SOURCES $IMGUI_SOURCES"
 else
     echo "=== Building Iris ($MODE) ==="
 fi
 
 echo "  CXX: $CXX  (${NPROC} parallel jobs)"
-echo "  Sources: $(echo $SOURCES | wc -w) files"
 
-# Compile C++ sources in parallel
-CXX_OBJS=""
-for src in $SOURCES; do
-    OBJ="$OUTDIR/$(echo "$src" | sed 's|/|_|g; s|\.cc$|.o|; s|\.cpp$|.o|')"
-    CXX_OBJS="$CXX_OBJS $OBJ"
+# C library sources
+C_LIB_SOURCES="
+third_party/monocypher/monocypher.c
+third_party/zstd/zstd.c
+third_party/lzhuf/lzhuf.c
+third_party/mlkem/mlkem_native.c
+third_party/ppmd/Ppmd8.c
+third_party/ppmd/Ppmd8Enc.c
+third_party/ppmd/Ppmd8Dec.c
+"
+
+# --- Compile C libraries ---
+CC="${CC:-gcc}"
+C_OBJS=""
+C_COMPILED=0
+
+for src in $C_LIB_SOURCES; do
+    obj=$(obj_name "$src")
+    C_OBJS="$C_OBJS $obj"
+    if needs_rebuild "$src" "$obj"; then
+        EXTRA_C=""
+        case "$src" in
+            *lzhuf.c) EXTRA_C="-DLZHUF -DB2F -I third_party/lzhuf" ;;
+            *monocypher.c) EXTRA_C="-I third_party/monocypher" ;;
+            *zstd.c) EXTRA_C="-I third_party/zstd" ;;
+            *mlkem_native.c) EXTRA_C="-I third_party/mlkem -I third_party/mlkem/src" ;;
+            *Ppmd*) EXTRA_C="-I third_party/ppmd" ;;
+        esac
+        echo "  $src"
+        wait_slot
+        dep="${obj%.o}.d"
+        $CC -c $C_OPT $SANITIZER_FLAGS -MMD -MF "$dep" $EXTRA_C "$src" -o "$obj" &
+        PIDS+=($!)
+        ((C_COMPILED++)) || true
+    fi
 done
 
-# Use xargs for parallel compilation
-echo "$SOURCES" | tr ' ' '\n' | while read src; do
-    OBJ="$OUTDIR/$(echo "$src" | sed 's|/|_|g; s|\.cc$|.o|; s|\.cpp$|.o|')"
-    echo "$CXX $CXXFLAGS -c $src -o $OBJ"
-done | xargs -P "$NPROC" -I CMD sh -c 'CMD'
+# --- Compile C++ sources ---
+CXX_OBJS=""
+CXX_COMPILED=0
+
+for src in $SOURCES $IMGUI_SOURCES; do
+    obj=$(obj_name "$src")
+    CXX_OBJS="$CXX_OBJS $obj"
+    if needs_rebuild "$src" "$obj"; then
+        echo "  $src"
+        wait_slot
+        dep="${obj%.o}.d"
+        $CXX $CXXFLAGS -MMD -MF "$dep" -c "$src" -o "$obj" &
+        PIDS+=($!)
+        ((CXX_COMPILED++)) || true
+    fi
+done
+
+wait_all
+
+TOTAL=$((C_COMPILED + CXX_COMPILED))
+if [ "$TOTAL" -eq 0 ] && [ -f "$OUTDIR/$BINARY" ]; then
+    echo "  (nothing changed)"
+    echo "=== Build complete: $OUTDIR/$BINARY ==="
+    ls -la "$OUTDIR/$BINARY"
+    echo ""
+    if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "mingw"* || "$OSTYPE" == "cygwin" ]]; then
+        INSTALL_DIR="/c/Program Files/Iris"
+        mkdir -p "$INSTALL_DIR" 2>/dev/null && cp "$OUTDIR/$BINARY" "$INSTALL_DIR/" && \
+            echo "*** Installed to $INSTALL_DIR/$BINARY" || true
+    fi
+    exit 0
+fi
+
+echo "  $TOTAL files compiled"
 
 # Link
-$CXX $CXX_OBJS "$MONOCYPHER_OBJ" "$ZSTD_OBJ" $PPMD_OBJS "$LZHUF_OBJ" "$MLKEM_OBJ" -o "$OUTDIR/$BINARY" $LDFLAGS $IMGUI_FLAGS $SANITIZER_FLAGS
+echo "Linking $OUTDIR/$BINARY..."
+$CXX $CXX_OBJS $C_OBJS -o "$OUTDIR/$BINARY" $LDFLAGS $IMGUI_FLAGS $SANITIZER_FLAGS
 
 echo "=== Build complete: $OUTDIR/$BINARY ==="
 ls -la "$OUTDIR/$BINARY"
 
-# Install reminder
+# Install
 echo ""
 if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "mingw"* || "$OSTYPE" == "cygwin" ]]; then
     INSTALL_DIR="/c/Program Files/Iris"

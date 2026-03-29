@@ -1067,6 +1067,149 @@ static void test_ofdm_speed_levels() {
 
 }
 
+// =======================================================================
+//  OFDM Throughput Config Reliability: test O8/O9 with various pilot
+//  spacing and frame length settings through the FM channel simulator.
+//  Goal: identify which throughput-increasing configs are safe.
+// =======================================================================
+static void test_ofdm_throughput_configs() {
+    printf("\n=== DFT-Spread ON vs OFF: FM Channel Reliability ===\n");
+
+    NegotiatedPassband pb;
+    pb.low_hz = 300.0f;
+    pb.high_hz = 3000.0f;
+    pb.center_hz = 1650.0f;
+    pb.bandwidth_hz = 2700.0f;
+    pb.valid = true;
+
+    // Large payload buffer for max-fill tests
+    uint8_t payload[2400];
+    for (int i = 0; i < 2400; i++) payload[i] = (uint8_t)(i * 37 + 13);
+
+    struct Preset {
+        int id;
+        const char* name;
+        LdpcRate fec;
+    };
+    Preset presets[] = {
+        { 7, "O6 64Q r5/8",  LdpcRate::RATE_5_8},
+        { 8, "O7 64Q r3/4",  LdpcRate::RATE_3_4},
+        { 9, "O8 256Q r5/8", LdpcRate::RATE_5_8},
+        {10, "O9 256Q r3/4", LdpcRate::RATE_3_4},
+    };
+    int n_presets = 4;
+
+    struct TestCase {
+        bool dft_spread;
+        int carrier_sp;
+        int ncw;
+        int payload_bytes;
+    };
+    // Max payload per block: r5/8 k=1000→119B, r3/4 k=1200→144B
+    TestCase cases[] = {
+        // DFT-spread ON — baseline
+        {true,  8,  1,   32},    // single cw
+        {true,  8,  4,  476},    // ncw=4, 476B (O8 max fill)
+        {true,  8,  8,  952},    // ncw=8, 952B (O8 max fill)
+        {true,  8,  8, 1152},    // ncw=8, 1152B (O7 max fill)
+        {true,  4,  1,   32},    // single cw, dense pilots
+        {true,  4,  4,  476},    // ncw=4, dense pilots
+        {true,  4,  8,  952},    // ncw=8, dense pilots
+        // DFT-spread OFF — same configs
+        {false, 8,  1,   32},    // single cw
+        {false, 8,  4,  476},    // ncw=4
+        {false, 8,  8,  952},    // ncw=8
+        {false, 8,  8, 1152},    // ncw=8 (O7 max fill)
+        {false, 4,  1,   32},    // single cw, dense pilots
+        {false, 4,  4,  476},    // ncw=4, dense pilots
+        {false, 4,  8,  952},    // ncw=8, dense pilots
+    };
+    int n_cases = (int)(sizeof(cases) / sizeof(cases[0]));
+
+    struct Result {
+        const char* status;
+        int ldpc_iters;
+        int n_syms;
+        float snr_db;
+    };
+    Result results[14][4];
+
+    for (int ci = 0; ci < n_cases; ci++) {
+        auto& tc = cases[ci];
+        OfdmConfig cfg = ofdm_config_from_probe(pb, 1024, 64, tc.carrier_sp, 24);
+        cfg.dft_spread = tc.dft_spread;
+
+        for (int pi = 0; pi < n_presets; pi++) {
+            auto& pr = presets[pi];
+            auto& r = results[ci][pi];
+            r = {"SKIP", 0, 0, 0.0f};
+
+            ToneMap tm = get_uniform_tone_map(pr.id, cfg);
+            tm.n_codewords = tc.ncw;
+            OfdmModulator mod(cfg);
+            auto iq = mod.build_ofdm_frame(payload, tc.payload_bytes, tm, pr.fec, tc.ncw);
+            if (iq.empty()) continue;
+
+            std::vector<float> fm_audio(iq.size());
+            for (size_t i = 0; i < iq.size(); i++)
+                fm_audio[i] = iq[i].real();
+
+            fm_channel_process(fm_audio.data(), (int)fm_audio.size(), 0.50f, 0.0f);
+
+            auto rx_iq = hilbert_analytic(fm_audio.data(), (int)fm_audio.size());
+            size_t pad = 48000;
+            rx_iq.insert(rx_iq.begin(), pad, std::complex<float>(0, 0));
+            rx_iq.insert(rx_iq.end(), pad, std::complex<float>(0, 0));
+
+            auto sync = ofdm_detect_frame(rx_iq.data(), (int)rx_iq.size(), cfg);
+            if (!sync.detected) { r.status = "NO DET"; continue; }
+
+            OfdmDemodulator demod(cfg);
+            auto result = demod.demodulate(rx_iq.data(), (int)rx_iq.size(), tm, &sync);
+            bool match = result.success &&
+                         (result.payload.size() == (size_t)tc.payload_bytes) &&
+                         (memcmp(result.payload.data(), payload, tc.payload_bytes) == 0);
+
+            r.status = match ? "PASS" : "FAIL";
+            r.ldpc_iters = result.worst_ldpc_iters;
+            r.n_syms = result.n_data_symbols;
+            r.snr_db = result.snr_db;
+        }
+    }
+
+    // Print results
+    printf("\n  %-4s %-4s %-4s %-5s |", "DFTs", "c_sp", "ncw", "bytes");
+    for (int pi = 0; pi < n_presets; pi++)
+        printf(" %-14s |", presets[pi].name);
+    printf("\n  ---------------------+");
+    for (int pi = 0; pi < n_presets; pi++)
+        printf("----------------+");
+    printf("\n");
+    for (int ci = 0; ci < n_cases; ci++) {
+        auto& tc = cases[ci];
+        int syms = 0;
+        for (int pi = 0; pi < n_presets; pi++)
+            if (results[ci][pi].n_syms > 0) { syms = results[ci][pi].n_syms; break; }
+        printf("  %-4s %-4d %-4d %-5d |", tc.dft_spread ? "ON" : "OFF",
+               tc.carrier_sp, tc.ncw, tc.payload_bytes);
+        for (int pi = 0; pi < n_presets; pi++) {
+            auto& r = results[ci][pi];
+            if (r.ldpc_iters == 0)
+                printf(" %-14s |", r.status);
+            else
+                printf(" %-6s i=%-5d |", r.status, r.ldpc_iters);
+        }
+        printf("\n");
+        // Separator between DFT ON and OFF sections
+        if (ci == 6) {
+            printf("  ---------------------+");
+            for (int pi = 0; pi < n_presets; pi++)
+                printf("----------------+");
+            printf("\n");
+        }
+    }
+}
+
 static void test_ofdm_kiss_loopback() {
     printf("\n=== OFDM-KISS Audio Loopback (Mode A upconvert/downconvert) ===\n");
 
@@ -1194,6 +1337,7 @@ int run_tests() {
     test_ofdm_phy_roundtrip();
     test_ofdm_multi_codeword();
     test_ofdm_speed_levels();
+    test_ofdm_throughput_configs();
 
     // Phase 3: Auto-upgrade
     printf("\n--- Phase 3: Auto-Upgrade ---\n");

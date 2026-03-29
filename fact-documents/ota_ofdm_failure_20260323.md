@@ -89,18 +89,54 @@ Every legitimate OTA frame (both directions) shows:
 
 ## §5 Root Cause Analysis
 
-### Primary cause: Insufficient link margin
-- OTA SNR is 0-6 dB (32 carriers, 93.75 Hz spacing)
-- BPSK r=1/2 needs ~5 dB Eb/N0 → ~5 dB SNR at 1 bpc
-- Most frames are at 0-3 dB — no margin at all
-- FM de-emphasis rolls off higher subcarriers (3 dB/octave above 300 Hz pre-emphasis corner), reducing effective SNR on upper carriers
+### Primary cause: Almost all "OTA frames" are false sync triggers on noise
 
-### Contributing causes:
-1. **NFFT=512 too few carriers**: 32 carriers in ~3 kHz = 93.75 Hz spacing. FM pre-emphasis/de-emphasis creates ~10 dB amplitude variation across band. With only 8 pilots, channel estimation is poor.
+Evidence from detection metrics across both logs:
 
-2. **Phase drift from FM discriminator**: FM demodulation converts frequency to amplitude. Any frequency offset becomes a DC offset + phase ramp. 20 Hz CFO × 12ms symbol = 86 deg/symbol phase — well beyond what sparse pilots can track.
+**Initiator (KG7VSN) detections of W7WEK frames:**
+| Time | SC | FD-ZC | CFO (Hz) | SNR (dB) | Verdict |
+|------|-----|-------|----------|----------|---------|
+| 55.3s | 0.502 | 0.309 | -21.5 | 0.0 | **False** — FD-ZC barely above 0.30, SNR=0 |
+| 56.5s | 0.680 | 0.377 | -26.7 | 3.3 | **Likely false** — CFO jumped 5 Hz |
+| 57.5s | 0.530 | 0.520 | -21.0 | 0.5 | **Possible** — FD-ZC decent but SNR=0.5 |
+| 58.6s | 0.605 | 0.526 | -18.3 | 1.9 | **Possible** — FD-ZC decent |
+| 59.6s | 0.574 | 0.319 | +4.6 | 1.3 | **False** — CFO flipped sign (+4.6 vs -21) |
+| 60.6s | 0.508 | 0.329 | -17.0 | 0.1 | **False** — SC/FD-ZC/SNR all marginal |
 
-3. **Many false sync triggers**: CFO varying from -27 Hz to +5 Hz between "frames" from same station strongly suggests noise-triggered false syncs. SC=0.5-0.68 is barely above threshold (0.5).
+**Responder (W7WEK) detections of KG7VSN frames:**
+| Time | SC | FD-ZC | CFO (Hz) | SNR (dB) | Verdict |
+|------|-----|-------|----------|----------|---------|
+| 50.2s | 0.788 | 0.151 | -23.5 | 5.7 | **Best candidate** — SC good but FD-ZC=0.151! |
+| 51.2s | 0.525 | 0.197 | -23.6 | 0.4 | **False** — FD-ZC=0.197 |
+| 52.3s | 0.670 | 0.314 | -1.1 | 3.1 | **False** — CFO jumped from -23.5 to -1.1 |
+| 53.4s | 0.507 | 0.395 | +2.0 | 0.1 | **False** — CFO sign flip |
+| 54.3s | 0.535 | 0.346 | -1.8 | 0.6 | **False** — inconsistent CFO |
+
+**Self-hear detections (for comparison):**
+| Time | SC | FD-ZC | CFO (Hz) | SNR (dB) | Verdict |
+|------|-----|-------|----------|----------|---------|
+| 61.6s | 0.950 | 0.752 | -3.7 | 12.8 | **Real** (self-hear) |
+| 62.6s | 0.950 | 0.752 | -3.7 | 12.8 | **Same frame** (re-scan bug) |
+
+**Key observations:**
+1. A **real** ZC detection has SC≈0.95, FD-ZC≈0.75. OTA "detections" have SC=0.5-0.7, FD-ZC=0.15-0.53
+2. **CFO is wildly inconsistent**: -27 Hz, -1 Hz, +2 Hz, +5 Hz between "frames" from the **same TX**. Real FM offset is approximately constant. This confirms noise triggers.
+3. **FD-ZC threshold lowered to 0.15 during TUNE** (modem.cc:1311), which lets through detections that would be rejected in normal operation (threshold 0.30). The responder's "best" frame at FD-ZC=0.151 is barely above the TUNE threshold.
+4. **Sync word CRC fails on 100% of OTA frames** — if even one were a real frame, the 8-bit CRC has 1/256 chance of passing, and it never does.
+5. The **316 deg/sym "phase drift"** is meaningless — it's the Kalman tracking noise after a false sync placed the frame window at the wrong position. There is no real signal to track.
+
+### ~~Phase drift from FM discriminator~~ [Corrected]
+The extreme phase numbers (up to 316 deg/sym) are NOT evidence of FM channel phase distortion. They result from false sync triggers on noise, where the Kalman has no real signal to lock onto. The one plausible real frame (responder T=50.2s, SC=0.788, SNR=5.7 dB) showed -250 deg/sym — but even this had FD-ZC=0.151, suggesting a marginal detection at best.
+
+### Root cause chain:
+1. **NFFT=512 loaded from stale INI** → 32 carriers, ZC preamble length 32 → ZC correlation gain only ~15 dB
+2. **Signal too weak for 32-carrier ZC** → real preambles scored FD-ZC=0.15-0.53 (real detection should be >0.7)
+3. **TUNE mode lowers FD-ZC threshold to 0.15** → noise triggers pass the gate
+4. **Sync word CRC is 8-bit** → with 10 false triggers per session, 10/256 ≈ 4% chance of one passing (none did)
+5. **Kalman tracks noise** → accumulates thousands of degrees → reported as "phase drift"
+
+### Remaining question: Was the signal actually present?
+The responder's first detection (SC=0.788, FD-ZC=0.151, SNR=5.7 dB, CFO=-23.5 Hz) is the most likely real frame. SC=0.788 is decent but FD-ZC=0.151 is terrible. The ZC correlation gain with only 32 carriers may not be enough to distinguish the signal from noise at 5.7 dB SNR. **With NFFT=1024 (~42 carriers), ZC length increases and correlation gain improves by ~1.2 dB.** This may or may not be enough — the next OTA test will tell.
 
 4. **Self-hear corrupts TUNE**: Initiator's 134 self-hear frames produce avg_H=11.88 and set tx_level=0.750 — wildly incorrect for the actual channel.
 

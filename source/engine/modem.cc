@@ -303,7 +303,7 @@ bool Modem::init(const IrisConfig& config) {
         else if (config_.ofdm_nfft == 256) nfft_code = 1;
         probe_.set_local_ofdm_config(
             (uint8_t)config_.ofdm_cp_samples,  // e.g. 64
-            4,   // pilot_carrier_spacing
+            8,   // pilot_carrier_spacing (1:8, 50 data carriers; 64QAM FM ceiling)
             24,  // pilot_symbol_spacing
             nfft_code);
     }
@@ -2515,15 +2515,17 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                 // Multi-codeword frames: amortize preamble + pilot overhead.
                 // Each LDPC block is independently decodable with per-block SACK.
                 // O0-O1: n_cw=1 (keep frames short for weak-signal reliability).
-                // O2-O5: n_cw=4 (moderate overhead reduction).
-                // O6+:   n_cw=8 (maximize throughput at high SNR).
+                // O2-O5: n_cw=4. O6-O7 (64QAM): n_cw=8 (best throughput ceiling).
+                // O8-O9 (256QAM): n_cw=4 — 256QAM can't sustain ncw=8 partial fill through FM.
+                // In practice O7 ncw=8 (~6 kbps) beats O8 ncw=4 (~4.3 kbps).
                 int ofdm_cw_per_frame = 1;
-                if (ofdm_speed_level_ >= 6) ofdm_cw_per_frame = 8;
+                if (ofdm_speed_level_ >= 8) ofdm_cw_per_frame = 4;
+                else if (ofdm_speed_level_ >= 6) ofdm_cw_per_frame = 8;
                 else if (ofdm_speed_level_ >= 2) ofdm_cw_per_frame = 4;
                 size_t max_payload;
                 if (ofdm_phy_active_ && !native_hail_active) {
-                    int k_bytes = LdpcCodec::block_size(LdpcRate::RATE_1_2) / 8;
-                    int per_block = std::max(20, k_bytes - 6);
+                    int k_bytes = LdpcCodec::block_size(ofdm_tone_map_.fec_rate) / 8;
+                    int per_block = std::max(20, k_bytes - 6);  // 2-byte len + 4-byte CRC overhead
                     max_payload = (size_t)(per_block * ofdm_cw_per_frame);
                 } else {
                     max_payload = (size_t)NATIVE_MAX_PAYLOAD;
@@ -3924,7 +3926,7 @@ void Modem::tick() {
                 // (max CP, min pilot spacings) so both sides compute identical config.
                 // Old peers (v3 or earlier) have ofdm_* = 0, meaning "use defaults."
                 int cp = config_.ofdm_cp_samples;
-                int carrier_pilot_spacing = 8;  // default: 1:8 comb pilots (FM channel is flat)
+                int carrier_pilot_spacing = 8;  // default: 1:8 comb pilots (50 data carriers; 64QAM ceiling)
                 int block_pilot_spacing = 24;   // default (was 14, widened for throughput)
                 int nfft = config_.ofdm_nfft;
                 {
@@ -3973,13 +3975,13 @@ void Modem::tick() {
                         float var = sum2 / n_det - mean * mean;
                         float std_db = std::sqrt(std::max(0.0f, var));
                         if (std_db < 3.0f) {
-                            carrier_pilot_spacing = 14;   // very flat: ~7% pilot overhead
-                            block_pilot_spacing = 32;
-                        } else if (std_db < 6.0f) {
-                            carrier_pilot_spacing = 8;    // moderate: ~12.5% pilot overhead
+                            carrier_pilot_spacing = 8;    // flat: 1:8 fine for 64QAM ceiling
                             block_pilot_spacing = 24;
+                        } else if (std_db < 6.0f) {
+                            carrier_pilot_spacing = 8;    // moderate
+                            block_pilot_spacing = 16;
                         } else {
-                            carrier_pilot_spacing = 4;    // rough channel: ~25% pilot overhead
+                            carrier_pilot_spacing = 4;    // rough: tighter pilots for equalization
                             block_pilot_spacing = 8;
                         }
                         IRIS_LOG("[OFDM-AUTO] probe flatness: std=%.1f dB → pilot spacing 1:%d (carrier) 1:%d (block)",
@@ -5541,7 +5543,7 @@ bool Modem::try_use_cached_probe(const std::string& callsign) {
         ofdm_pb.valid = true;
 
         int cp = config_.ofdm_cp_samples;
-        int carrier_pilot_spacing = 8;   // FM channel is flat, fewer pilots needed
+        int carrier_pilot_spacing = 8;   // 1:8 comb pilots (50 data carriers; 64QAM ceiling)
         int block_pilot_spacing = 24;
         int nfft = config_.ofdm_nfft;
 
