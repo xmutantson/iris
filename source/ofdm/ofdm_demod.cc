@@ -224,9 +224,9 @@ void OfdmDemodulator::equalize_mmse(
         // despreading) captures actual distortion including BPF effects.
         // The per-carrier NV floor here only needs to prevent numerical
         // instability — the real noise estimation happens in dft_sigma_sq.
-        // Without DFT-spread, cap at ~27 dB (0.002) for 256QAM headroom.
+        // Without DFT-spread, cap at ~33 dB (0.0005) for 1024QAM headroom.
         constexpr float NV_ABS_FLOOR = 0.001f;  // -30 dB absolute
-        constexpr float NV_REL_FLOOR = 0.002f;  // max 27 dB effective SNR per carrier
+        constexpr float NV_REL_FLOOR = 0.0005f;  // max 33 dB effective SNR per carrier
         float nv_floor = std::max(NV_ABS_FLOOR, NV_REL_FLOOR * H_mag2);
         if (nv < nv_floor) nv = nv_floor;
 
@@ -288,7 +288,7 @@ void OfdmDemodulator::demap_to_llrs(
             float H_mag2 = std::norm(est.H[i]);
             float nv = (i < (int)est.noise_var.size()) ? est.noise_var[i] : 0.001f;
             constexpr float NV_ABS_FLOOR = 0.001f;
-            constexpr float NV_REL_FLOOR = 0.002f;  // 27 dB cap — must match equalize_mmse
+            constexpr float NV_REL_FLOOR = 0.0005f;  // 33 dB cap — must match equalize_mmse
             float nv_floor = std::max(NV_ABS_FLOOR, NV_REL_FLOOR * H_mag2);
             if (nv < nv_floor) nv = nv_floor;
             sigma_sum += (H_mag2 + nv > 1e-12f) ? (nv / (H_mag2 + nv)) : 1.0f;
@@ -323,7 +323,7 @@ void OfdmDemodulator::demap_to_llrs(
             float H_mag2 = std::norm(est.H[i]);
             float nv = (i < (int)est.noise_var.size()) ? est.noise_var[i] : 0.001f;
             constexpr float NV_ABS_FLOOR = 0.001f;
-            constexpr float NV_REL_FLOOR = 0.002f;
+            constexpr float NV_REL_FLOOR = 0.0005f;
             float nv_floor = std::max(NV_ABS_FLOOR, NV_REL_FLOOR * H_mag2);
             if (nv < nv_floor) nv = nv_floor;
             sigma_sq = (H_mag2 + nv > 1e-12f) ? (nv / (H_mag2 + nv)) : 1.0f;
