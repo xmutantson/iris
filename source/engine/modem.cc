@@ -2512,19 +2512,19 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                 // Cap payload at actual LDPC block capacity for current speed level.
                 // LDPC k bits = data bits per block.  Minus 6 bytes overhead (2 len + 4 CRC).
                 // Multi-codeword: pack multiple LDPC blocks per frame to amortize
-                // preamble + pilot overhead. Each block is independently decodable.
-                // Single codeword per frame: keeps frames short (~1.3s at O0)
-                // for reliable sync+decode. Multi-codeword doubles frame length
-                // (2.5s at O0) — too long for the redetect buffer (1.5s limit)
-                // and exposes more phase drift on FM. Re-enable for O2+ when
-                // throughput > reliability.
-                static constexpr int OFDM_CODEWORDS_PER_FRAME = 1;
+                // Multi-codeword frames: amortize preamble + pilot overhead.
+                // Each LDPC block is independently decodable with per-block SACK.
+                // O0-O1: n_cw=1 (keep frames short for weak-signal reliability).
+                // O2-O5: n_cw=4 (moderate overhead reduction).
+                // O6+:   n_cw=8 (maximize throughput at high SNR).
+                int ofdm_cw_per_frame = 1;
+                if (ofdm_speed_level_ >= 6) ofdm_cw_per_frame = 8;
+                else if (ofdm_speed_level_ >= 2) ofdm_cw_per_frame = 4;
                 size_t max_payload;
                 if (ofdm_phy_active_ && !native_hail_active) {
-                    // Worst-case per-block capacity (O1 r1/2, K=800) × n_codewords.
                     int k_bytes = LdpcCodec::block_size(LdpcRate::RATE_1_2) / 8;
                     int per_block = std::max(20, k_bytes - 6);
-                    max_payload = (size_t)(per_block * OFDM_CODEWORDS_PER_FRAME);
+                    max_payload = (size_t)(per_block * ofdm_cw_per_frame);
                 } else {
                     max_payload = (size_t)NATIVE_MAX_PAYLOAD;
                 }
@@ -2680,7 +2680,7 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                         ofdm_tone_map_ = get_uniform_tone_map(preset, ofdm_config_);
                     }
                     ofdm_tone_map_.use_nuc = config_.ofdm_nuc;
-                    ofdm_tone_map_.n_codewords = OFDM_CODEWORDS_PER_FRAME;
+                    ofdm_tone_map_.n_codewords = ofdm_cw_per_frame;
                     LdpcRate fec = ofdm_tone_map_.fec_rate;
 
                     IRIS_LOG("[TX-OFDM] speed=O%d %s fec=%d/%d, %zu bytes, %d cw/frame, %d carriers, %d bits/sym",
@@ -2688,14 +2688,14 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                              ofdm_tone_map_.tone_map_id == 0 ? "waterfill" : "uniform",
                              OFDM_SPEED_LEVELS[ofdm_speed_level_].fec_rate_num,
                              OFDM_SPEED_LEVELS[ofdm_speed_level_].fec_rate_den,
-                             frame_data.size(), OFDM_CODEWORDS_PER_FRAME,
+                             frame_data.size(), ofdm_cw_per_frame,
                              ofdm_config_.n_data_carriers,
                              ofdm_tone_map_.total_bits_per_symbol);
 
                     // Build OFDM frame (returns complex samples, real-valued via Hermitian symmetry)
                     ofdm_iq = ofdm_mod_->build_ofdm_frame(
                         frame_data.data(), frame_data.size(), ofdm_tone_map_, fec,
-                        OFDM_CODEWORDS_PER_FRAME);
+                        ofdm_cw_per_frame);
                     if (ofdm_iq.empty()) {
                         IRIS_LOG("[TX-OFDM] build_ofdm_frame rejected %zu bytes — skipping TX",
                                  frame_data.size());
@@ -2838,7 +2838,7 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                         int burst_frames = 1;
                         constexpr int MAX_BURST = 8;
                         size_t burst_max_payload = (size_t)(std::max(20,
-                            LdpcCodec::block_size(ofdm_tone_map_.fec_rate) / 8 - 6) * OFDM_CODEWORDS_PER_FRAME);
+                            LdpcCodec::block_size(ofdm_tone_map_.fec_rate) / 8 - 6) * ofdm_cw_per_frame);
 
                         while (!tx_queue_.empty() &&
                                frame_airtime_s < batch_airtime_s_ &&
@@ -2903,7 +2903,7 @@ void Modem::process_tx(float* tx_audio, int frame_count) {
                             auto xiq = ofdm_mod_->build_ofdm_frame(
                                 xframe.data(), xframe.size(),
                                 ofdm_tone_map_, ofdm_tone_map_.fec_rate,
-                                OFDM_CODEWORDS_PER_FRAME);
+                                ofdm_cw_per_frame);
                             if (xiq.empty()) {
                                 IRIS_LOG("[TX-OFDM] burst frame %d rejected — stopping burst",
                                          burst_frames + 1);
@@ -3924,7 +3924,7 @@ void Modem::tick() {
                 // (max CP, min pilot spacings) so both sides compute identical config.
                 // Old peers (v3 or earlier) have ofdm_* = 0, meaning "use defaults."
                 int cp = config_.ofdm_cp_samples;
-                int carrier_pilot_spacing = 4;  // default: 1:4 comb pilots
+                int carrier_pilot_spacing = 8;  // default: 1:8 comb pilots (FM channel is flat)
                 int block_pilot_spacing = 24;   // default (was 14, widened for throughput)
                 int nfft = config_.ofdm_nfft;
                 {
@@ -3973,10 +3973,13 @@ void Modem::tick() {
                         float var = sum2 / n_det - mean * mean;
                         float std_db = std::sqrt(std::max(0.0f, var));
                         if (std_db < 3.0f) {
-                            carrier_pilot_spacing = 12;
+                            carrier_pilot_spacing = 14;   // very flat: ~7% pilot overhead
+                            block_pilot_spacing = 32;
+                        } else if (std_db < 6.0f) {
+                            carrier_pilot_spacing = 8;    // moderate: ~12.5% pilot overhead
                             block_pilot_spacing = 24;
-                        } else if (std_db > 8.0f) {
-                            carrier_pilot_spacing = 4;
+                        } else {
+                            carrier_pilot_spacing = 4;    // rough channel: ~25% pilot overhead
                             block_pilot_spacing = 8;
                         }
                         IRIS_LOG("[OFDM-AUTO] probe flatness: std=%.1f dB → pilot spacing 1:%d (carrier) 1:%d (block)",
@@ -5538,7 +5541,7 @@ bool Modem::try_use_cached_probe(const std::string& callsign) {
         ofdm_pb.valid = true;
 
         int cp = config_.ofdm_cp_samples;
-        int carrier_pilot_spacing = 4;
+        int carrier_pilot_spacing = 8;   // FM channel is flat, fewer pilots needed
         int block_pilot_spacing = 24;
         int nfft = config_.ofdm_nfft;
 

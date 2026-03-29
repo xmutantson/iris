@@ -646,15 +646,18 @@ OfdmDemodResult OfdmDemodulator::demodulate(
     };
 
     // Process noise — scaled proportionally to symbol period.
-    // Reference: NFFT=512, CP=32 → 544/48000 = 11.33ms. Values tuned empirically.
-    // Phase std dev ~ √t (Wiener process), freq drift ~ t, accel ~ t^1.5.
-    // Using conservative sqrt scaling to keep Kalman responsive to measurements.
+    // Reference: NFFT=512, CP=32 → 544/48000 = 11.33ms.
+    // For a Wiener frequency process with σ_f Hz/√s:
+    //   Var[Δω] = (2π·σ_f)² · T_sym³  (freq state in rad/sym units)
+    // At σ_f=3 Hz/√s, NFFT=1024: Var[Δω] = 4.1e-3 rad²
+    // q_freq must match this to keep the Kalman responsive to drift.
+    // Phase: q_phase ~ σ_f²·T³/3 ≈ 1.4e-3 at NFFT=1024.
     const float sym_t = config_.symbol_duration_s();
     const float ref_t = 544.0f / 48000.0f;  // reference period (NFFT=512, CP=32)
     const float t_ratio = sym_t / ref_t;
     const float q_phase = 1e-3f * std::sqrt(t_ratio);   // rad²/symbol
-    const float q_freq  = 1e-4f * t_ratio;              // rad²/symbol³
-    const float q_accel = 1e-6f * t_ratio * std::sqrt(t_ratio);  // rad²/symbol⁵
+    const float q_freq  = 2e-3f * t_ratio;              // rad²/symbol³ (matches 3 Hz/√s drift)
+    const float q_accel = 5e-6f * t_ratio * std::sqrt(t_ratio);  // rad²/symbol⁵
     // Measurement noise
     const float r_pilot = 0.01f;   // pilot row / block pilot (~6° RMS)
     const float r_comb  = 0.09f;   // comb pilot CPE (~17° RMS)
@@ -693,6 +696,7 @@ OfdmDemodResult OfdmDemodulator::demodulate(
     std::vector<std::vector<std::complex<float>>> stored_eq(n_data_symbols);
     std::vector<int> stored_n_data(n_data_symbols, 0);
     std::vector<float> stored_fwd_phase(n_data_symbols, 0.0f);
+    std::vector<int> sym_positions(n_data_symbols, 0);  // byte offset of each data symbol in iq_corrected
 
     OfdmKalmanState ks;  // running Kalman state
 
@@ -925,6 +929,7 @@ OfdmDemodResult OfdmDemodulator::demodulate(
             return result;
         }
 
+        sym_positions[data_sym_count] = pos;  // store for RTS second pass
         const std::complex<float>* sym_body = iq_corrected.data() + pos + cp;
         std::copy(sym_body, sym_body + nfft, fft_buf.data());
         tdf_derotate(fft_buf.data(), ks);
@@ -1170,8 +1175,114 @@ OfdmDemodResult OfdmDemodulator::demodulate(
         }
     }
 
-    // ---- RTS re-correction + deferred soft demapping ----
-    // Apply (smoothed - forward) residual to stored eq carriers, then demap
+    // ---- RTS second pass: re-FFT with smoothed tdf for 64QAM+ ----
+    // The forward pass tdf uses the predicted (pre-measurement) Kalman state,
+    // which lags the actual frequency drift. For 64QAM+, the residual ICI from
+    // this prediction error exceeds the decision boundary margin.
+    // Solution: re-FFT using RTS-smoothed freq/accel for tdf (better ICI removal),
+    // then fresh comb pilot measurement for CPE (not smoothed_phase, which doesn't
+    // capture the direct comb/BPS corrections from the forward pass).
+    // Cost: one extra FFT per data symbol (N=1024, negligible at ~44 sym/s).
+    // Ref: Petrovic, Rave & Fettweis, "Phase Noise Suppression in OFDM", 2007.
+    // Gate on Kalman dynamics: only run second pass if freq drift is significant.
+    // Check max |smoothed_freq| across data symbols — if < threshold, forward pass
+    // is already accurate enough and re-FFT introduces quantization noise.
+    float max_rts_freq = 0.0f;
+    for (int k = 0; k < data_sym_count; k++)
+        max_rts_freq = std::max(max_rts_freq, std::abs(smoothed_freq[k]));
+    bool rts_tdf_needed = (max_bpc >= 6 && data_sym_count > 2 &&
+                           max_rts_freq > 0.01f);  // ~0.6 deg/sym threshold
+
+    if (rts_tdf_needed) {
+        for (int k = 0; k < data_sym_count; k++) {
+            int nd = stored_n_data[k];
+            if (nd <= 0) continue;
+
+            // Re-read time-domain symbol from iq_corrected
+            const auto* sym_body = iq_corrected.data() + sym_positions[k] + cp;
+            std::copy(sym_body, sym_body + nfft, fft_buf.data());
+
+            // tdf with RTS-smoothed freq/accel (optimal ICI removal)
+            OfdmKalmanState rts_ks;
+            rts_ks.freq = smoothed_freq[k];
+            rts_ks.accel = smoothed_accel[k];
+            tdf_derotate(fft_buf.data(), rts_ks);
+
+            // Re-FFT
+            fft_complex(fft_buf.data(), nfft);
+
+            // Extract carriers at used bins
+            for (int i = 0; i < n_used; i++)
+                used_carriers_buf[i] = fft_buf[config_.used_carrier_bins[i]];
+
+            // Fresh comb pilot CPE + ICI slope (weighted linear regression)
+            float w_sum = 0, wx_sum = 0, wy_sum = 0, wxx_sum = 0, wxy_sum = 0;
+            for (int i = 0; i < n_used; i += config_.pilot_carrier_spacing) {
+                std::complex<float> Y_pilot = used_carriers_buf[i];
+                std::complex<float> H = channel_est_.H[i];
+                float H_mag2 = std::norm(H);
+                float nv = (i < (int)channel_est_.noise_var.size())
+                           ? channel_est_.noise_var[i] : 1e-6f;
+                if (nv < 1e-12f) nv = 1e-12f;
+                float w = H_mag2 / nv;
+                if (w < 1e-6f) continue;
+                float phase_diff = std::arg(Y_pilot * std::conj(H));
+                float x = (float)i;
+                w_sum  += w;
+                wx_sum += w * x;
+                wy_sum += w * phase_diff;
+                wxx_sum += w * x * x;
+                wxy_sum += w * x * phase_diff;
+            }
+            if (w_sum > 0.0f) {
+                float center = wx_sum / w_sum;
+                float cpe2 = wy_sum / w_sum;
+                float denom = w_sum * wxx_sum - wx_sum * wx_sum;
+                float ici_slope2 = 0.0f;
+                if (std::abs(denom) > 1e-6f)
+                    ici_slope2 = (w_sum * wxy_sum - wx_sum * wy_sum) / denom;
+
+                // Apply CPE + per-carrier ICI slope correction
+                for (int i = 0; i < n_used; i++) {
+                    float phase_corr = cpe2 + ici_slope2 * ((float)i - center);
+                    std::complex<float> rot(std::cos(-phase_corr), std::sin(-phase_corr));
+                    used_carriers_buf[i] *= rot;
+                }
+            }
+
+            // Extract data carriers (skip pilot positions)
+            int n_data_actual = extract_data_carriers(used_carriers_buf.data(), n_used,
+                                                      data_carriers_buf);
+
+            // MMSE equalize
+            equalize_mmse(data_carriers_buf, n_data_actual, channel_est_, eq_carriers_buf);
+
+            // DFT-despread
+            if (config_.dft_spread && n_data_actual > 1) {
+                std::vector<std::complex<float>> idft_out(n_data_actual);
+                small_idft(eq_carriers_buf.data(), idft_out.data(), n_data_actual);
+                std::copy(idft_out.begin(), idft_out.end(), eq_carriers_buf.begin());
+            }
+
+            // BPS for QAM16+ (refine phase beyond comb pilot resolution)
+            if (use_bps) {
+                float bps2 = bps_estimate(eq_carriers_buf.data(), n_data_actual,
+                                           active_tone_map, fec_r16);
+                if (std::abs(bps2) > 1e-4f) {
+                    std::complex<float> bps_rot(std::cos(-bps2), std::sin(-bps2));
+                    for (int i = 0; i < n_data_actual; i++)
+                        eq_carriers_buf[i] *= bps_rot;
+                }
+            }
+
+            // Replace forward-pass carriers with RTS-corrected carriers
+            stored_eq[k].assign(eq_carriers_buf.begin(),
+                                eq_carriers_buf.begin() + n_data_actual);
+            stored_n_data[k] = n_data_actual;
+        }
+    }
+
+    // ---- Soft demapping ----
     result.eq_constellation.clear();
     result.eq_constellation.reserve(data_sym_count * n_data);
 
@@ -1179,16 +1290,6 @@ OfdmDemodResult OfdmDemodulator::demodulate(
         int nd = stored_n_data[k];
         if (nd <= 0) continue;
 
-        // Phase correction residual: smoothed minus what was applied in forward pass
-        float residual = smoothed_phase[k] - stored_fwd_phase[k];
-
-        if (std::abs(residual) > 1e-6f) {
-            std::complex<float> rts_rot(std::cos(-residual), std::sin(-residual));
-            for (int i = 0; i < nd; i++)
-                stored_eq[k][i] *= rts_rot;
-        }
-
-        // Store for constellation GUI
         result.eq_constellation.insert(result.eq_constellation.end(),
                                         stored_eq[k].begin(),
                                         stored_eq[k].begin() + nd);

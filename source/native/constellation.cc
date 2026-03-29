@@ -12,7 +12,8 @@ int bits_per_symbol(Modulation mod) {
         case Modulation::QPSK:   return 2;
         case Modulation::QAM16:  return 4;
         case Modulation::QAM64:  return 6;
-        case Modulation::QAM256: return 8;
+        case Modulation::QAM256:  return 8;
+        case Modulation::QAM1024: return 10;
     }
     return 1;
 }
@@ -96,9 +97,10 @@ std::complex<float> map_symbol(const uint8_t* bits, Modulation mod) {
             float q_val = q_bit ? -norm : norm;
             return std::complex<float>(i_val, q_val);
         }
-        case Modulation::QAM16:  return qam_map(val, 16);
-        case Modulation::QAM64:  return qam_map(val, 64);
-        case Modulation::QAM256: return qam_map(val, 256);
+        case Modulation::QAM16:   return qam_map(val, 16);
+        case Modulation::QAM64:   return qam_map(val, 64);
+        case Modulation::QAM256:  return qam_map(val, 256);
+        case Modulation::QAM1024: return qam_map(val, 1024);
     }
     return {1.0f, 0.0f};
 }
@@ -115,9 +117,10 @@ void demap_symbol(std::complex<float> sym, uint8_t* bits, Modulation mod) {
             bits[0] = sym.real() < 0 ? 1 : 0;
             bits[1] = sym.imag() < 0 ? 1 : 0;
             return;
-        case Modulation::QAM16:  val = qam_demap(sym, 16);  break;
-        case Modulation::QAM64:  val = qam_demap(sym, 64);  break;
-        case Modulation::QAM256: val = qam_demap(sym, 256); break;
+        case Modulation::QAM16:   val = qam_demap(sym, 16);   break;
+        case Modulation::QAM64:   val = qam_demap(sym, 64);   break;
+        case Modulation::QAM256:  val = qam_demap(sym, 256);  break;
+        case Modulation::QAM1024: val = qam_demap(sym, 1024); break;
     }
 
     for (int i = 0; i < bps; i++)
@@ -180,7 +183,8 @@ std::vector<float> demap_soft(const std::vector<std::complex<float>>& symbols, M
 
             case Modulation::QAM16:
             case Modulation::QAM64:
-            case Modulation::QAM256: {
+            case Modulation::QAM256:
+            case Modulation::QAM1024: {
                 int order = 1 << bps;
                 int side = (int)std::sqrt((float)order);
                 int nbits_axis = bps / 2;

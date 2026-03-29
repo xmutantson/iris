@@ -119,7 +119,8 @@ Modulation bits_to_modulation(int bpc) {
         case 2: return Modulation::QPSK;
         case 4: return Modulation::QAM16;
         case 6: return Modulation::QAM64;
-        case 8: return Modulation::QAM256;
+        case 8:  return Modulation::QAM256;
+        case 10: return Modulation::QAM1024;
         default: return Modulation::BPSK;
     }
 }
@@ -789,7 +790,8 @@ std::vector<std::complex<float>> OfdmModulator::build_ofdm_frame(
         papr_target = 7.0f;   // BPSK/QPSK with DFT-spread
     } else {
         // No DFT-spread: gentle targets
-        if (max_bpc >= 8)      papr_target = 15.0f;
+        if (max_bpc >= 10)     papr_target = 17.0f;
+        else if (max_bpc >= 8) papr_target = 15.0f;
         else if (max_bpc >= 6) papr_target = 13.0f;
         else if (max_bpc >= 4) papr_target = 11.0f;
         else                   papr_target = 9.0f;

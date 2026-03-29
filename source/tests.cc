@@ -864,6 +864,9 @@ static void test_ofdm_speed_levels() {
         { 8, "O7 64QAM r3/4",   LdpcRate::RATE_3_4},
         { 9, "O8 256QAM r5/8",  LdpcRate::RATE_5_8},
         {10, "O9 256QAM r3/4",  LdpcRate::RATE_3_4},
+        {11, "O10 256QAM r7/8", LdpcRate::RATE_7_8},
+        {12, "O11 1024QAM r3/4", LdpcRate::RATE_3_4},
+        {13, "O12 1024QAM r7/8", LdpcRate::RATE_7_8},
     };
 
     // Helper: run a frame through detect + demod, return success
@@ -957,7 +960,28 @@ static void test_ofdm_speed_levels() {
         char label[80];
         snprintf(label, sizeof(label), "%s: FM-1024", lv.name);
         bool match = try_decode(fm_audio, tm, label);
-        if (lv.preset <= 4) check(label, match);  // assert O0-O3, probe O4+
+        if (lv.preset <= 10) check(label, match);  // assert O0-O9, probe O10+
+    }
+
+    // --- Phase 2c: FM channel with NO drift (isolate pre-emphasis distortion) ---
+    printf("\n  --- FM Channel NFFT=1024 (50%% drive, NO drift) ---\n");
+    for (auto& lv : levels) {
+        if (lv.preset < 8) continue;  // O7+ only
+        ToneMap tm = get_uniform_tone_map(lv.preset, cfg);
+        OfdmModulator mod(cfg);
+        auto iq = mod.build_ofdm_frame(payload, 32, tm, lv.fec);
+        if (iq.empty()) continue;
+
+        std::vector<float> fm_audio(iq.size());
+        for (size_t i = 0; i < iq.size(); i++)
+            fm_audio[i] = iq[i].real();
+
+        fm_channel_process(fm_audio.data(), (int)fm_audio.size(), 0.50f, 0.0f, 48000.0f, 0.0f);
+
+        char label[80];
+        snprintf(label, sizeof(label), "%s: FM-1024-nodrift", lv.name);
+        bool match = try_decode(fm_audio, tm, label);
+        // Just probe, don't assert
     }
 
     // --- Phase 2b: FM channel at 50% drive (NFFT=512) ---

@@ -11,11 +11,12 @@ namespace iris {
 struct NucTable;
 
 enum class Modulation : uint8_t {
-    BPSK   = 0,   // 1 bit/symbol
-    QPSK   = 1,   // 2 bits/symbol
-    QAM16  = 2,   // 4 bits/symbol
-    QAM64  = 3,   // 6 bits/symbol
-    QAM256 = 4,   // 8 bits/symbol
+    BPSK    = 0,   // 1 bit/symbol
+    QPSK    = 1,   // 2 bits/symbol
+    QAM16   = 2,   // 4 bits/symbol
+    QAM64   = 3,   // 6 bits/symbol
+    QAM256  = 4,   // 8 bits/symbol
+    QAM1024 = 5,   // 10 bits/symbol
 };
 
 // Bits per symbol for each modulation

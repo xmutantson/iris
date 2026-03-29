@@ -87,6 +87,17 @@ void loopback_set_fm_channel(float preemph_us, float bp_low, float bp_high,
 // gain: reflection amplitude (0-1, e.g., 0.3 = -10.5 dB reflection)
 void loopback_set_fm_multipath(float delay_ms, float gain);
 
+// Configure VHF fading (ported from Ionos HF/VHF simulator).
+// doppler_hz: Rayleigh fading Doppler spread (0 = disabled, 0.1-2.0 typical)
+// flat_depth_db: sinusoidal fade depth in dB (0 = disabled, 0-40)
+// flat_rate_hz: sinusoidal fade rate (0.1-20 Hz typical)
+void loopback_set_fm_fading(float doppler_hz, float flat_depth_db,
+                             float flat_rate_hz);
+
+// Configure VCO frequency drift (Wiener process).
+// drift_rate: Hz/sqrt(s) — 3.0 typical for FM radios (0 = disabled)
+void loopback_set_fm_drift(float drift_rate);
+
 std::unique_ptr<AudioCapture> create_loopback_capture();
 std::unique_ptr<AudioPlayback> create_loopback_playback();
 

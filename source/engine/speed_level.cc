@@ -27,16 +27,19 @@ const SpeedLevel SPEED_LEVELS[NUM_SPEED_LEVELS] = {
 // Dropped 64QAM r1/2 (= 16QAM r3/4 throughput) and 256QAM r1/2 (< 64QAM r3/4).
 const SpeedLevel OFDM_SPEED_LEVELS[NUM_OFDM_SPEED_LEVELS] = {
     // name    mod                num den  min_snr  net_bits/baud
-    {"O0",   Modulation::BPSK,    1, 2,   0.0f,  0},   // BPSK r1/2
-    {"O1",   Modulation::QPSK,    1, 2,   6.0f,  0},   // QPSK r1/2
-    {"O2",   Modulation::QPSK,    3, 4,  10.0f,  0},   // QPSK r3/4
-    {"O3",   Modulation::QAM16,   1, 2,  14.0f,  0},   // 16QAM r1/2
-    {"O4",   Modulation::QAM16,  5, 8,  16.0f,  0},   // 16QAM r5/8
-    {"O5",   Modulation::QAM16,   3, 4,  18.0f,  0},   // 16QAM r3/4
-    {"O6",   Modulation::QAM64,  5, 8,  21.0f,  0},   // 64QAM r5/8
-    {"O7",   Modulation::QAM64,   3, 4,  24.0f,  0},   // 64QAM r3/4
-    {"O8",   Modulation::QAM256, 5, 8,  27.0f,  0},   // 256QAM r5/8
-    {"O9",   Modulation::QAM256,  3, 4,  30.0f,  0},   // 256QAM r3/4
+    {"O0",   Modulation::BPSK,    1, 2,   0.0f,  0},   // BPSK r1/2        = 0.5 net bpc
+    {"O1",   Modulation::QPSK,    1, 2,   6.0f,  0},   // QPSK r1/2        = 1.0
+    {"O2",   Modulation::QPSK,    3, 4,  10.0f,  0},   // QPSK r3/4        = 1.5
+    {"O3",   Modulation::QAM16,   1, 2,  14.0f,  0},   // 16QAM r1/2       = 2.0
+    {"O4",   Modulation::QAM16,  5, 8,  16.0f,  0},   // 16QAM r5/8       = 2.5
+    {"O5",   Modulation::QAM16,   3, 4,  18.0f,  0},   // 16QAM r3/4       = 3.0
+    {"O6",   Modulation::QAM64,  5, 8,  21.0f,  0},   // 64QAM r5/8       = 3.75
+    {"O7",   Modulation::QAM64,   3, 4,  24.0f,  0},   // 64QAM r3/4       = 4.5
+    {"O8",   Modulation::QAM256, 5, 8,  27.0f,  0},   // 256QAM r5/8      = 5.0
+    {"O9",   Modulation::QAM256,  3, 4,  30.0f,  0},   // 256QAM r3/4      = 6.0
+    {"O10",  Modulation::QAM256,  7, 8,  33.0f,  0},   // 256QAM r7/8      = 7.0
+    {"O11",  Modulation::QAM1024, 3, 4,  36.0f,  0},   // 1024QAM r3/4     = 7.5
+    {"O12",  Modulation::QAM1024, 7, 8,  39.0f,  0},   // 1024QAM r7/8     = 8.75
 };
 
 int ofdm_snr_to_speed_level(float snr_db) {

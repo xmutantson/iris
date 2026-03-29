@@ -44,7 +44,8 @@ static uint8_t round_to_valid_bpc(int raw_bits) {
     if (raw_bits <= 3) return 2;   // 2 or 3 → QPSK
     if (raw_bits <= 5) return 4;   // 4 or 5 → 16QAM
     if (raw_bits <= 7) return 6;   // 6 or 7 → 64QAM
-    return 8;                      // 8+ → 256QAM
+    if (raw_bits <= 9) return 8;   // 8 or 9 → 256QAM
+    return 10;                     // 10+ → 1024QAM
 }
 
 // Encode FEC rate into a 4-bit field for serialization.
@@ -125,6 +126,9 @@ static const UniformPreset kUniformPresets[] = {
     { 8, 6, LdpcRate::RATE_3_4 },  // O7: 64QAM r3/4
     { 9, 8, LdpcRate::RATE_5_8 },  // O8: 256QAM r5/8
     {10, 8, LdpcRate::RATE_3_4 },  // O9: 256QAM r3/4
+    {11, 8, LdpcRate::RATE_7_8 },   // O10: 256QAM r7/8
+    {12, 10, LdpcRate::RATE_3_4 },  // O11: 1024QAM r3/4
+    {13, 10, LdpcRate::RATE_7_8 },  // O12: 1024QAM r7/8
 };
 static constexpr int kNumPresets = sizeof(kUniformPresets) / sizeof(kUniformPresets[0]);
 
@@ -152,7 +156,7 @@ ToneMap compute_waterfill_tone_map(const std::vector<float>& snr_per_carrier,
             continue;
         }
         int raw_bits = static_cast<int>(std::floor(std::log2(1.0f + snr / gap_lin)));
-        if (raw_bits > 8) raw_bits = 8;
+        if (raw_bits > 10) raw_bits = 10;
         map.bits_per_carrier[k] = round_to_valid_bpc(raw_bits);
         map.total_bits_per_symbol += map.bits_per_carrier[k];
     }

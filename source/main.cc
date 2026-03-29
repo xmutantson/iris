@@ -135,6 +135,9 @@ static void print_usage() {
     printf("  --fm-channel       Enable FM channel simulator in loopback\n");
     printf("  --fm-cfo <Hz>      FM channel frequency offset (default: 0)\n");
     printf("  --fm-multipath <ms> <gain>  FM multipath reflection (delay ms, gain 0-1)\n");
+    printf("  --fm-drift <Hz/sqrt(s)>    VCO frequency drift rate (default: 0, typical: 3)\n");
+    printf("  --fm-rayleigh <doppler_Hz> Rayleigh fading Doppler spread (default: 0)\n");
+    printf("  --fm-flat-fade <depth_dB> <rate_Hz>  Sinusoidal flat fading\n");
     printf("  --list-audio       List audio devices and exit\n");
     printf("  --capture <id>     Capture device ID (-1 = default)\n");
     printf("  --playback <id>    Playback device ID (-1 = default)\n");
@@ -219,6 +222,10 @@ int main(int argc, char** argv) {
     float cli_fm_cfo = 0.0f;
     float cli_fm_mp_delay = 0.0f;
     float cli_fm_mp_gain = 0.0f;
+    float cli_fm_drift = 0.0f;
+    float cli_fm_rayleigh = 0.0f;
+    float cli_fm_flat_depth = 0.0f;
+    float cli_fm_flat_rate = 0.0f;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--test") == 0) {
@@ -330,6 +337,13 @@ int main(int argc, char** argv) {
         } else if (strcmp(argv[i], "--fm-multipath") == 0 && i + 2 < argc) {
             cli_fm_mp_delay = (float)atof(argv[++i]);
             cli_fm_mp_gain = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--fm-drift") == 0 && i + 1 < argc) {
+            cli_fm_drift = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--fm-rayleigh") == 0 && i + 1 < argc) {
+            cli_fm_rayleigh = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--fm-flat-fade") == 0 && i + 2 < argc) {
+            cli_fm_flat_depth = (float)atof(argv[++i]);
+            cli_fm_flat_rate = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage();
             return 0;
@@ -494,6 +508,18 @@ int main(int argc, char** argv) {
         if (cli_fm_mp_delay > 0.0f) {
             loopback_set_fm_multipath(cli_fm_mp_delay, cli_fm_mp_gain);
             printf("  FM multipath: delay=%.2f ms, gain=%.2f\n", cli_fm_mp_delay, cli_fm_mp_gain);
+        }
+        if (cli_fm_drift > 0.0f) {
+            loopback_set_fm_drift(cli_fm_drift);
+            printf("  FM drift: %.2f Hz/sqrt(s)\n", cli_fm_drift);
+        }
+        if (cli_fm_rayleigh > 0.0f || cli_fm_flat_depth > 0.0f) {
+            loopback_set_fm_fading(cli_fm_rayleigh, cli_fm_flat_depth, cli_fm_flat_rate);
+            if (cli_fm_rayleigh > 0.0f)
+                printf("  FM Rayleigh fading: Doppler=%.2f Hz\n", cli_fm_rayleigh);
+            if (cli_fm_flat_depth > 0.0f)
+                printf("  FM flat fading: depth=%.1f dB, rate=%.2f Hz\n",
+                       cli_fm_flat_depth, cli_fm_flat_rate);
         }
     }
     if (cli_speed_level >= 0)

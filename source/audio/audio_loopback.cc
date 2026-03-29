@@ -106,6 +106,39 @@ struct FmChannelState {
     float mp_delay_line[480] = {};
     int mp_write_pos = 0;
 
+    // Frequency drift: Wiener process (random walk in frequency).
+    // Models slowly-varying VCO frequency offset between TX and RX radios.
+    // OTA logs show residual CFO of 1-7 Hz with drift over the frame.
+    // σ_f = 3 Hz/√s → over a 1.3s frame, frequency wanders ~3.4 Hz RMS.
+    // Ported from tests.cc batch model to per-sample real-time.
+    float freq_drift_rate = 0.0f;    // Hz/√s (0 = disabled, 3.0 typical)
+    float drift_freq_offset = 0.0f;  // current accumulated frequency drift (Hz)
+    float drift_step_std = 0.0f;     // pre-computed: freq_drift_rate * sqrt(1/fs)
+    std::mt19937 drift_rng{77};
+    std::normal_distribution<float> drift_dist{0.0f, 1.0f};
+
+    // Rayleigh fading: time-varying complex channel gain (Watterson model).
+    // Ported from Ionos HF simulator. Models VHF multipath fading from
+    // vehicle motion or atmospheric scintillation.
+    // The RF Rayleigh envelope maps to audio-domain amplitude variation:
+    //   fade_gain = |H(t)| = sqrt(I² + Q²), normalized to unit mean power.
+    // I and Q are independent Gaussian processes filtered to Doppler bandwidth
+    // via IIR lowpass (equivalent to Ionos's 128-tap Gaussian FIR at decimated rate).
+    float doppler_hz = 0.0f;         // Doppler spread (0 = disabled, 0.1-2 Hz typical)
+    float fade_I = 1.0f;             // in-phase channel gain (Gaussian filtered)
+    float fade_Q = 0.0f;             // quadrature channel gain
+    float fade_alpha = 0.0f;         // IIR coefficient: exp(-2π·f_doppler/fs)
+    float fade_scale = 1.0f;         // normalization: sqrt((1+α)/(1-α))
+    std::mt19937 fade_rng{99};
+
+    // Flat fading: sinusoidal amplitude modulation.
+    // Ported from Ionos Fade() function (modes 6-7).
+    // Models signal strength variation from moving platforms.
+    // SNR(t) = SNR_max - depth/2 × (1 - cos(2π·rate·t))
+    float flat_fade_depth_db = 0.0f; // 0 = disabled, 0-40 dB
+    float flat_fade_rate_hz = 0.0f;  // 0.1-20 Hz typical
+    float flat_fade_phase = 0.0f;    // accumulator (radians)
+
     void init(float fs) {
         sample_rate = fs;
 
@@ -174,6 +207,29 @@ struct FmChannelState {
         // Reset multipath delay line
         memset(mp_delay_line, 0, sizeof(mp_delay_line));
         mp_write_pos = 0;
+
+        // Frequency drift
+        drift_freq_offset = 0.0f;
+        if (freq_drift_rate > 0.0f) {
+            float dt = 1.0f / fs;
+            drift_step_std = freq_drift_rate * std::sqrt(dt);
+        } else {
+            drift_step_std = 0.0f;
+        }
+
+        // Rayleigh fading: IIR lowpass for Doppler filtering
+        if (doppler_hz > 0.0f) {
+            fade_alpha = std::exp(-2.0f * (float)M_PI * doppler_hz / fs);
+            // Scale so filtered output has unit variance per component.
+            // IIR output variance = (1-α)²/(1-α²) × input_variance
+            // = (1-α)/(1+α). Scale factor = sqrt((1+α)/(1-α)).
+            fade_scale = std::sqrt((1.0f + fade_alpha) / (1.0f - fade_alpha));
+            fade_I = 1.0f;
+            fade_Q = 0.0f;
+        }
+
+        // Flat fading
+        flat_fade_phase = 0.0f;
     }
 
     // Process one sample through the full FM channel model
@@ -187,6 +243,32 @@ struct FmChannelState {
         // 2. Deviation limiter (FM radio clips to max deviation)
         if (pe > deviation_limit) pe = deviation_limit;
         if (pe < -deviation_limit) pe = -deviation_limit;
+
+        // 2.3. Rayleigh fading: time-varying amplitude from RF envelope.
+        // The FM discriminator SNR is proportional to carrier power.
+        // When carrier fades, signal drops and noise rises relative to signal.
+        if (doppler_hz > 0.0f) {
+            // Update complex channel gain via IIR-filtered Gaussian noise
+            float wn_i = drift_dist(fade_rng);
+            float wn_q = drift_dist(fade_rng);
+            fade_I = fade_alpha * fade_I + (1.0f - fade_alpha) * wn_i * fade_scale;
+            fade_Q = fade_alpha * fade_Q + (1.0f - fade_alpha) * wn_q * fade_scale;
+            // Rayleigh envelope, normalized so E[gain²] = 1
+            // E[I²+Q²] = 2σ² = 2 (unit variance per component), so divide by sqrt(2)
+            float rayleigh_env = std::sqrt(fade_I * fade_I + fade_Q * fade_Q);
+            float fade_gain = rayleigh_env * 0.7071f;  // 1/sqrt(2)
+            pe *= fade_gain;
+        }
+
+        // 2.4. Flat fading: sinusoidal amplitude modulation.
+        // Ported from Ionos Fade(): gain = 10^(-depth/2 × (1-cos(2π·rate·t))/20)
+        if (flat_fade_depth_db > 0.0f && flat_fade_rate_hz > 0.0f) {
+            flat_fade_phase += 2.0f * (float)M_PI * flat_fade_rate_hz / sample_rate;
+            if (flat_fade_phase > 2.0f * (float)M_PI)
+                flat_fade_phase -= 2.0f * (float)M_PI;
+            float fade_db = flat_fade_depth_db * 0.5f * (1.0f - std::cos(flat_fade_phase));
+            pe *= std::pow(10.0f, -fade_db / 20.0f);
+        }
 
         // 2.5. f²-shaped FM discriminator noise (before de-emphasis)
         if (noise_amplitude > 0.0f) {
@@ -218,18 +300,23 @@ struct FmChannelState {
             mp_write_pos = (mp_write_pos + 1) % MP_MAX_DELAY;
         }
 
-        // 6. Frequency offset (VCO drift between radios)
-        // For real-valued audio, frequency offset shifts the entire spectrum.
-        // Model as: multiply by cos(2π*cfo*t) which shifts energy by ±cfo Hz.
-        // This is a simplification — true FM offset shifts the demodulated
-        // audio spectrum linearly, which for narrowband is well-approximated
-        // by this multiplication.
+        // 6. Frequency offset + drift (VCO between radios)
+        // Fixed CFO + Wiener-process drift (ported from tests.cc batch model).
+        // For real-valued audio, multiply by cos(2π*f(t)*t) shifts spectrum.
+        // The drift models VCO crystal aging/temperature variation.
         float out = bp;
-        if (std::abs(cfo_hz) > 0.01f) {
-            cfo_phase += 2.0f * (float)M_PI * cfo_hz / sample_rate;
-            if (cfo_phase > (float)M_PI) cfo_phase -= 2.0f * (float)M_PI;
-            if (cfo_phase < -(float)M_PI) cfo_phase += 2.0f * (float)M_PI;
-            out = bp * std::cos(cfo_phase);
+        {
+            // Update drift: random walk in frequency
+            if (drift_step_std > 0.0f) {
+                drift_freq_offset += drift_step_std * drift_dist(drift_rng);
+            }
+            float total_cfo = cfo_hz + drift_freq_offset;
+            if (std::abs(total_cfo) > 0.01f) {
+                cfo_phase += 2.0f * (float)M_PI * total_cfo / sample_rate;
+                if (cfo_phase > (float)M_PI) cfo_phase -= 2.0f * (float)M_PI;
+                if (cfo_phase < -(float)M_PI) cfo_phase += 2.0f * (float)M_PI;
+                out = bp * std::cos(cfo_phase);
+            }
         }
 
         return out;
@@ -266,6 +353,26 @@ void loopback_set_fm_channel(float preemph_us, float bp_low, float bp_high,
     if (g_fm_channel.enabled) {
         g_fm_channel.init(48000.0f);
     }
+}
+
+void loopback_set_fm_fading(float doppler_hz, float flat_depth_db,
+                             float flat_rate_hz) {
+    std::lock_guard<std::mutex> lock(g_loop_mutex);
+    g_fm_channel.doppler_hz = std::max(0.0f, doppler_hz);
+    g_fm_channel.flat_fade_depth_db = std::max(0.0f, flat_depth_db);
+    g_fm_channel.flat_fade_rate_hz = std::max(0.0f, flat_rate_hz);
+    if (g_fm_channel.enabled)
+        g_fm_channel.init(48000.0f);
+    IRIS_LOG("[FM-FADING] Rayleigh doppler=%.2f Hz, flat depth=%.1f dB rate=%.2f Hz",
+             doppler_hz, flat_depth_db, flat_rate_hz);
+}
+
+void loopback_set_fm_drift(float drift_rate) {
+    std::lock_guard<std::mutex> lock(g_loop_mutex);
+    g_fm_channel.freq_drift_rate = std::max(0.0f, drift_rate);
+    if (g_fm_channel.enabled)
+        g_fm_channel.init(48000.0f);
+    IRIS_LOG("[FM-DRIFT] rate=%.2f Hz/sqrt(s)", drift_rate);
 }
 
 void loopback_set_fm_multipath(float delay_ms, float gain) {

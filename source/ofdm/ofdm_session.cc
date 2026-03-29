@@ -172,7 +172,7 @@ std::vector<std::complex<float>> OfdmSession::build_tx_frame(const uint8_t* payl
         int max_per_block = k / 8 - 4 - 2;  // minus CRC + length prefix
         if (max_per_block > 0 && (int)len > max_per_block) {
             n_cw = ((int)len + max_per_block - 1) / max_per_block;
-            n_cw = std::min(n_cw, 4);  // cap at 4 blocks for FM channel stability
+            n_cw = std::min(n_cw, 8);  // cap at 8 blocks (Kalman tracker handles FM phase drift)
         }
     }
     tx_tone_map_.n_codewords = n_cw;
