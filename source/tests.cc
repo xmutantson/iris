@@ -1210,6 +1210,133 @@ static void test_ofdm_throughput_configs() {
     }
 }
 
+// =======================================================================
+//  SNR sweep: test all speed levels across FM channel SNR range.
+//  Uses production config (carrier_sp=8, appropriate ncw per level).
+//  noise_amplitude in fm_channel_process maps to FM discriminator noise.
+// =======================================================================
+static void test_ofdm_snr_sweep() {
+    printf("\n=== OFDM SNR Sweep (FM channel, carrier_sp=8) ===\n");
+
+    NegotiatedPassband pb;
+    pb.low_hz = 300.0f;
+    pb.high_hz = 3000.0f;
+    pb.center_hz = 1650.0f;
+    pb.bandwidth_hz = 2700.0f;
+    pb.valid = true;
+    OfdmConfig cfg = ofdm_config_from_probe(pb, 1024, 64, 8, 24);
+
+    uint8_t payload[1200];
+    for (int i = 0; i < 1200; i++) payload[i] = (uint8_t)(i * 37 + 13);
+
+    struct Level {
+        int preset;
+        const char* name;
+        LdpcRate fec;
+        int ncw;
+        int payload_bytes;
+    };
+    Level levels[] = {
+        { 1, "O0 BPSK r1/2",   LdpcRate::RATE_1_2,  1,   32},
+        { 2, "O1 QPSK r1/2",   LdpcRate::RATE_1_2,  1,   32},
+        { 3, "O2 QPSK r3/4",   LdpcRate::RATE_3_4,  4,  200},
+        { 4, "O3 16QAM r1/2",  LdpcRate::RATE_1_2,  4,  200},
+        { 5, "O4 16QAM r5/8",  LdpcRate::RATE_5_8,  4,  200},
+        { 6, "O5 16QAM r3/4",  LdpcRate::RATE_3_4,  4,  200},
+        { 7, "O6 64QAM r5/8",  LdpcRate::RATE_5_8,  8,  952},
+        { 8, "O7 64QAM r3/4",  LdpcRate::RATE_3_4,  8, 1152},
+        { 9, "O8 256QAM r5/8", LdpcRate::RATE_5_8,  8,  952},
+        {10, "O9 256QAM r3/4", LdpcRate::RATE_3_4,  4,  476},
+    };
+    int n_levels = (int)(sizeof(levels) / sizeof(levels[0]));
+
+    // Noise amplitudes: finer resolution in the 0-0.02 range where transitions happen
+    float noise_amps[] = {0.0f, 0.002f, 0.004f, 0.006f, 0.008f, 0.01f, 0.015f, 0.02f, 0.03f, 0.05f};
+    int n_noise = (int)(sizeof(noise_amps) / sizeof(noise_amps[0]));
+
+    // Collect results: [level][noise] = {pass, ldpc_iters, snr}
+    struct Result {
+        bool pass;
+        int ldpc_iters;
+        float snr_db;
+        bool detected;
+    };
+    Result results[10][10];
+
+    for (int li = 0; li < n_levels; li++) {
+        auto& lv = levels[li];
+        ToneMap tm = get_uniform_tone_map(lv.preset, cfg);
+        tm.n_codewords = lv.ncw;
+
+        for (int ni = 0; ni < n_noise; ni++) {
+            auto& r = results[li][ni];
+            r = {false, 0, 0.0f, false};
+
+            OfdmModulator mod(cfg);
+            auto iq = mod.build_ofdm_frame(payload, lv.payload_bytes, tm, lv.fec, lv.ncw);
+            if (iq.empty()) continue;
+
+            std::vector<float> fm_audio(iq.size());
+            for (size_t i = 0; i < iq.size(); i++)
+                fm_audio[i] = iq[i].real();
+
+            fm_channel_process(fm_audio.data(), (int)fm_audio.size(), 0.50f, noise_amps[ni]);
+
+            auto rx_iq = hilbert_analytic(fm_audio.data(), (int)fm_audio.size());
+            size_t pad = 48000;
+            rx_iq.insert(rx_iq.begin(), pad, std::complex<float>(0, 0));
+            rx_iq.insert(rx_iq.end(), pad, std::complex<float>(0, 0));
+
+            auto sync = ofdm_detect_frame(rx_iq.data(), (int)rx_iq.size(), cfg);
+            if (!sync.detected) continue;
+            r.detected = true;
+
+            OfdmDemodulator demod(cfg);
+            auto result = demod.demodulate(rx_iq.data(), (int)rx_iq.size(), tm, &sync);
+            r.snr_db = result.snr_db;
+            r.ldpc_iters = result.worst_ldpc_iters;
+            r.pass = result.success &&
+                     (result.payload.size() == (size_t)lv.payload_bytes) &&
+                     (memcmp(result.payload.data(), payload, lv.payload_bytes) == 0);
+        }
+    }
+
+    // Print results table
+    printf("\n  %-20s |", "");
+    for (int ni = 0; ni < n_noise; ni++)
+        printf(" n=%-6.3f|", noise_amps[ni]);
+    printf("\n  ---------------------+");
+    for (int ni = 0; ni < n_noise; ni++)
+        printf("---------+");
+    printf("\n");
+
+    for (int li = 0; li < n_levels; li++) {
+        auto& lv = levels[li];
+        printf("  %-20s |", lv.name);
+        for (int ni = 0; ni < n_noise; ni++) {
+            auto& r = results[li][ni];
+            if (!r.detected)
+                printf(" --      |");
+            else if (r.pass)
+                printf(" OK %-4d |", r.ldpc_iters);
+            else
+                printf(" FAIL    |");
+        }
+        printf("\n");
+    }
+
+    // Print SNR row (from first level that detected at each noise)
+    printf("  %-20s |", "SNR (dB)");
+    for (int ni = 0; ni < n_noise; ni++) {
+        float snr = 0;
+        for (int li = 0; li < n_levels; li++) {
+            if (results[li][ni].detected) { snr = results[li][ni].snr_db; break; }
+        }
+        printf(" %-7.0f |", snr);
+    }
+    printf("\n");
+}
+
 static void test_ofdm_kiss_loopback() {
     printf("\n=== OFDM-KISS Audio Loopback (Mode A upconvert/downconvert) ===\n");
 
@@ -1338,6 +1465,7 @@ int run_tests() {
     test_ofdm_multi_codeword();
     test_ofdm_speed_levels();
     test_ofdm_throughput_configs();
+    test_ofdm_snr_sweep();
 
     // Phase 3: Auto-upgrade
     printf("\n--- Phase 3: Auto-Upgrade ---\n");
@@ -2803,7 +2931,7 @@ static void fm_channel_process(float* audio, int n, float target_peak,
     // giving the correct f² spectral shape. De-emphasis then partially
     // whitens it: combined PSD ∝ f²/(1+(2πfτ)²), matching real FM.
     if (noise_amplitude > 0) {
-        static std::mt19937 rng(42);
+        std::mt19937 rng(42);  // non-static: reproducible per call
         std::normal_distribution<float> dist(0.0f, noise_amplitude);
         float prev_noise = 0.0f;
         for (int i = 0; i < n; i++) {
