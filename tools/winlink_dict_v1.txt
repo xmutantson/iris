@@ -1,0 +1,40 @@
+<?xml version="1.0"?>
+ICS-213 GENERAL MESSAGE
+INCIDENT NAME: 
+TO (Name/Position): 
+FROM (Name/Position): 
+SUBJECT: 
+DATE: 
+TIME:  local
+MESSAGE:
+APPROVED BY (Name/Position): 
+SIGNATURE: /s/ 
+REPLY:
+DATE:
+TIME:
+SIGNATURE:
+Request the following resources be delivered to 
+no later than  today:
+Current shelter population is 
+//WL2K ICS-213 General Message - Resource Request
+//WL2K 
+Net control is on frequency for the weekly section traffic net. Please
+check in with your call sign, location, and any traffic you are holding.
+Standing by. 73 de 
+Thanks for the update. Please confirm receipt and relay to the net control.
+Let me know if you need anything else.
+73,
+73 de 
+de 
+Content-Transfer-Encoding: quoted-printable
+Content-Type: text/html; charset=ISO-8859-1
+Subject: //WL2K 
+Mid: 
+Body: 
+Content-Transfer-Encoding: 8bit
+Content-Type: text/plain; charset=ISO-8859-1
+Date: 2026/06/12 00:00
+From: 
+Mbo: 
+Subject: 
+To: 

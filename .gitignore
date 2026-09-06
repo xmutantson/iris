@@ -1,0 +1,7 @@
+build/
+*.log
+*.ini
+*.csv
+__pycache__/
+--output
+iris_loop5_console.txt

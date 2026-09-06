@@ -1,0 +1,55 @@
+{
+  "source": "VARA_Sims_2025.xlsx — Rick Muething KN6KB, updated 2025-11-17; Winlink Express 1.7.27.0 both ends, VARA FM 4.3.9, Masters DRA-36 modems, IONOS simulator (Teensy 4.0 prototype), gains 1.0, one message/session",
+  "metric": "Thruput bytes/min as reported by Winlink Express (message size after compression = actual bytes sent/received)",
+  "modem": "VARA VHF (VARA FM) 4.3.9",
+  "note": "bps = bytes_per_min * 8 / 60. This is the measured delivered-goodput bar; compare Iris on the same channel/S:N cell, same real Winlink traffic, same delivered-goodput basis. Same dataset Mercury uses (VARA HF WGN -10=1070 matches reference_vara_benchmark_data).",
+  "bars": {
+    "narrow_3000Hz": {
+      "WGN": {"40": 53277, "30": 53726, "20": 51978, "15": 36940},
+      "MPG": {"40": 52540, "30": 52834, "20": 32195, "15": 23720}
+    },
+    "wide_6000Hz": {
+      "WGN": {"40": 141399, "30": 133444, "20": 91155, "15": 64203},
+      "MPG": {"40": 107704, "30": 91149, "20": 43176, "15": 31486}
+    }
+  },
+  "bars_bps_narrow_3000Hz": {
+    "WGN": {"40": 7104, "30": 7163, "20": 6930, "15": 4925},
+    "MPG": {"40": 7005, "30": 7045, "20": 4293, "15": 3163}
+  },
+  "comparison_contract": {
+    "extracted_from": "VARA_Sims_2025.xlsx (Sheet1) via iris_honest_baseline_runner.py comparison-contract read (openpyxl)",
+    "vara_message": {
+      "size_basis": "message size AFTER compression = actual bytes sent/received (sheet: 'Message size after compression (actual bytes sent/received)')",
+      "per_session": "ONE message per session (sheet: 'One message per session. Session times ranged between 4 and 120 minutes')",
+      "numeric_bytes": null,
+      "size_note": "The sheet does NOT pin a single numeric message size; it reports Thruput Bytes/min on the compressed basis. Session times 4-120 min imply the per-cell test message varied (larger messages at higher S:N to keep sessions bounded). Bytes/min is size-normalised, so the Iris<->VARA comparison holds on the SAME basis WITHOUT matching absolute message size.",
+      "compressed_basis_implication": "Because the bar IS post-compression bytes/min, Iris's dict-OFF WIRE-PARITY basis (B2F-LZHUF bytes = b2f_nodict) compares to narrow_3000Hz DIRECTLY; the dict-ON plaintext basis compares to the bar * VARA's LZHUF ratio on the identical corpus."
+    },
+    "winlink_timing_basis": {
+      "metric": "Thruput Bytes/min as reported by Winlink Express (sheet metric row)",
+      "denominator": "per whole session, one message/session; Winlink-Express-reported bytes/min (compressed bytes / session minutes)",
+      "session_time_range_min": [4, 120],
+      "timing_note": "VARA's bytes/min denominator is Winlink Express's own per-session figure (connect -> complete). This is a WHOLE-SESSION denominator, so it is comparable to the Iris wall below; Iris is therefore NOT credited for turnaround/handshake it also pays."
+    },
+    "iris_wall_definition": {
+      "wall": "first-SABM-TX -> last-hash-verified-byte (whole session)",
+      "connect_probe_climb": "SEPARATE line-item = first-SABM-TX -> first-hash-verified-byte (connect+probe+climb overhead); RECORDED, not netted out of the wall",
+      "rationale": "same whole-session basis as Winlink Express bytes/min, so the two denominators are comparable and Iris cannot inflate by excluding its own overhead"
+    },
+    "iris_payload_sizing": {
+      "per_session_payload": "the fixed 4-message Winlink corpus (net_checkin + ics213 + short_email + batch3)",
+      "corpus_plaintext_bytes": 5870,
+      "corpus_b2f_nodict_bytes": 3710,
+      "sized_to_vara": "sized to a representative multi-message Winlink session; because bytes/min normalises absolute size, an exact size-match to VARA's per-cell message is neither required nor possible (the sheet gives no per-cell byte size).",
+      "corpus_source": "_research/b2f_unroll_harness/corpus/ (real Winlink messages), b2f sizes via production LZHUF, reroll bit-identity 6/6 (D3)"
+    },
+    "snr_caveat": {
+      "sheet_sn": "COMMANDED IONOS dial S:N (front-panel command, NOT a measured output; owner 2026-07-02)",
+      "realized_offset_db": 2.4,
+      "residual_axis_db": 1.1,
+      "caveat_note": "Realized SNR3k = dial + ~2.4 dB. AdjustS_N (BANDWIDTH:3000) is crest-factor/PAPR dependent because it references the signal PEAK: a tone realises +3.5 dB, high-PAPR OFDM ~+2.4 dB (HW confirmed by R7 butler test A). Keeping +2.4 is CONSERVATIVE for Iris (Iris runs at <= VARA's realised SNR; 0-1.1 dB harsher if VARA is lower-PAPR) -> it can never INFLATE Iris. Residual axis uncertainty +/- ~1.1 dB; a VARA capture through butler test A would pin VARA's exact offset."
+    },
+    "expectation": "At the current O2 (16QAM r3/4) proposal cap, ZERO of the 8 dict-OFF cells are winnable by arithmetic; this table is the honest DENOMINATOR. The beat comes from a separate window-fill / higher-order-QAM lever (P1/P2/P3+), NOT from this harness."
+  }
+}

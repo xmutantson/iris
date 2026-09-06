@@ -1,0 +1,142 @@
+{
+  "schema": "measguard-arm-v1",
+  "guards_version": "1.0.0",
+  "arm_dir": "remeasure_results",
+  "harvested_utc": "2026-07-10T04:56:31Z",
+  "note": "REAL artifact: remeasure_results - the 4-message / 3,710 B UNIT-corpus WGN:40+MPG:40 re-measure (build 6e222b47, git 83f37e3 per its own IRIS_HONEST_BASELINE.json, duration=360 s). This is the run behind BOTH escaped numbers: (a) the 'reverse-ACK binding constraint DISPROVEN' negative claim - a disproof at a scale (4 messages) where the ~31-45-message wedge cannot manifest (G2 fail-before witness); (b) the steady_state 8280.8 B/min that was hand-divided into '0.155x VARA' although the cell's own gate had WITHHELD vs_vara (G4 fail-before witness).",
+  "n_sessions": 9,
+  "build_hashes": [
+    "6e222b47"
+  ],
+  "git_head": "83f37e3e2257faf5a108401ab6b0e116a054ae28",
+  "payload_files": [
+    "/home/kameron/rxfix_ws/iris/tools/corpus/corpus.json"
+  ],
+  "corpus_sha256": "e1f2bee30906eb24feaf539f3b3d797f6588d08aaf225daa2d974e9390632226",
+  "verified_sha_by_name": {
+    "net_checkin": "a61505369fe4d53a115eb48df9d49e464de469af3e0dac1b514096c4b3e91a7d",
+    "ics213": "e52a65f0cccbc449ad71e1073d31b446978d1f3b56c76d406d1020becdbaa463",
+    "short_email": "c55bea992d9f3fc70c7845c3065d569ef84a7b3d3874e0ab32b5392c1c277cce",
+    "batch3": "8c93e283508ce4425b0f2c38848ee64ae773dae4d2940093b95178cbf824ff47"
+  },
+  "verified_sha_conflicts": [],
+  "sessions": [
+    {
+      "tag": "MPG40_doff_s00_a1",
+      "build_hashes": [
+        "6e222b47"
+      ],
+      "first_sabm_tx_epoch": 1783226763.9866822,
+      "duration": 360,
+      "kiss_sender_md5": "04c212bfb539f52d910ed58203cfdf94",
+      "kiss_receiver_md5": "88fea5cf96184f6612e310c7d779c950",
+      "n_verified": 0,
+      "complete": false,
+      "value_Bmin": 0.0
+    },
+    {
+      "tag": "MPG40_doff_s01_a1",
+      "build_hashes": [
+        "6e222b47"
+      ],
+      "first_sabm_tx_epoch": 1783226764.0041704,
+      "duration": 360,
+      "kiss_sender_md5": "70aa2049b72ab00a5ac4e0945b4d7805",
+      "kiss_receiver_md5": "052cae9fa85e9acdfc75ceeebebdc66f",
+      "n_verified": 4,
+      "complete": true,
+      "value_Bmin": 1601.0
+    },
+    {
+      "tag": "MPG40_doff_s02_a1",
+      "build_hashes": [
+        "6e222b47"
+      ],
+      "first_sabm_tx_epoch": 1783226764.004161,
+      "duration": 360,
+      "kiss_sender_md5": "eb290112a0d1e6b090c7b21769714542",
+      "kiss_receiver_md5": "fe24959522b4b3e45d3d3c2a87295347",
+      "n_verified": 4,
+      "complete": true,
+      "value_Bmin": 2734.1
+    },
+    {
+      "tag": "WGN40_doff_s00_a1",
+      "build_hashes": [
+        "6e222b47"
+      ],
+      "first_sabm_tx_epoch": 1783226763.9888632,
+      "duration": 360,
+      "kiss_sender_md5": "fcc9c3dc592c586f45ff5267a7995e0f",
+      "kiss_receiver_md5": "27748cb6bd00a6800489263d9a63879a",
+      "n_verified": 0,
+      "complete": false,
+      "value_Bmin": 0.0
+    },
+    {
+      "tag": "WGN40_doff_s00_a2",
+      "build_hashes": [
+        "6e222b47"
+      ],
+      "first_sabm_tx_epoch": 1783227182.5125268,
+      "duration": 360,
+      "kiss_sender_md5": "b305e215cd5e9fc8c0ae331cc63f567f",
+      "kiss_receiver_md5": "de7a6d57623d2d961076da45457a63a1",
+      "n_verified": 4,
+      "complete": true,
+      "value_Bmin": 3033.7
+    },
+    {
+      "tag": "WGN40_doff_s01_a1",
+      "build_hashes": [
+        "6e222b47"
+      ],
+      "first_sabm_tx_epoch": 1783226763.9406083,
+      "duration": 360,
+      "kiss_sender_md5": "ff3bf4f959aa562132cde3e63aed9202",
+      "kiss_receiver_md5": "6e56006845e9f7ef19c83f6b92f9b029",
+      "n_verified": 4,
+      "complete": true,
+      "value_Bmin": 2973.6
+    },
+    {
+      "tag": "WGN40_doff_s02_a1",
+      "build_hashes": [
+        "6e222b47"
+      ],
+      "first_sabm_tx_epoch": 1783226764.005639,
+      "duration": 360,
+      "kiss_sender_md5": "24bab7b308db78dabea431a170194ccc",
+      "kiss_receiver_md5": "8b965a0b232f688f8530b8e03e404b78",
+      "n_verified": 0,
+      "complete": false,
+      "value_Bmin": 0.0
+    },
+    {
+      "tag": "WGN40_doff_s02_a2",
+      "build_hashes": [
+        "6e222b47"
+      ],
+      "first_sabm_tx_epoch": 1783227182.4803905,
+      "duration": 360,
+      "kiss_sender_md5": "d7664439c26fda4eb0d685bd7cd7b4f4",
+      "kiss_receiver_md5": "bf60e1e7005b546c1ebdd7f1c6edde01",
+      "n_verified": 0,
+      "complete": false,
+      "value_Bmin": 0.0
+    },
+    {
+      "tag": "WGN40_doff_s02_a3",
+      "build_hashes": [
+        "6e222b47"
+      ],
+      "first_sabm_tx_epoch": 1783227600.7661753,
+      "duration": 360,
+      "kiss_sender_md5": "8e32722e17c52686935ccd209a9eede6",
+      "kiss_receiver_md5": "ee0693808ac7e1649a87dd08caf3a598",
+      "n_verified": 0,
+      "complete": false,
+      "value_Bmin": 0.0
+    }
+  ]
+}

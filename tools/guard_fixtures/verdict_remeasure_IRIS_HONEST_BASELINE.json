@@ -1,0 +1,92 @@
+{
+  "runner_version": "0.2.0-dryrun",
+  "mode": "LIVE",
+  "iris_bin": "/home/kameron/iris_commit_wt/build/iris",
+  "boxes": [
+    "31"
+  ],
+  "box_binary_manifest": {
+    "31": {
+      "md5": "75c120f53e4ece75bd1ddca3cc0ca501",
+      "git_head": "83f37e3e2257faf5a108401ab6b0e116a054ae28"
+    }
+  },
+  "n_sessions": 6,
+  "cells": [
+    {
+      "cell": "MPG:40",
+      "cohort": "off",
+      "basis": "wire_parity",
+      "n_total": 3,
+      "n_scored": 2,
+      "n_modem_fault": 1,
+      "n_harness_invalid": 0,
+      "n_refused_dep": 0,
+      "activation_rate": 0.6667,
+      "n_activated": 2,
+      "n_in_distribution": 3,
+      "distribution_Bmin": {
+        "n": 3,
+        "median": 1601.0,
+        "min": 0.0,
+        "max": 2734.1,
+        "iqr": [
+          0.0,
+          2734.1
+        ]
+      },
+      "connect_probe_climb_secs_median": 63.2,
+      "steady_state_Bmin_median": 4341.6,
+      "connect_tax_pct_median": 0.5,
+      "steady_state_label": "post-first-delivery sustained rate (line-item; NOT the VARA-compared headline)",
+      "gate_violation_codes": [
+        "NO_OFDM",
+        "ZERO_DELIVER"
+      ],
+      "wall_anchors": [
+        "sender_first_sabm_tx"
+      ],
+      "vara_Bmin": 52540,
+      "vs_vara": 0.0305,
+      "compare_reason": null
+    },
+    {
+      "cell": "WGN:40",
+      "cohort": "off",
+      "basis": "wire_parity",
+      "n_total": 3,
+      "n_scored": 2,
+      "n_modem_fault": 0,
+      "n_harness_invalid": 1,
+      "n_refused_dep": 0,
+      "activation_rate": 1.0,
+      "n_activated": 2,
+      "n_in_distribution": 2,
+      "distribution_Bmin": {
+        "n": 2,
+        "median": 3003.6,
+        "min": 2973.6,
+        "max": 3033.7,
+        "iqr": [
+          2958.6,
+          3048.7
+        ]
+      },
+      "connect_probe_climb_secs_median": 49.5,
+      "steady_state_Bmin_median": 8280.8,
+      "connect_tax_pct_median": 0.7,
+      "steady_state_label": "post-first-delivery sustained rate (line-item; NOT the VARA-compared headline)",
+      "gate_violation_codes": [
+        "CONFIG_ASYMMETRIC_BAND",
+        "CONFIG_ASYMMETRIC_CARRIERS",
+        "ZERO_DELIVER"
+      ],
+      "wall_anchors": [
+        "sender_first_sabm_tx"
+      ],
+      "vara_Bmin": null,
+      "vs_vara": null,
+      "compare_reason": "1 session(s) remain HARNESS_INVALID after re-run budget -> cell not clean"
+    }
+  ]
+}
